@@ -85,7 +85,7 @@ echo "  Connecting to Mac..."
 echo ""
 
 # Get tmux sessions from Mac
-SESSIONS=$(ssh "$SSH_HOST" "tmux list-sessions -F '#{session_name}:#{session_windows}'" 2>/dev/null) || true
+SESSIONS=$(ssh "$SSH_HOST" "bash -lc \"tmux list-sessions -F '#{session_name}:#{session_windows}'\"" 2>/dev/null) || true
 
 if [[ -z "$SESSIONS" ]]; then
     echo "  No active tmux sessions on Mac."
@@ -100,7 +100,7 @@ if [[ "$SESSION_COUNT" -eq 1 ]]; then
     SESSION_NAME=$(echo "$SESSIONS" | cut -d: -f1)
     echo "  Attaching to: $SESSION_NAME"
     echo ""
-    exec ssh -t "$SSH_HOST" "tmux attach -t '$SESSION_NAME'"
+    exec ssh -t "$SSH_HOST" "bash -lc \"tmux attach -t '$SESSION_NAME'\""
 fi
 
 # Multiple sessions — show picker
@@ -124,7 +124,7 @@ if [[ "$choice" -ge 1 && "$choice" -le "$SESSION_COUNT" ]] 2>/dev/null; then
     echo ""
     echo "  Attaching to: $SESSION_NAME"
     echo ""
-    exec ssh -t "$SSH_HOST" "tmux attach -t '$SESSION_NAME'"
+    exec ssh -t "$SSH_HOST" "bash -lc \"tmux attach -t '$SESSION_NAME'\""
 else
     echo "  Invalid choice."
     read -rp "  Press Enter to exit..."
