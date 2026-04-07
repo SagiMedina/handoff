@@ -28,35 +28,61 @@ fi
 
 SESSION_COUNT=$(echo "$SESSIONS" | wc -l | tr -d ' ')
 
+# Pick session
 if [[ "$SESSION_COUNT" -eq 1 ]]; then
     SESSION_NAME=$(echo "$SESSIONS" | cut -d: -f1)
+else
+    echo "  Sessions:"
+    echo ""
+    i=1
+    declare -a SESSION_NAMES
+    while IFS=: read -r name windows; do
+        label="window"
+        [[ "$windows" -gt 1 ]] && label="windows"
+        printf "  %d) %-16s (%s %s)\n" "$i" "$name" "$windows" "$label"
+        SESSION_NAMES+=("$name")
+        ((i++))
+    done <<< "$SESSIONS"
+    echo ""
+    read -rp "  Pick a session [1-$SESSION_COUNT]: " choice
+    if [[ "$choice" -ge 1 && "$choice" -le "$SESSION_COUNT" ]] 2>/dev/null; then
+        SESSION_NAME="${SESSION_NAMES[$((choice-1))]}"
+    else
+        echo "  Invalid choice."
+        exit 1
+    fi
+fi
+
+# Get windows for selected session
+WINDOWS=$(ssh "$SSH_HOST" "$TMUX_PATH list-windows -t '$SESSION_NAME' -F '#{window_index}|#{pane_title}|#{pane_current_command}'" 2>/dev/null) || true
+WINDOW_COUNT=$(echo "$WINDOWS" | wc -l | tr -d ' ')
+
+if [[ "$WINDOW_COUNT" -le 1 ]]; then
     echo "  Attaching to: $SESSION_NAME"
     echo ""
     exec ssh -t "$SSH_HOST" "$TMUX_PATH attach -t '$SESSION_NAME'"
 fi
 
-# Multiple sessions — show picker
-echo "  Active sessions:"
+# Multiple windows — show picker
+echo ""
+echo "  Windows in $SESSION_NAME:"
 echo ""
 i=1
-declare -a SESSION_NAMES
-while IFS=: read -r name windows; do
-    label="window"
-    [[ "$windows" -gt 1 ]] && label="windows"
-    printf "  %d) %-16s (%s %s)\n" "$i" "$name" "$windows" "$label"
-    SESSION_NAMES+=("$name")
+declare -a WINDOW_INDICES
+while IFS='|' read -r idx title cmd; do
+    display="${title:-$cmd}"
+    printf "  %d) %s\n" "$i" "$display"
+    WINDOW_INDICES+=("$idx")
     ((i++))
-done <<< "$SESSIONS"
+done <<< "$WINDOWS"
 
 echo ""
-read -rp "  Pick a session [1-$SESSION_COUNT]: " choice
+read -rp "  Pick a window [1-$WINDOW_COUNT]: " wchoice
 
-if [[ "$choice" -ge 1 && "$choice" -le "$SESSION_COUNT" ]] 2>/dev/null; then
-    SESSION_NAME="${SESSION_NAMES[$((choice-1))]}"
+if [[ "$wchoice" -ge 1 && "$wchoice" -le "$WINDOW_COUNT" ]] 2>/dev/null; then
+    WIN_IDX="${WINDOW_INDICES[$((wchoice-1))]}"
     echo ""
-    echo "  Attaching to: $SESSION_NAME"
-    echo ""
-    exec ssh -t "$SSH_HOST" "$TMUX_PATH attach -t '$SESSION_NAME'"
+    exec ssh -t "$SSH_HOST" "$TMUX_PATH attach -t '${SESSION_NAME}:${WIN_IDX}'"
 else
     echo "  Invalid choice."
     exit 1
