@@ -19,6 +19,7 @@ ${BOLD}Usage:${RESET}
   handoff setup        One-time setup (Tailscale, SSH, tmux, keys)
   handoff pair         Show QR code for phone pairing
   handoff status       Check if everything is ready
+  handoff unpair       Remove phone access and clean up
   handoff version      Show version
   handoff help         Show this help
 
@@ -262,11 +263,57 @@ cmd_status() {
     echo ""
 }
 
+# ─── handoff unpair ──────────────────────────────────────────────────
+
+cmd_unpair() {
+    echo ""
+    info "  Handoff Unpair"
+    echo "  ──────────────"
+    echo ""
+
+    if [[ ! -f "$HANDOFF_KEY" ]]; then
+        warn "  No phone key found — nothing to unpair."
+        echo ""
+        return
+    fi
+
+    # 1. Remove public key from authorized_keys
+    local pubkey
+    pubkey=$(cat "${HANDOFF_KEY}.pub")
+    if [[ -f "$HOME/.ssh/authorized_keys" ]]; then
+        grep -vF "$pubkey" "$HOME/.ssh/authorized_keys" > "$HOME/.ssh/authorized_keys.tmp" || true
+        mv "$HOME/.ssh/authorized_keys.tmp" "$HOME/.ssh/authorized_keys"
+        chmod 600 "$HOME/.ssh/authorized_keys"
+        success "  ✓ Removed phone key from authorized_keys"
+    fi
+
+    # 2. Delete the keypair
+    rm -f "$HANDOFF_KEY" "${HANDOFF_KEY}.pub"
+    success "  ✓ Deleted phone SSH keypair"
+
+    # 3. Clean up ~/.handoff directory
+    rm -rf "$HANDOFF_DIR"
+    success "  ✓ Removed ~/.handoff"
+
+    echo ""
+    info "  Mac side cleaned up."
+    echo ""
+    echo "  To clean up your phone, open Termux and run:"
+    printf "    ${BOLD}rm -rf ~/.handoff ~/.shortcuts/handoff ~/.ssh/handoff_key${RESET}\n"
+    echo "    ${BOLD}sed -i '/handoff-mac/,/ServerAliveCountMax/d' ~/.ssh/config${RESET}"
+    echo "    ${BOLD}sed -i '/alias handoff=/d' ~/.bashrc${RESET}"
+    echo ""
+    echo "  Or paste this one-liner:"
+    printf "    ${DIM}rm -rf ~/.handoff ~/.shortcuts/handoff ~/.ssh/handoff_key; sed -i '/handoff-mac/,/ServerAliveCountMax/d' ~/.ssh/config; sed -i '/alias handoff=/d' ~/.bashrc${RESET}\n"
+    echo ""
+}
+
 # ─── Main ───────────────────────────────────────────────────────────
 
 case "${1:-}" in
     setup)   cmd_setup ;;
     pair)    cmd_pair ;;
+    unpair)  cmd_unpair ;;
     status)  cmd_status ;;
     version) echo "handoff $VERSION" ;;
     help|-h|--help) usage ;;
