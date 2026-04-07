@@ -296,15 +296,18 @@ cmd_unpair() {
     success "  ✓ Removed ~/.handoff"
 
     echo ""
-    info "  Mac side cleaned up."
+    success "  Mac side cleaned up."
     echo ""
-    echo "  To clean up your phone, open Termux and run:"
-    printf "    ${BOLD}rm -rf ~/.handoff ~/.shortcuts/handoff ~/.ssh/handoff_key${RESET}\n"
-    echo "    ${BOLD}sed -i '/handoff-mac/,/ServerAliveCountMax/d' ~/.ssh/config${RESET}"
-    echo "    ${BOLD}sed -i '/alias handoff=/d' ~/.bashrc${RESET}"
+
+    # 4. Show QR code for phone cleanup
+    local cleanup_cmd="rm -rf ~/.handoff ~/.shortcuts/handoff ~/.ssh/handoff_key; sed -i '/# Handoff/,/ServerAliveCountMax/d' ~/.ssh/config; sed -i '/alias handoff=/d' ~/.bashrc; echo 'Handoff removed.'"
+
+    info "  Scan this QR code in Termux to clean up your phone:"
     echo ""
-    echo "  Or paste this one-liner:"
-    printf "    ${DIM}rm -rf ~/.handoff ~/.shortcuts/handoff ~/.ssh/handoff_key; sed -i '/handoff-mac/,/ServerAliveCountMax/d' ~/.ssh/config; sed -i '/alias handoff=/d' ~/.bashrc${RESET}\n"
+    qrencode -t ANSIUTF8 "$cleanup_cmd"
+    echo ""
+    printf "  ${DIM}Or paste manually:${RESET}\n"
+    printf "  ${DIM}%s${RESET}\n" "$cleanup_cmd"
     echo ""
 }
 
