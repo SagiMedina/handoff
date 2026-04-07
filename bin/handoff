@@ -1,0 +1,279 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Resolve the lib directory relative to this script
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+LIB_DIR="$(cd "$SCRIPT_DIR/../lib" 2>/dev/null && pwd || echo "/usr/local/lib/handoff")"
+
+# shellcheck source=../lib/handoff-common.sh
+source "$LIB_DIR/handoff-common.sh"
+
+VERSION="0.1.0"
+
+usage() {
+    printf "%b" "
+${BOLD}handoff${RESET} — Continue your Mac terminal on your phone.
+
+${BOLD}Usage:${RESET}
+  handoff              Show active sessions and connection info
+  handoff setup        One-time setup (Tailscale, SSH, tmux, keys)
+  handoff pair         Show QR code for phone pairing
+  handoff status       Check if everything is ready
+  handoff version      Show version
+  handoff help         Show this help
+
+"
+}
+
+# ─── handoff (default) ─────────────────────────────────────────────
+
+cmd_default() {
+    echo ""
+    if ! tailscale_is_up; then
+        error "  Tailscale is not running. Start it with: tailscale up"
+        exit 1
+    fi
+
+    local ip
+    ip=$(tailscale_ip)
+    if [[ -z "$ip" ]]; then
+        error "  Could not get Tailscale IP. Run: tailscale up"
+        exit 1
+    fi
+
+    print_sessions || true
+    echo ""
+    success "  Ready. Open Handoff on your phone."
+    printf "  ${DIM}Tailscale IP: %s${RESET}\n" "$ip"
+    echo ""
+}
+
+# ─── handoff setup ──────────────────────────────────────────────────
+
+cmd_setup() {
+    echo ""
+    info "  Handoff Setup"
+    echo "  ─────────────"
+    echo ""
+
+    # 1. tmux
+    if require_cmd tmux; then
+        success "  ✓ tmux installed"
+    else
+        info "  Installing tmux..."
+        brew install tmux
+        success "  ✓ tmux installed"
+    fi
+
+    # 2. Tailscale
+    if require_cmd tailscale; then
+        success "  ✓ Tailscale installed"
+    else
+        info "  Installing Tailscale..."
+        brew install tailscale
+        success "  ✓ Tailscale installed"
+    fi
+
+    if tailscale_is_up; then
+        success "  ✓ Tailscale is running"
+    else
+        info "  Starting Tailscale..."
+        sudo brew services start tailscale 2>/dev/null || true
+        echo ""
+        warn "  Please log in to Tailscale:"
+        echo "    tailscale up"
+        echo ""
+        read -rp "  Press Enter after you've logged in... "
+        if tailscale_is_up; then
+            success "  ✓ Tailscale connected"
+        else
+            error "  Tailscale is not connected. Run 'tailscale up' and try again."
+            exit 1
+        fi
+    fi
+
+    # 3. qrencode
+    if require_cmd qrencode; then
+        success "  ✓ qrencode installed"
+    else
+        info "  Installing qrencode..."
+        brew install qrencode
+        success "  ✓ qrencode installed"
+    fi
+
+    # 4. Enable SSH (Remote Login)
+    if ssh_is_enabled; then
+        success "  ✓ Remote Login (SSH) enabled"
+    else
+        info "  Enabling Remote Login (SSH)..."
+        sudo systemsetup -setremotelogin on
+        success "  ✓ Remote Login (SSH) enabled"
+    fi
+
+    # 5. Generate SSH keypair for phone
+    mkdir -p "$HANDOFF_DIR"
+    if [[ -f "$HANDOFF_KEY" ]]; then
+        success "  ✓ Phone SSH key exists"
+    else
+        info "  Generating SSH key for phone access..."
+        ssh-keygen -t ed25519 -f "$HANDOFF_KEY" -N "" -C "handoff-phone"
+        success "  ✓ Phone SSH key generated"
+    fi
+
+    # 6. Add public key to authorized_keys
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    local pubkey
+    pubkey=$(cat "${HANDOFF_KEY}.pub")
+    if grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
+        success "  ✓ Phone key in authorized_keys"
+    else
+        echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
+        chmod 600 "$HOME/.ssh/authorized_keys"
+        success "  ✓ Phone key added to authorized_keys"
+    fi
+
+    # 7. Configure tmux auto-start
+    echo ""
+    if [[ -d "/Applications/iTerm.app" ]]; then
+        info "  iTerm2 detected."
+        echo "  To make tmux invisible, set in iTerm2 Preferences:"
+        echo "    Profiles → General → Command → Send text at start:"
+        printf "    ${BOLD}tmux -CC new -A -s main${RESET}\n"
+        echo ""
+        echo "  This makes every iTerm2 tab a tmux window — no workflow change."
+    else
+        info "  iTerm2 not detected. For automatic tmux sessions, add to ~/.zshrc:"
+        printf "    ${BOLD}[[ -z \"\$TMUX\" ]] && exec tmux new -A -s main${RESET}\n"
+        echo ""
+        read -rp "  Add this to ~/.zshrc now? [y/N] " yn
+        if [[ "$yn" =~ ^[Yy]$ ]]; then
+            echo '' >> "$HOME/.zshrc"
+            echo '# Handoff: auto-attach to tmux session' >> "$HOME/.zshrc"
+            echo '[[ -z "$TMUX" ]] && exec tmux new -A -s main' >> "$HOME/.zshrc"
+            success "  ✓ Added tmux auto-attach to ~/.zshrc"
+        fi
+    fi
+
+    echo ""
+    success "  Setup complete!"
+    echo "  Next step: run ${BOLD}handoff pair${RESET} to connect your phone."
+    echo ""
+}
+
+# ─── handoff pair ───────────────────────────────────────────────────
+
+cmd_pair() {
+    echo ""
+
+    if [[ ! -f "$HANDOFF_KEY" ]]; then
+        error "  Setup not complete. Run 'handoff setup' first."
+        exit 1
+    fi
+
+    if ! tailscale_is_up; then
+        error "  Tailscale is not running. Start it with: tailscale up"
+        exit 1
+    fi
+
+    local ip
+    ip=$(tailscale_ip)
+    if [[ -z "$ip" ]]; then
+        error "  Could not get Tailscale IP."
+        exit 1
+    fi
+
+    local user
+    user=$(whoami)
+
+    # Base64-encode the private key (single line, no wrapping)
+    local key_b64
+    key_b64=$(base64 < "$HANDOFF_KEY" | tr -d '\n')
+
+    # Build the setup one-liner for Termux
+    # The phone will run this after scanning the QR code
+    local setup_url="https://raw.githubusercontent.com/SagiMedina/handoff/main/termux/setup.sh"
+    local oneliner="curl -fsSL '${setup_url}' | bash -s -- '${ip}' '${user}' '${key_b64}'"
+
+    info "  Scan this QR code in Termux on your phone:"
+    echo ""
+    qrencode -t ANSIUTF8 "$oneliner"
+    echo ""
+    echo "  ${DIM}Steps:${RESET}"
+    echo "  1. Install Termux from F-Droid"
+    echo "  2. Open Termux and type: ${DIM}pkg install termux-api${RESET}"
+    echo "  3. Scan the QR code above, or paste this command:"
+    echo ""
+    printf "  ${DIM}%s${RESET}\n" "$oneliner"
+    echo ""
+}
+
+# ─── handoff status ─────────────────────────────────────────────────
+
+cmd_status() {
+    echo ""
+    info "  Handoff Status"
+    echo "  ──────────────"
+    echo ""
+
+    # Tailscale
+    if tailscale_is_up; then
+        local ip
+        ip=$(tailscale_ip)
+        success "  ✓ Tailscale: connected ($ip)"
+    else
+        error "  ✗ Tailscale: not running"
+    fi
+
+    # SSH
+    if ssh_is_enabled; then
+        success "  ✓ SSH: enabled"
+    else
+        error "  ✗ SSH: disabled (run: sudo systemsetup -setremotelogin on)"
+    fi
+
+    # tmux
+    local session_count
+    session_count=$(tmux_sessions | wc -l | tr -d ' ')
+    if require_cmd tmux; then
+        if [[ "$session_count" -gt 0 ]]; then
+            success "  ✓ tmux: $session_count session(s) active"
+        else
+            warn "  ~ tmux: installed, no active sessions"
+        fi
+    else
+        error "  ✗ tmux: not installed"
+    fi
+
+    # Phone key
+    if [[ -f "$HANDOFF_KEY" ]]; then
+        success "  ✓ Phone key: configured"
+    else
+        error "  ✗ Phone key: not found (run: handoff setup)"
+    fi
+
+    # qrencode
+    if require_cmd qrencode; then
+        success "  ✓ qrencode: installed"
+    else
+        error "  ✗ qrencode: not installed"
+    fi
+
+    echo ""
+}
+
+# ─── Main ───────────────────────────────────────────────────────────
+
+case "${1:-}" in
+    setup)   cmd_setup ;;
+    pair)    cmd_pair ;;
+    status)  cmd_status ;;
+    version) echo "handoff $VERSION" ;;
+    help|-h|--help) usage ;;
+    "")      cmd_default ;;
+    *)
+        error "Unknown command: $1"
+        usage
+        exit 1
+        ;;
+esac
