@@ -195,21 +195,35 @@ cmd_pair() {
     local tmux_path
     tmux_path=$(which tmux)
 
-    # Build the setup one-liner for Termux
-    # The phone will run this after scanning the QR code
-    local setup_url="https://raw.githubusercontent.com/SagiMedina/handoff/main/termux/setup.sh"
-    local oneliner="curl -fsSL '${setup_url}' | bash -s -- '${ip}' '${user}' '${key_b64}' '${tmux_path}'"
+    if [[ "${1:-}" == "--termux" ]]; then
+        # Legacy Termux mode
+        local setup_url="https://raw.githubusercontent.com/SagiMedina/handoff/main/termux/setup.sh"
+        local oneliner="curl -fsSL '${setup_url}' | bash -s -- '${ip}' '${user}' '${key_b64}' '${tmux_path}'"
 
-    info "  Scan this QR code in Termux on your phone:"
+        info "  Scan this QR code in Termux on your phone:"
+        echo ""
+        qrencode -t ANSIUTF8 "$oneliner"
+        echo ""
+        printf "  ${DIM}%s${RESET}\n" "$oneliner"
+        echo ""
+        return
+    fi
+
+    # JSON payload for the Handoff Android app
+    local json_payload
+    json_payload=$(printf '{"v":1,"ip":"%s","user":"%s","key":"%s","tmux":"%s"}' \
+        "$ip" "$user" "$key_b64" "$tmux_path")
+
+    info "  Scan this QR code with the Handoff app on your phone:"
     echo ""
-    qrencode -t ANSIUTF8 "$oneliner"
+    qrencode -t ANSIUTF8 "$json_payload"
     echo ""
     echo "  ${DIM}Steps:${RESET}"
-    echo "  1. Install Termux from F-Droid"
-    echo "  2. Open Termux and type: ${DIM}pkg install termux-api${RESET}"
-    echo "  3. Scan the QR code above, or paste this command:"
+    echo "  1. Install the Handoff app on your phone"
+    echo "  2. Open the app and tap \"Scan QR Code\""
+    echo "  3. Point your phone camera at the QR code above"
     echo ""
-    printf "  ${DIM}%s${RESET}\n" "$oneliner"
+    printf "  ${DIM}For Termux users: handoff pair --termux${RESET}\n"
     echo ""
 }
 
@@ -319,7 +333,7 @@ cmd_unpair() {
 
 case "${1:-}" in
     setup)   cmd_setup ;;
-    pair)    cmd_pair ;;
+    pair)    shift; cmd_pair "$@" ;;
     unpair)  cmd_unpair ;;
     status)  cmd_status ;;
     version) echo "handoff $VERSION" ;;
