@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Handoff — Termux setup script
 # Run on phone after scanning QR code from 'handoff pair'
-# Usage: bash setup.sh <tailscale_ip> <user> <base64_private_key>
+# Usage: bash setup.sh <tailscale_ip> <user> <base64_private_key> <tmux_path>
 set -euo pipefail
 
 TAILSCALE_IP="${1:?Missing Tailscale IP}"
 REMOTE_USER="${2:?Missing username}"
 KEY_B64="${3:?Missing SSH key}"
+TMUX_PATH="${4:-/opt/homebrew/bin/tmux}"
 
 SSH_DIR="$HOME/.ssh"
 KEY_FILE="$SSH_DIR/handoff_key"
@@ -60,6 +61,7 @@ mkdir -p "$CONFIG_DIR"
 cat > "$CONFIG_FILE" <<EOF
 TAILSCALE_IP=$TAILSCALE_IP
 REMOTE_USER=$REMOTE_USER
+TMUX_PATH=$TMUX_PATH
 EOF
 echo "  ✓ Config saved"
 
@@ -85,7 +87,7 @@ echo "  Connecting to Mac..."
 echo ""
 
 # Get tmux sessions from Mac
-SESSIONS=$(ssh "$SSH_HOST" "bash -lc \"tmux list-sessions -F '#{session_name}:#{session_windows}'\"" 2>/dev/null) || true
+SESSIONS=$(ssh "$SSH_HOST" "$TMUX_PATH list-sessions -F '#{session_name}:#{session_windows}'" 2>/dev/null) || true
 
 if [[ -z "$SESSIONS" ]]; then
     echo "  No active tmux sessions on Mac."
@@ -100,7 +102,7 @@ if [[ "$SESSION_COUNT" -eq 1 ]]; then
     SESSION_NAME=$(echo "$SESSIONS" | cut -d: -f1)
     echo "  Attaching to: $SESSION_NAME"
     echo ""
-    exec ssh -t "$SSH_HOST" "bash -lc \"tmux attach -t '$SESSION_NAME'\""
+    exec ssh -t "$SSH_HOST" "$TMUX_PATH attach -t '$SESSION_NAME'"
 fi
 
 # Multiple sessions — show picker
@@ -124,7 +126,7 @@ if [[ "$choice" -ge 1 && "$choice" -le "$SESSION_COUNT" ]] 2>/dev/null; then
     echo ""
     echo "  Attaching to: $SESSION_NAME"
     echo ""
-    exec ssh -t "$SSH_HOST" "bash -lc \"tmux attach -t '$SESSION_NAME'\""
+    exec ssh -t "$SSH_HOST" "$TMUX_PATH attach -t '$SESSION_NAME'"
 else
     echo "  Invalid choice."
     read -rp "  Press Enter to exit..."
