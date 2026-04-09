@@ -90,7 +90,9 @@ class SshManager {
         val channel = sess.openChannel("exec") as ChannelExec
         channel.setPtyType("xterm-256color", cols, rows, cols * 8, rows * 16)
         channel.setPty(true)
-        channel.setCommand("$tmuxPath attach -t '${sessionName}:${windowIndex}'")
+        // Set UTF-8 locale so tmux sends Unicode characters instead of ASCII fallbacks.
+        // Without this, tmux replaces ●, ❯, etc. with _ because it assumes non-UTF-8 client.
+        channel.setCommand("export LANG=en_US.UTF-8; $tmuxPath attach -t '${sessionName}:${windowIndex}'")
 
         // Get streams BEFORE connect
         val inputFromRemote = channel.inputStream
