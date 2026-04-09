@@ -6,7 +6,7 @@ plugins {
 
 android {
     namespace = "com.handoff.app"
-    compileSdk = 35
+    compileSdk = 36
 
     defaultConfig {
         applicationId = "com.handoff.app"
@@ -31,12 +31,29 @@ android {
         targetCompatibility = JavaVersion.VERSION_17
     }
 
-    kotlinOptions {
-        jvmTarget = "17"
+    kotlin {
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_17)
+        }
     }
 
     buildFeatures {
         compose = true
+    }
+
+    packaging {
+        resources {
+            excludes += listOf(
+                "META-INF/DEPENDENCIES",
+                "META-INF/LICENSE",
+                "META-INF/LICENSE.txt",
+                "META-INF/LICENSE.md",
+                "META-INF/NOTICE",
+                "META-INF/NOTICE.txt",
+                "META-INF/NOTICE.md",
+                "META-INF/versions/**"
+            )
+        }
     }
 }
 
@@ -60,10 +77,8 @@ dependencies {
     implementation("com.google.mlkit:barcode-scanning:17.3.0")
 
     // SSH
-    implementation("org.apache.sshd:sshd-core:2.13.0")
-
-    // Terminal emulator (Termux libraries via JitPack)
-    implementation("com.github.termux.termux-app:terminal-view:0.118.1")
+    implementation("com.github.mwiede:jsch:0.2.21")
+    implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 
     // DataStore for persistence
     implementation("androidx.datastore:datastore-preferences:1.1.1")
@@ -74,6 +89,5 @@ dependencies {
     // Coroutines
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.9.0")
 
-    // JSON parsing
-    implementation("org.json:json:20231013")
+    // org.json is built into Android - no external dep needed
 }

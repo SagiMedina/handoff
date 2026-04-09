@@ -4,14 +4,17 @@ import android.os.Bundle
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.padding
+import androidx.compose.material3.Scaffold
 import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.SshManager
-import com.handoff.app.shortcuts.HandoffShortcutManager
 import com.handoff.app.ui.screens.*
 import com.handoff.app.ui.theme.HandoffTheme
 import kotlinx.coroutines.launch
@@ -25,8 +28,6 @@ class MainActivity : ComponentActivity() {
         enableEdgeToEdge()
 
         val configStore = ConfigStore(applicationContext)
-        val shortcutManager = HandoffShortcutManager(applicationContext)
-
         setContent {
             HandoffTheme {
                 val navController = rememberNavController()
@@ -38,29 +39,30 @@ class MainActivity : ComponentActivity() {
                     config = configStore.load()
                 }
 
-                // Handle deep links
-                val deepLink = intent?.data
-                val autoConnect = deepLink?.scheme == "handoff" && deepLink.host == "connect"
-
+                Scaffold { innerPadding ->
+                // innerPadding applied per-screen; terminal goes edge-to-edge
+                val scaffoldPadding = innerPadding
                 NavHost(
                     navController = navController,
-                    startDestination = if (config != null) "sessions" else "welcome"
+                    startDestination = if (config != null) "sessions" else "welcome",
                 ) {
                     composable("welcome") {
+                        Box(Modifier.padding(scaffoldPadding)) {
                         WelcomeScreen(
                             onScanClick = {
                                 navController.navigate("scan")
                             }
                         )
+                        }
                     }
 
                     composable("scan") {
+                        Box(Modifier.padding(scaffoldPadding)) {
                         ScanScreen(
                             onConfigScanned = { scannedConfig ->
                                 scope.launch {
                                     configStore.save(scannedConfig)
                                     config = scannedConfig
-                                    shortcutManager.createHomeShortcut()
                                     navController.navigate("sessions") {
                                         popUpTo("welcome") { inclusive = true }
                                     }
@@ -68,9 +70,11 @@ class MainActivity : ComponentActivity() {
                             },
                             onError = { /* TODO: show snackbar */ }
                         )
+                        }
                     }
 
                     composable("sessions") {
+                        Box(Modifier.padding(scaffoldPadding)) {
                         val currentConfig = config
                         if (currentConfig != null) {
                             SessionsScreen(
@@ -93,6 +97,7 @@ class MainActivity : ComponentActivity() {
                                 }
                             )
                         }
+                        }
                     }
 
                     composable("terminal/{session}/{window}") { backStackEntry ->
@@ -112,6 +117,7 @@ class MainActivity : ComponentActivity() {
                             )
                         }
                     }
+                }
                 }
             }
         }

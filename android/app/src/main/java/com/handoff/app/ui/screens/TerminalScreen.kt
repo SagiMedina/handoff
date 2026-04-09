@@ -1,25 +1,33 @@
 package com.handoff.app.ui.screens
 
+import android.content.ClipboardManager
+import android.content.Context
+import android.util.Log
+import android.view.KeyEvent
+import android.view.MotionEvent
+import android.view.inputmethod.InputMethodManager
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.ime
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.platform.LocalConfiguration
-import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.SshManager
 import com.handoff.app.ui.components.MobileToolbar
-import com.termux.terminal.TerminalEmulator
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.io.InputStream
 import java.io.OutputStream
 
 @Composable
@@ -30,96 +38,191 @@ fun TerminalScreen(
     windowIndex: Int,
     onDisconnect: () -> Unit
 ) {
-    var connected by remember { mutableStateOf(false) }
+    var sshReady by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var outputStream by remember { mutableStateOf<OutputStream?>(null) }
+    var termView by remember { mutableStateOf<TerminalView?>(null) }
+    val terminalSsh = remember { SshManager() }
     val scope = rememberCoroutineScope()
+    val context = LocalContext.current
 
-    // Estimate terminal size
-    val configuration = LocalConfiguration.current
-    val cols = (configuration.screenWidthDp / 8).coerceIn(40, 200)
-    val rows = ((configuration.screenHeightDp - 60) / 16).coerceIn(10, 100)
-
-    LaunchedEffect(Unit) {
-        try {
-            if (!sshManager.isConnected) {
-                sshManager.connect(config)
+    val sessionClient = remember {
+        object : TerminalSessionClient {
+            override fun onTextChanged(changedSession: TerminalSession) {
+                val view = termView
+                if (view != null) {
+                    view.onScreenUpdated()
+                } else {
+                    Log.w("Handoff", "onTextChanged but termView is null!")
+                }
             }
-            val (input, output) = sshManager.openShell(
-                config.tmuxPath, sessionName, windowIndex, cols, rows
+            override fun onTitleChanged(changedSession: TerminalSession) {}
+            override fun onSessionFinished(finishedSession: TerminalSession) {}
+            override fun onBell(session: TerminalSession) {}
+            override fun onColorsChanged(session: TerminalSession) {
+                termView?.invalidate()
+            }
+            override fun onCopyTextToClipboard(session: TerminalSession, text: String?) {
+                if (text != null) {
+                    val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                    clip.setPrimaryClip(android.content.ClipData.newPlainText("terminal", text))
+                }
+            }
+            override fun onPasteTextFromClipboard(session: TerminalSession?) {
+                val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+                val text = clip.primaryClip?.getItemAt(0)?.text?.toString()
+                if (text != null) session?.getEmulator()?.paste(text)
+            }
+            override fun onTerminalCursorStateChange(state: Boolean) {}
+            override fun setTerminalShellPid(session: TerminalSession, pid: Int) {}
+            override fun getTerminalCursorStyle(): Int = 0
+            override fun logError(tag: String?, message: String?) { Log.e(tag ?: "Handoff", message ?: "") }
+            override fun logWarn(tag: String?, message: String?) {}
+            override fun logInfo(tag: String?, message: String?) {}
+            override fun logDebug(tag: String?, message: String?) {}
+            override fun logVerbose(tag: String?, message: String?) {}
+            override fun logStackTraceWithMessage(tag: String?, message: String?, e: Exception?) {}
+            override fun logStackTrace(tag: String?, e: Exception?) {}
+        }
+    }
+
+    val viewClient = remember {
+        object : TerminalViewClient {
+            override fun onScale(scale: Float): Float = scale
+            override fun onSingleTapUp(e: MotionEvent?) {
+                termView?.let { view ->
+                    view.requestFocus()
+                    val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                    imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
+                }
+            }
+            override fun shouldBackButtonBeMappedToEscape(): Boolean = false
+            override fun shouldEnforceCharBasedInput(): Boolean = true
+            override fun shouldUseCtrlSpaceWorkaround(): Boolean = false
+            override fun isTerminalViewSelected(): Boolean = true
+            override fun copyModeChanged(copyMode: Boolean) {}
+            override fun onKeyDown(keyCode: Int, e: KeyEvent?, session: TerminalSession?): Boolean = false
+            override fun onKeyUp(keyCode: Int, e: KeyEvent?): Boolean = false
+            override fun onLongPress(event: MotionEvent?): Boolean = false
+            override fun readControlKey(): Boolean = false
+            override fun readAltKey(): Boolean = false
+            override fun readShiftKey(): Boolean = false
+            override fun readFnKey(): Boolean = false
+            override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession?): Boolean = false
+            override fun onEmulatorSet() {
+                termView?.let { view ->
+                    // Notify SSH of the terminal size once emulator is ready
+                    val emulator = view.mEmulator ?: return
+                    terminalSsh.resizeShell(emulator.mColumns, emulator.mRows)
+                }
+            }
+            override fun logError(tag: String?, message: String?) {}
+            override fun logWarn(tag: String?, message: String?) {}
+            override fun logInfo(tag: String?, message: String?) {}
+            override fun logDebug(tag: String?, message: String?) {}
+            override fun logVerbose(tag: String?, message: String?) {}
+            override fun logStackTraceWithMessage(tag: String?, message: String?, e: Exception?) {}
+            override fun logStackTrace(tag: String?, e: Exception?) {}
+        }
+    }
+
+    // Clean up terminal SSH on leave
+    DisposableEffect(Unit) {
+        onDispose { terminalSsh.disconnect() }
+    }
+
+    // Connect SSH once after TerminalView is created, keyboard shown, and view stabilized
+    LaunchedEffect(Unit) {
+        // Wait for termView to be set by AndroidView factory
+        while (termView == null) { delay(50) }
+        val view = termView!!
+
+        // Wait for view to have real dimensions
+        while (view.width == 0 || view.height == 0) { delay(50) }
+
+        // Show keyboard FIRST — so the view resizes before we calculate terminal dimensions
+        view.post {
+            view.requestFocus()
+            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+            imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
+        }
+
+        // Wait for keyboard animation to settle (view height stabilizes)
+        var lastHeight = view.height
+        delay(400)
+        while (true) {
+            delay(100)
+            if (view.height == lastHeight) break
+            lastHeight = view.height
+        }
+
+        // Now calculate terminal size with keyboard visible
+        val session = TerminalSession(sessionClient)
+        val renderer = view.mRenderer
+        val cols = (view.width / renderer.fontWidth).toInt().coerceAtLeast(4)
+        val rows = (view.height / renderer.fontLineSpacing).coerceAtLeast(4)
+        session.initializeEmulator(cols, rows, renderer.fontWidth.toInt(), renderer.fontLineSpacing)
+        view.attachSession(session)
+
+        val emulator = view.mEmulator
+        val actualCols = emulator?.mColumns ?: cols
+        val actualRows = emulator?.mRows ?: rows
+        Log.d("Handoff", "Terminal: ${actualCols}x${actualRows} (after keyboard)")
+
+        try {
+            terminalSsh.connect(config)
+            val (input, output) = terminalSsh.openShell(
+                config.tmuxPath, sessionName, windowIndex, actualCols, actualRows
             )
             outputStream = output
-            connected = true
+            session.setOutputStream(output)
+            session.startReading(input)
+            sshReady = true
+            Log.d("Handoff", "SSH ready")
         } catch (e: Exception) {
+            Log.e("Handoff", "SSH failed", e)
             error = "Failed to connect: ${e.message}"
         }
     }
 
-    Column(modifier = Modifier.fillMaxSize()) {
-        when {
-            error != null -> {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .weight(1f),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        Text(
-                            text = error!!,
-                            color = MaterialTheme.colorScheme.error
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Button(onClick = onDisconnect) {
-                            Text("Back")
-                        }
-                    }
-                }
-            }
-            !connected -> {
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .weight(1f),
-                    contentAlignment = Alignment.Center
-                ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                        CircularProgressIndicator(
-                            color = MaterialTheme.colorScheme.primary
-                        )
-                        Spacer(modifier = Modifier.height(16.dp))
-                        Text(
-                            text = "Attaching to $sessionName:$windowIndex...",
-                            color = MaterialTheme.colorScheme.onSurfaceVariant
-                        )
-                    }
-                }
-            }
-            else -> {
-                // Terminal view placeholder
-                // Note: Full terminal-view integration requires bridging SSH I/O
-                // to the Termux TerminalEmulator which needs native JNI setup.
-                // This is a simplified version that will be enhanced.
-                Box(
-                    modifier = Modifier
-                        .fillMaxSize()
-                        .weight(1f)
-                )
-
-                // Mobile toolbar
-                MobileToolbar(
-                    onKey = { bytes ->
-                        scope.launch(Dispatchers.IO) {
-                            try {
-                                outputStream?.write(bytes)
-                                outputStream?.flush()
-                            } catch (e: Exception) {
-                                // Connection lost
-                            }
-                        }
-                    }
-                )
+    if (error != null) {
+        Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(text = error!!, color = MaterialTheme.colorScheme.error)
+                Spacer(modifier = Modifier.height(16.dp))
+                Button(onClick = onDisconnect) { Text("Back") }
             }
         }
+        return
+    }
+
+    Column(modifier = Modifier.fillMaxSize()
+        .windowInsetsPadding(WindowInsets.statusBars)
+        .imePadding()
+    ) {
+        AndroidView(
+            factory = { ctx ->
+                TerminalView(ctx, null).apply {
+                    setTerminalViewClient(viewClient)
+                    setTextSize(24) // Termux default: 24dp
+                    isFocusable = true
+                    isFocusableInTouchMode = true
+                    keepScreenOn = true
+                    termView = this
+                }
+            },
+            modifier = Modifier.fillMaxWidth().weight(1f)
+        )
+
+        MobileToolbar(
+            onKey = { bytes ->
+                scope.launch(Dispatchers.IO) {
+                    try {
+                        outputStream?.write(bytes)
+                        outputStream?.flush()
+                    } catch (_: Exception) {}
+                }
+            }
+        )
     }
 }

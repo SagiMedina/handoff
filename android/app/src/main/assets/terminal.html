@@ -1,0 +1,88 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<link rel="stylesheet" href="xterm.min.css">
+<style>
+* { margin: 0; padding: 0; box-sizing: border-box; }
+html, body { overflow: hidden; background: #0d1117; }
+#terminal { position: fixed; top: 0; left: 0; right: 0; bottom: 0; }
+</style>
+</head>
+<body>
+<div id="terminal"></div>
+<script src="xterm.min.js"></script>
+<script src="addon-fit.min.js"></script>
+<script src="addon-web-links.min.js"></script>
+<script>
+var term = new Terminal({
+  theme: {
+    background: '#0d1117',
+    foreground: '#c9d1d9',
+    cursor: '#c9d1d9',
+    selectionBackground: '#264f78',
+    black: '#484f58', red: '#ff7b72', green: '#3fb950',
+    yellow: '#d29922', blue: '#58a6ff', magenta: '#bc8cff',
+    cyan: '#39c5cf', white: '#b1bac4',
+    brightBlack: '#6e7681', brightRed: '#ffa198', brightGreen: '#56d364',
+    brightYellow: '#e3b341', brightBlue: '#79c0ff', brightMagenta: '#d2a8ff',
+    brightCyan: '#56d4dd', brightWhite: '#f0f6fc'
+  },
+  fontFamily: 'monospace',
+  fontSize: 14,
+  cursorBlink: true,
+  scrollback: 5000,
+  convertEol: false,
+  allowProposedApi: true
+});
+
+var fitAddon = new FitAddon.FitAddon();
+term.loadAddon(fitAddon);
+term.loadAddon(new WebLinksAddon.WebLinksAddon());
+
+term.open(document.getElementById('terminal'));
+
+// Keyboard input -> Android
+term.onData(function(data) {
+  if (window.AndroidBridge) window.AndroidBridge.onInput(data);
+});
+
+// Debounced resize — only notify Android after keyboard animation settles
+var resizeTimer = null;
+var lastCols = 0;
+var lastRows = 0;
+
+function doFit() {
+  fitAddon.fit();
+  // Only send resize to SSH if dimensions actually changed, after a settle delay
+  if (term.cols !== lastCols || term.rows !== lastRows) {
+    if (resizeTimer) clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(function() {
+      lastCols = term.cols;
+      lastRows = term.rows;
+      if (window.AndroidBridge) window.AndroidBridge.onResize(term.cols, term.rows);
+    }, 300);
+  }
+}
+window.addEventListener('resize', doFit);
+
+// SSH output -> terminal
+function writeOutput(base64Data) {
+  var binaryStr = atob(base64Data);
+  var bytes = new Uint8Array(binaryStr.length);
+  for (var i = 0; i < binaryStr.length; i++) bytes[i] = binaryStr.charCodeAt(i);
+  term.write(bytes);
+}
+
+// Wait for layout then signal ready
+setTimeout(function() {
+  fitAddon.fit();
+  console.log('HANDOFF: ready cols=' + term.cols + ' rows=' + term.rows);
+  if (window.AndroidBridge) {
+    window.AndroidBridge.onReady(term.cols, term.rows);
+  }
+}, 500);
+</script>
+</body>
+</html>

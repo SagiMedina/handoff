@@ -30,15 +30,12 @@ ${BOLD}Usage:${RESET}
 
 cmd_default() {
     echo ""
-    if ! tailscale_is_up; then
-        error "  Tailscale is not running. Start it with: tailscale up"
-        exit 1
-    fi
+    ensure_tailscale || exit 1
 
     local ip
     ip=$(tailscale_ip)
     if [[ -z "$ip" ]]; then
-        error "  Could not get Tailscale IP. Run: tailscale up"
+        error "  Could not get Tailscale IP."
         exit 1
     fi
 
@@ -78,19 +75,8 @@ cmd_setup() {
     if tailscale_is_up; then
         success "  ✓ Tailscale is running"
     else
-        info "  Starting Tailscale..."
-        sudo brew services start tailscale 2>/dev/null || true
-        echo ""
-        warn "  Please log in to Tailscale:"
-        echo "    tailscale up"
-        echo ""
-        read -rp "  Press Enter after you've logged in... "
-        if tailscale_is_up; then
-            success "  ✓ Tailscale connected"
-        else
-            error "  Tailscale is not connected. Run 'tailscale up' and try again."
-            exit 1
-        fi
+        ensure_tailscale || exit 1
+        success "  ✓ Tailscale connected"
     fi
 
     # 3. qrencode
@@ -172,10 +158,7 @@ cmd_pair() {
         exit 1
     fi
 
-    if ! tailscale_is_up; then
-        error "  Tailscale is not running. Start it with: tailscale up"
-        exit 1
-    fi
+    ensure_tailscale || exit 1
 
     local ip
     ip=$(tailscale_ip)

@@ -27,6 +27,61 @@ tailscale_is_up() {
     tailscale status &>/dev/null
 }
 
+# Start the Tailscale daemon (handles both brew and Mac App Store installs)
+tailscale_start_daemon() {
+    if [[ -d "/Applications/Tailscale.app" ]]; then
+        open -a Tailscale
+    else
+        brew services start tailscale 2>/dev/null || sudo brew services start tailscale 2>/dev/null || true
+    fi
+}
+
+# Ensure Tailscale is up — start it if not, wait for it, or fail with a clear message
+ensure_tailscale() {
+    if tailscale_is_up; then
+        return 0
+    fi
+
+    if ! require_cmd tailscale; then
+        error "  Tailscale is not installed."
+        echo "    brew install tailscale"
+        echo "    — or install from the Mac App Store"
+        return 1
+    fi
+
+    info "  Starting Tailscale..."
+    tailscale_start_daemon
+
+    # Wait for the daemon to be reachable
+    local i
+    for i in $(seq 1 10); do
+        if tailscale status &>/dev/null 2>&1 || tailscale up &>/dev/null 2>&1; then
+            break
+        fi
+        sleep 1
+    done
+
+    if tailscale_is_up; then
+        success "  Tailscale connected."
+        return 0
+    fi
+
+    # Daemon is up but not logged in — run tailscale up interactively
+    if tailscale status 2>&1 | grep -qi "stopped\|needslogin\|not logged in"; then
+        warn "  Tailscale needs login."
+        tailscale up
+        if tailscale_is_up; then
+            success "  Tailscale connected."
+            return 0
+        fi
+    fi
+
+    error "  Could not start Tailscale."
+    echo "    Try: open /Applications/Tailscale.app"
+    echo "    — or: brew services start tailscale && tailscale up"
+    return 1
+}
+
 # Get the Tailscale IPv4 address of this machine
 tailscale_ip() {
     tailscale ip -4 2>/dev/null

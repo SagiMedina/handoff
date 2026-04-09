@@ -1,41 +1,49 @@
 package com.handoff.app.data
 
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import com.jcraft.jsch.ChannelExec
+import com.jcraft.jsch.JSch
+import com.jcraft.jsch.Session
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
-import org.apache.sshd.client.SshClient
-import org.apache.sshd.client.channel.ChannelShell
-import org.apache.sshd.client.session.ClientSession
-import org.apache.sshd.common.config.keys.loader.pem.PEMResourceParserUtils
-import org.apache.sshd.common.util.security.SecurityUtils
-import java.io.ByteArrayInputStream
 import java.io.InputStream
 import java.io.OutputStream
-import java.security.KeyPair
+import org.bouncycastle.jce.provider.BouncyCastleProvider
+import java.security.Security
 import java.util.Base64
-import java.util.concurrent.TimeUnit
+import java.util.Properties
 
 class SshManager {
 
-    private var client: SshClient? = null
-    private var session: ClientSession? = null
-    private var shellChannel: ChannelShell? = null
+    private var session: Session? = null
+    private var shellChannel: ChannelExec? = null
+    private val resizeHandler = Handler(Looper.getMainLooper())
+    private var pendingResize: Runnable? = null
 
     suspend fun connect(config: ConnectionConfig) = withContext(Dispatchers.IO) {
         disconnect()
 
-        val sshClient = SshClient.setUpDefaultClient()
-        sshClient.start()
-        client = sshClient
+        // Ensure BouncyCastle is available for Ed25519 key support
+        if (Security.getProvider(BouncyCastleProvider.PROVIDER_NAME) == null) {
+            Security.insertProviderAt(BouncyCastleProvider(), 1)
+        }
 
-        val keyPair = loadKeyPair(config.privateKey)
+        val jsch = JSch()
+        val keyBytes = Base64.getDecoder().decode(config.privateKey)
+        Log.d("Handoff", "Key bytes length: ${keyBytes.size}, starts with: ${String(keyBytes.take(30).toByteArray())}")
+        jsch.addIdentity("handoff", keyBytes, null, null)
 
-        val clientSession = sshClient.connect(config.user, config.ip, 22)
-            .verify(10, TimeUnit.SECONDS)
-            .session
-
-        clientSession.addPublicKeyIdentity(keyPair)
-        clientSession.auth().verify(10, TimeUnit.SECONDS)
-        session = clientSession
+        val sess = jsch.getSession(config.user, config.ip, 22)
+        val props = Properties()
+        props["StrictHostKeyChecking"] = "no"
+        sess.setConfig(props)
+        sess.setServerAliveInterval(15_000) // Send keepalive every 15s
+        sess.setServerAliveCountMax(3)
+        sess.connect(10_000)
+        session = sess
+        Log.d("Handoff", "SSH connected via JSch")
     }
 
     suspend fun listSessions(tmuxPath: String): List<TmuxSession> = withContext(Dispatchers.IO) {
@@ -73,57 +81,59 @@ class SshManager {
         cols: Int,
         rows: Int
     ): Pair<InputStream, OutputStream> = withContext(Dispatchers.IO) {
-        val currentSession = session ?: throw IllegalStateException("Not connected")
+        val sess = session ?: throw IllegalStateException("Not connected")
 
-        val channel = currentSession.createShellChannel()
-        channel.setPtyColumns(cols)
-        channel.setPtyLines(rows)
-        channel.setPtyType("xterm-256color")
+        // Use exec channel (not shell) — matches `ssh -t host "tmux attach ..."` behavior.
+        // Shell channel opens an interactive shell then sends tmux attach as text,
+        // which causes race conditions and locks the Mac tmux session.
+        val channel = sess.openChannel("exec") as ChannelExec
+        channel.setPtyType("xterm-256color", cols, rows, cols * 8, rows * 16)
+        channel.setPty(true)
+        channel.setCommand("$tmuxPath attach -t '${sessionName}:${windowIndex}'")
 
-        channel.open().verify(10, TimeUnit.SECONDS)
+        // Get streams BEFORE connect
+        val inputFromRemote = channel.inputStream
+        val outputToRemote = channel.outputStream
+
+        channel.connect(10_000)
         shellChannel = channel
 
-        // Attach to the tmux session window
-        val attachCmd = "$tmuxPath attach -t '${sessionName}:${windowIndex}'\n"
-        channel.invertedIn.write(attachCmd.toByteArray())
-        channel.invertedIn.flush()
+        Log.d("Handoff", "Exec channel connected, running: tmux attach -t '${sessionName}:${windowIndex}'")
 
-        Pair(channel.invertedOut, channel.invertedIn)
+        Pair(inputFromRemote, outputToRemote)
     }
 
     fun resizeShell(cols: Int, rows: Int) {
-        shellChannel?.let { channel ->
-            channel.sendWindowChange(cols, rows)
+        // Debounce: keyboard animation fires many rapid resize events.
+        // Only send the final size to tmux after 150ms of no changes.
+        pendingResize?.let { resizeHandler.removeCallbacks(it) }
+        pendingResize = Runnable {
+            val ch = shellChannel ?: return@Runnable
+            Log.d("Handoff", "resizeShell: ${cols}x${rows}")
+            ch.setPtySize(cols, rows, cols * 8, rows * 16)
         }
+        resizeHandler.postDelayed(pendingResize!!, 150)
     }
 
     private suspend fun executeCommand(command: String): String = withContext(Dispatchers.IO) {
-        val currentSession = session ?: throw IllegalStateException("Not connected")
-        val channel = currentSession.createExecChannel(command)
-        channel.open().verify(10, TimeUnit.SECONDS)
-
-        val output = channel.invertedOut.bufferedReader().readText()
-        channel.close()
+        val sess = session ?: throw IllegalStateException("Not connected")
+        val channel = sess.openChannel("exec") as ChannelExec
+        channel.setCommand(command)
+        channel.inputStream = null
+        val input = channel.inputStream
+        channel.connect(10_000)
+        val output = input.bufferedReader().readText()
+        channel.disconnect()
         output
     }
 
-    private fun loadKeyPair(base64Key: String): KeyPair {
-        val keyBytes = Base64.getDecoder().decode(base64Key)
-        val keyStream = ByteArrayInputStream(keyBytes)
-        val loader = SecurityUtils.getKeyPairResourceParser()
-        val keyPairs = loader.loadKeyPairs(null, null, null, keyStream)
-        return keyPairs.first()
-    }
-
     fun disconnect() {
-        shellChannel?.close()
+        shellChannel?.disconnect()
         shellChannel = null
-        session?.close()
+        session?.disconnect()
         session = null
-        client?.stop()
-        client = null
     }
 
     val isConnected: Boolean
-        get() = session?.isOpen == true
+        get() = session?.isConnected == true
 }
