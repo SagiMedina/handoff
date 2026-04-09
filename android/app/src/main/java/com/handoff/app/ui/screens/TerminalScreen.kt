@@ -2,6 +2,7 @@ package com.handoff.app.ui.screens
 
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Typeface
 import android.util.Log
 import android.view.KeyEvent
 import android.view.MotionEvent
@@ -204,7 +205,11 @@ fun TerminalScreen(
             factory = { ctx ->
                 TerminalView(ctx, null).apply {
                     setTerminalViewClient(viewClient)
-                    setTextSize(24) // Termux default: 24dp
+                    setTextSize(24)
+                    // JetBrains Mono for broad Unicode coverage (❯, ●, box drawing, etc.)
+                    // Android's font fallback handles remaining chars (braille, dingbats).
+                    val font = Typeface.createFromAsset(ctx.assets, "JetBrainsMono-Regular.ttf")
+                    setTypeface(font)
                     isFocusable = true
                     isFocusableInTouchMode = true
                     keepScreenOn = true

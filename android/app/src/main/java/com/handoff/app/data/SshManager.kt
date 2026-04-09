@@ -68,7 +68,8 @@ class SshManager {
             val parts = line.split("|", limit = 3)
             TmuxWindow(
                 index = parts[0].toIntOrNull() ?: 0,
-                title = parts.getOrElse(1) { "" }.ifBlank { parts.getOrElse(2) { "shell" } },
+                title = (parts.getOrElse(1) { "" }.ifBlank { parts.getOrElse(2) { "shell" } })
+                    .replace(Regex("^[^\\p{L}\\p{N}]+"), "").trim(), // Strip leading Unicode symbols (e.g. Claude Code status indicators)
                 command = parts.getOrElse(2) { "" }
             )
         }
