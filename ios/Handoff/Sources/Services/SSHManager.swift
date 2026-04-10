@@ -351,7 +351,7 @@ private final class PublicKeyAuthDelegate: NIOSSHClientUserAuthenticationDelegat
             .init(
                 username: username,
                 serviceName: "",
-                offer: .privateKey(.init(privateKey: .ed25519(privateKey)))
+                offer: .privateKey(.init(privateKey: NIOSSHPrivateKey(ed25519Key: privateKey)))
             )
         )
     }

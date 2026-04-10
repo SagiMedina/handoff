@@ -192,7 +192,7 @@ extension SSHManager {
                 return childChannel.eventLoop.makeFailedFuture(SSHError.channelError("Unexpected channel type"))
             }
             // Enable half-closure per codex recommendation
-            childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).flatMap {
+            return childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).flatMap {
                 childChannel.pipeline.addHandler(handler)
             }
         }

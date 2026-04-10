@@ -78,7 +78,7 @@ struct TerminalView: View {
         .onDisappear {
             sshManager.disconnect()
         }
-        .onChange(of: scenePhase) { _, newPhase in
+        .onChange(of: scenePhase) { newPhase in
             switch newPhase {
             case .background:
                 wasBackgrounded = true
@@ -180,10 +180,9 @@ struct SwiftTermView: UIViewRepresentable {
         handler?.onDataReceived = { data in
             DispatchQueue.main.async {
                 let terminal = termView.getTerminal()
-                data.withUnsafeBytes { rawBuffer in
-                    let bytes = rawBuffer.bindMemory(to: UInt8.self)
-                    terminal.feed(buffer: bytes)
-                }
+                let array = Array(data)
+                let slice = array[array.startIndex..<array.endIndex]
+                terminal.feed(buffer: slice)
                 termView.setNeedsDisplay()
             }
         }
@@ -223,7 +222,19 @@ struct SwiftTermView: UIViewRepresentable {
 
         func setTerminalTitle(source: SwiftTerm.TerminalView, title: String) {}
         func scrolled(source: SwiftTerm.TerminalView, position: Double) {}
-        func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
-        func requestOpenLink(source: TerminalView, link: String, params: [String : String]) {}
+        func hostCurrentDirectoryUpdate(source: SwiftTerm.TerminalView, directory: String?) {}
+        func requestOpenLink(source: SwiftTerm.TerminalView, link: String, params: [String : String]) {
+            if let url = URL(string: link) {
+                UIApplication.shared.open(url)
+            }
+        }
+        func bell(source: SwiftTerm.TerminalView) {}
+        func clipboardCopy(source: SwiftTerm.TerminalView, content: Data) {
+            if let text = String(data: content, encoding: .utf8) {
+                UIPasteboard.general.string = text
+            }
+        }
+        func iTermContent(source: SwiftTerm.TerminalView, content: ArraySlice<UInt8>) {}
+        func rangeChanged(source: SwiftTerm.TerminalView, startY: Int, endY: Int) {}
     }
 }
