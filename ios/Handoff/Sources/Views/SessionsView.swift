@@ -1,11 +1,12 @@
 import SwiftUI
 
 /// Displays tmux sessions and windows from the remote Mac.
-/// Full SSH integration in Phase 3.
+/// Connects via SSH, discovers sessions, and allows navigation to terminal.
 struct SessionsView: View {
     @EnvironmentObject var configStore: ConfigStore
     @Binding var path: NavigationPath
 
+    @StateObject private var sshManager = SSHManager()
     @State private var sessions: [TmuxSession] = []
     @State private var isLoading = true
     @State private var errorMessage: String?
@@ -15,48 +16,18 @@ struct SessionsView: View {
             Theme.background.ignoresSafeArea()
 
             if isLoading {
-                ProgressView("Connecting...")
-                    .foregroundColor(Theme.textSecondary)
+                VStack(spacing: 16) {
+                    ProgressView()
+                        .tint(Theme.primary)
+                    Text("Connecting...")
+                        .foregroundColor(Theme.textSecondary)
+                }
             } else if let error = errorMessage {
-                VStack(spacing: 16) {
-                    Image(systemName: "wifi.exclamationmark")
-                        .font(.system(size: 48))
-                        .foregroundColor(Theme.red)
-                    Text(error)
-                        .foregroundColor(Theme.textSecondary)
-                        .multilineTextAlignment(.center)
-                    Button("Retry") {
-                        loadSessions()
-                    }
-                    .foregroundColor(Theme.primary)
-                }
-                .padding()
+                errorView(error)
             } else if sessions.isEmpty {
-                VStack(spacing: 16) {
-                    Image(systemName: "terminal")
-                        .font(.system(size: 48))
-                        .foregroundColor(Theme.textSecondary)
-                    Text("No tmux sessions running on your Mac.")
-                        .foregroundColor(Theme.textSecondary)
-                    Button("Refresh") {
-                        loadSessions()
-                    }
-                    .foregroundColor(Theme.primary)
-                }
+                emptyView
             } else {
-                ScrollView {
-                    LazyVStack(spacing: 12) {
-                        ForEach(sessions) { session in
-                            SessionCard(session: session) { window in
-                                path.append(ContentView.Route.terminal(
-                                    session: session.name,
-                                    window: window.index
-                                ))
-                            }
-                        }
-                    }
-                    .padding()
-                }
+                sessionList
             }
         }
         .navigationTitle("Sessions")
@@ -64,6 +35,7 @@ struct SessionsView: View {
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button("Unpair") {
+                    sshManager.disconnect()
                     configStore.unpair()
                     path.removeLast(path.count)
                 }
@@ -76,30 +48,119 @@ struct SessionsView: View {
                     Image(systemName: "arrow.clockwise")
                 }
                 .foregroundColor(Theme.primary)
+                .disabled(isLoading)
             }
         }
         .onAppear {
             loadSessions()
         }
+        .onDisappear {
+            // Don't disconnect here — terminal screen may still need the connection
+        }
     }
 
+    // MARK: - Subviews
+
+    private var sessionList: some View {
+        ScrollView {
+            LazyVStack(spacing: 12) {
+                ForEach(sessions) { session in
+                    SessionCard(session: session) { window in
+                        path.append(ContentView.Route.terminal(
+                            session: session.name,
+                            window: window.index
+                        ))
+                    }
+                }
+            }
+            .padding()
+        }
+    }
+
+    private var emptyView: some View {
+        VStack(spacing: 16) {
+            Image(systemName: "terminal")
+                .font(.system(size: 48))
+                .foregroundColor(Theme.textSecondary)
+            Text("No tmux sessions running on your Mac.")
+                .foregroundColor(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+            Text("Start a terminal on your Mac first.")
+                .font(.caption)
+                .foregroundColor(Theme.textSecondary)
+            Button("Refresh") {
+                loadSessions()
+            }
+            .foregroundColor(Theme.primary)
+            .padding(.top, 8)
+        }
+        .padding()
+    }
+
+    private func errorView(_ message: String) -> some View {
+        VStack(spacing: 16) {
+            Image(systemName: "wifi.exclamationmark")
+                .font(.system(size: 48))
+                .foregroundColor(Theme.red)
+            Text(message)
+                .foregroundColor(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 24)
+            Button("Retry") {
+                loadSessions()
+            }
+            .foregroundColor(Theme.primary)
+            .padding(.top, 8)
+        }
+    }
+
+    // MARK: - Data loading
+
     private func loadSessions() {
+        guard let config = configStore.config else { return }
+
         isLoading = true
         errorMessage = nil
 
-        // TODO Phase 3: Replace with real SSH session discovery
-        // SSHManager.shared.connect(configStore.config!) { ... }
         Task {
-            try? await Task.sleep(for: .seconds(1))
-            await MainActor.run {
-                // Placeholder data for UI development
-                sessions = [
-                    TmuxSession(name: "main", windowCount: 2, windows: [
-                        TmuxWindow(index: 0, title: "claude", command: "claude"),
-                        TmuxWindow(index: 1, title: "vim", command: "nvim"),
-                    ])
-                ]
-                isLoading = false
+            do {
+                // Connect if not already connected
+                if !sshManager.isConnected {
+                    try await sshManager.connect(config: config)
+                }
+
+                // List sessions
+                var discoveredSessions = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
+
+                // Fetch windows for each session
+                for i in discoveredSessions.indices {
+                    let windows = try await sshManager.listWindows(
+                        tmuxPath: config.tmuxPath,
+                        session: discoveredSessions[i].name
+                    )
+                    discoveredSessions[i].windows = windows
+                }
+
+                await MainActor.run {
+                    sessions = discoveredSessions
+                    isLoading = false
+
+                    // Auto-connect: single session + single window → skip picker
+                    if discoveredSessions.count == 1,
+                       discoveredSessions[0].windows.count == 1 {
+                        let session = discoveredSessions[0]
+                        let window = session.windows[0]
+                        path.append(ContentView.Route.terminal(
+                            session: session.name,
+                            window: window.index
+                        ))
+                    }
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = error.localizedDescription
+                    isLoading = false
+                }
             }
         }
     }
