@@ -25,6 +25,9 @@ final class SSHManager: ObservableObject {
     /// Establish an SSH connection to the remote Mac.
     /// Waits for both TCP connection AND SSH authentication to complete before returning.
     func connect(config: ConnectionConfig) async throws {
+        // Tear down any existing connection to prevent resource leaks on retry
+        disconnect()
+
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
 
@@ -256,7 +259,11 @@ final class SSHManager: ObservableObject {
 
         func privReadUInt32() throws -> UInt32 {
             let bytes = try privReadBytes(4)
-            return bytes.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            // Safe unaligned read — do not use load(as:) on potentially unaligned Data
+            return UInt32(bytes[bytes.startIndex]) << 24
+                | UInt32(bytes[bytes.startIndex + 1]) << 16
+                | UInt32(bytes[bytes.startIndex + 2]) << 8
+                | UInt32(bytes[bytes.startIndex + 3])
         }
 
         func privReadString() throws -> Data {
@@ -378,6 +385,7 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     private let command: String
     private let promise: EventLoopPromise<String>
     private var buffer = Data()
+    private var promiseCompleted = false
 
     init(command: String, promise: EventLoopPromise<String>) {
         self.command = command
@@ -385,7 +393,6 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func channelActive(context: ChannelHandlerContext) {
-        // Send exec request on the child channel (correct NIOSSH pattern)
         let execRequest = SSHChannelRequestEvent.ExecRequest(
             command: command,
             wantReply: true
@@ -394,8 +401,8 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        // Fix #1 from codex review: handle exec request rejection (ChannelFailureEvent)
-        if event is ChannelFailureEvent {
+        if event is ChannelFailureEvent, !promiseCompleted {
+            promiseCompleted = true
             promise.fail(SSHError.commandFailed("Server rejected exec request for: \(command)"))
             context.close(promise: nil)
         }
@@ -415,12 +422,18 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        let output = String(data: buffer, encoding: .utf8) ?? ""
-        promise.succeed(output)
+        if !promiseCompleted {
+            promiseCompleted = true
+            let output = String(data: buffer, encoding: .utf8) ?? ""
+            promise.succeed(output)
+        }
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        promise.fail(error)
+        if !promiseCompleted {
+            promiseCompleted = true
+            promise.fail(error)
+        }
         context.close(promise: nil)
     }
 }

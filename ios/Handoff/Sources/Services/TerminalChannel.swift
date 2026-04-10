@@ -19,6 +19,7 @@ final class TerminalChannelHandler: ChannelDuplexHandler {
     private let initialCols: Int
     private let initialRows: Int
     private let readyPromise: EventLoopPromise<Void>
+    private var readyPromiseCompleted = false
 
     /// Called on the NIO event loop with data received from the remote tmux session.
     var onDataReceived: ((Data) -> Void)?
@@ -75,7 +76,8 @@ final class TerminalChannelHandler: ChannelDuplexHandler {
         )
         context.triggerUserOutboundEvent(execRequest, promise: nil)
 
-        readyPromise.succeed(())
+        // Do NOT succeed readyPromise here — wait for ChannelSuccessEvent
+        // which confirms the exec request was accepted by the server.
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -85,21 +87,39 @@ final class TerminalChannelHandler: ChannelDuplexHandler {
         guard case .byteBuffer(var buf) = channelData.data else { return }
 
         if let bytes = buf.readBytes(length: buf.readableBytes) {
+            // If we receive data before ChannelSuccessEvent, the exec was implicitly accepted
+            if !readyPromiseCompleted {
+                readyPromiseCompleted = true
+                readyPromise.succeed(())
+            }
             onDataReceived?(Data(bytes))
         }
     }
 
     func channelInactive(context: ChannelHandlerContext) {
+        if !readyPromiseCompleted {
+            readyPromiseCompleted = true
+            readyPromise.fail(SSHError.channelError("Channel closed before terminal was ready"))
+        }
         onClosed?()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        if !readyPromiseCompleted {
+            readyPromiseCompleted = true
+            readyPromise.fail(error)
+        }
         onClosed?()
         context.close(promise: nil)
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        if event is ChannelFailureEvent {
+        if event is ChannelSuccessEvent, !readyPromiseCompleted {
+            // Exec request was accepted — terminal is ready
+            readyPromiseCompleted = true
+            readyPromise.succeed(())
+        } else if event is ChannelFailureEvent, !readyPromiseCompleted {
+            readyPromiseCompleted = true
             readyPromise.fail(SSHError.commandFailed("Server rejected terminal request"))
         }
         context.fireUserInboundEventTriggered(event)

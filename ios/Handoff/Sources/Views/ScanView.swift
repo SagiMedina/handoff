@@ -10,6 +10,7 @@ struct ScanView: View {
 
     @State private var errorMessage: String?
     @State private var cameraPermission: CameraPermission = .unknown
+    @State private var scannerController: QRScannerController?
 
     enum CameraPermission {
         case unknown, granted, denied
@@ -39,9 +40,14 @@ struct ScanView: View {
 
     private var cameraView: some View {
         ZStack {
-            QRScannerRepresentable { value in
-                handleScannedCode(value)
-            }
+            QRScannerRepresentable(
+                onCodeScanned: { value in
+                    handleScannedCode(value)
+                },
+                onControllerReady: { controller in
+                    scannerController = controller
+                }
+            )
             .ignoresSafeArea()
 
             // Viewfinder overlay
@@ -129,7 +135,8 @@ struct ScanView: View {
             }
         } catch {
             errorMessage = error.localizedDescription
-            // Allow rescanning after error
+            // Reset scanner to allow rescanning after parse failure
+            scannerController?.resetScanning()
         }
     }
 }
@@ -139,10 +146,12 @@ struct ScanView: View {
 /// Bridges QRScannerController into SwiftUI.
 struct QRScannerRepresentable: UIViewControllerRepresentable {
     let onCodeScanned: (String) -> Void
+    let onControllerReady: (QRScannerController) -> Void
 
     func makeUIViewController(context: Context) -> QRScannerController {
         let controller = QRScannerController()
         controller.onCodeScanned = onCodeScanned
+        onControllerReady(controller)
         return controller
     }
 

@@ -55,7 +55,8 @@ struct SessionsView: View {
             loadSessions()
         }
         .onDisappear {
-            // Don't disconnect here — terminal screen may still need the connection
+            // TerminalView creates its own SSHManager, so we can safely disconnect discovery
+            sshManager.disconnect()
         }
     }
 
