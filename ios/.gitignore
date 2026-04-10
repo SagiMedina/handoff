@@ -1,0 +1,17 @@
+# Generated Xcode project — regenerate with: ./scripts/generate.sh
+Handoff/Handoff.xcodeproj/
+
+# Xcode user data
+*.xcuserdata/
+*.xcworkspace/xcuserdata/
+
+# Build artifacts
+DerivedData/
+build/
+
+# SPM
+.build/
+.swiftpm/
+
+# OS
+.DS_Store
