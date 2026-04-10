@@ -2,16 +2,19 @@ import SwiftUI
 import SwiftTerm
 
 /// Terminal screen: wraps SwiftTerm for tmux session display with SSH backing.
+/// Handles foreground reconnect since iOS suspends SSH when backgrounded.
 struct TerminalView: View {
     let sessionName: String
     let windowIndex: Int
 
     @EnvironmentObject var configStore: ConfigStore
+    @Environment(\.scenePhase) private var scenePhase
     @StateObject private var sshManager = SSHManager()
 
     @State private var isConnecting = true
     @State private var errorMessage: String?
     @State private var terminalHandler: TerminalChannelHandler?
+    @State private var wasBackgrounded = false
 
     var body: some View {
         ZStack {
@@ -21,7 +24,7 @@ struct TerminalView: View {
                 VStack(spacing: 16) {
                     ProgressView()
                         .tint(Theme.primary)
-                    Text("Attaching to \(sessionName):\(windowIndex)...")
+                    Text(wasBackgrounded ? "Reconnecting..." : "Attaching to \(sessionName):\(windowIndex)...")
                         .font(.subheadline)
                         .foregroundColor(Theme.textSecondary)
                 }
@@ -34,10 +37,21 @@ struct TerminalView: View {
                         .foregroundColor(Theme.textSecondary)
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
-                    Button("Retry") {
-                        connectAndAttach()
+
+                    HStack(spacing: 16) {
+                        Button("Reconnect") {
+                            connectAndAttach()
+                        }
+                        .foregroundColor(Theme.primary)
+
+                        if error.contains("Tailscale") || error.contains("connect") {
+                            Button("Open Tailscale") {
+                                openTailscale()
+                            }
+                            .foregroundColor(Theme.textSecondary)
+                        }
                     }
-                    .foregroundColor(Theme.primary)
+                    .padding(.top, 8)
                 }
             } else {
                 VStack(spacing: 0) {
@@ -57,11 +71,29 @@ struct TerminalView: View {
         }
         .navigationTitle("\(sessionName):\(windowIndex)")
         .navigationBarTitleDisplayMode(.inline)
+        .toolbarColorScheme(.dark, for: .navigationBar)
         .onAppear {
             connectAndAttach()
         }
         .onDisappear {
             sshManager.disconnect()
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            switch newPhase {
+            case .background:
+                wasBackgrounded = true
+            case .active:
+                if wasBackgrounded {
+                    wasBackgrounded = false
+                    // iOS kills SSH connections when backgrounded.
+                    // tmux keeps the session alive, so we just reconnect.
+                    if !sshManager.isConnected {
+                        connectAndAttach()
+                    }
+                }
+            default:
+                break
+            }
         }
     }
 
@@ -75,7 +107,6 @@ struct TerminalView: View {
             do {
                 try await sshManager.connect(config: config)
 
-                // Default terminal size — SwiftTerm will resize once layout is known
                 let handler = try await sshManager.openTerminal(
                     tmuxPath: config.tmuxPath,
                     session: sessionName,
@@ -86,7 +117,7 @@ struct TerminalView: View {
 
                 handler.onClosed = {
                     Task { @MainActor in
-                        errorMessage = "Session ended."
+                        errorMessage = "Session ended. The tmux session may have been detached or closed."
                     }
                 }
 
@@ -100,6 +131,13 @@ struct TerminalView: View {
                     isConnecting = false
                 }
             }
+        }
+    }
+
+    private func openTailscale() {
+        // Tailscale's URL scheme
+        if let url = URL(string: "tailscale://") {
+            UIApplication.shared.open(url)
         }
     }
 }
@@ -169,12 +207,10 @@ struct SwiftTermView: UIViewRepresentable {
             self.onResize = onResize
         }
 
-        // Terminal sends data (user typed something)
         func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
             handler?.send(Data(data))
         }
 
-        // Terminal resized (layout change, keyboard appeared)
         func sizeChanged(source: SwiftTerm.TerminalView, newCols: Int, newRows: Int) {
             // Debounce resize events (150ms) — keyboard animation causes rapid changes
             resizeWorkItem?.cancel()
@@ -185,7 +221,6 @@ struct SwiftTermView: UIViewRepresentable {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.15, execute: workItem)
         }
 
-        // Required delegate methods
         func setTerminalTitle(source: SwiftTerm.TerminalView, title: String) {}
         func scrolled(source: SwiftTerm.TerminalView, position: Double) {}
         func hostCurrentDirectoryUpdate(source: TerminalView, directory: String?) {}
