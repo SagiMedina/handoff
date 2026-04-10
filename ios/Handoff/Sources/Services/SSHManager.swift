@@ -22,11 +22,16 @@ final class SSHManager: ObservableObject {
     // MARK: - Connect
 
     /// Establish an SSH connection to the remote Mac.
+    /// Waits for both TCP connection AND SSH authentication to complete before returning.
     func connect(config: ConnectionConfig) async throws {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
 
         let privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
+        let authDelegate = PublicKeyAuthDelegate(
+            username: config.user,
+            privateKey: privateKey
+        )
 
         let bootstrap = ClientBootstrap(group: group)
             .channelInitializer { channel in
@@ -34,10 +39,7 @@ final class SSHManager: ObservableObject {
                     NIOSSHHandler(
                         role: .client(
                             .init(
-                                userAuthDelegate: PublicKeyAuthDelegate(
-                                    username: config.user,
-                                    privateKey: privateKey
-                                ),
+                                userAuthDelegate: authDelegate,
                                 serverAuthDelegate: AcceptAllHostKeysDelegate()
                             )
                         ),
@@ -54,6 +56,18 @@ final class SSHManager: ObservableObject {
 
         // Get the NIOSSHHandler for creating child channels
         self.sshHandler = try await channel.pipeline.handler(type: NIOSSHHandler.self).get()
+
+        // Fix #2 from codex review: Wait for SSH auth to complete before returning.
+        // We verify the connection works by opening and immediately closing a test channel.
+        // If auth hasn't completed, createChannel will fail with an appropriate error.
+        try await verifyAuthCompleted()
+    }
+
+    /// Verify SSH authentication is complete by opening a test exec channel.
+    /// This blocks until the SSH handshake + auth are fully done.
+    private func verifyAuthCompleted() async throws {
+        // Run a trivial command to confirm the connection is authenticated and functional
+        _ = try await executeCommand("echo ok")
     }
 
     // MARK: - Discovery (one-shot exec)
@@ -110,14 +124,22 @@ final class SSHManager: ObservableObject {
 
         let resultPromise = parentChannel.eventLoop.makePromise(of: String.self)
 
-        // Create a child session channel via NIOSSHHandler
-        sshHandler.createChannel(nil, channelType: .session) { childChannel, channelType in
+        // Fix #1 from codex review: capture createChannel's returned future so that
+        // if child-channel creation fails, resultPromise is properly failed instead of hanging.
+        let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
+
+        sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
             guard channelType == .session else {
                 return childChannel.eventLoop.makeFailedFuture(SSHError.channelError("Unexpected channel type"))
             }
             return childChannel.pipeline.addHandler(
                 ExecChannelHandler(command: command, promise: resultPromise)
             )
+        }
+
+        // If channel creation itself fails, propagate to resultPromise
+        channelPromise.futureResult.whenFailure { error in
+            resultPromise.fail(error)
         }
 
         return try await resultPromise.futureResult.get()
@@ -178,7 +200,11 @@ final class SSHManager: ObservableObject {
 
         func readUInt32() throws -> UInt32 {
             let bytes = try readBytes(4)
-            return bytes.withUnsafeBytes { $0.load(as: UInt32.self).bigEndian }
+            // Safe unaligned read — do not use load(as:) on potentially unaligned Data
+            return UInt32(bytes[bytes.startIndex]) << 24
+                | UInt32(bytes[bytes.startIndex + 1]) << 16
+                | UInt32(bytes[bytes.startIndex + 2]) << 8
+                | UInt32(bytes[bytes.startIndex + 3])
         }
 
         func readString() throws -> Data {
@@ -364,6 +390,15 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
             wantReply: true
         )
         context.triggerUserOutboundEvent(execRequest, promise: nil)
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        // Fix #1 from codex review: handle exec request rejection (ChannelFailureEvent)
+        if event is ChannelFailureEvent {
+            promise.fail(SSHError.commandFailed("Server rejected exec request for: \(command)"))
+            context.close(promise: nil)
+        }
+        context.fireUserInboundEventTriggered(event)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
