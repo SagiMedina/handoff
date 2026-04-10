@@ -13,8 +13,9 @@ import Crypto
 final class SSHManager: ObservableObject {
 
     private var group: EventLoopGroup?
-    private var parentChannel: Channel?
-    private var sshHandler: NIOSSHHandler?
+    // Internal access: TerminalChannel.swift extension needs these
+    var parentChannel: Channel?
+    var sshHandler: NIOSSHHandler?
 
     /// The active SSH connection's channel, if connected.
     var isConnected: Bool { parentChannel?.isActive ?? false }
