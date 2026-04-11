@@ -1,6 +1,6 @@
 name: Handoff
 options:
-  bundleIdPrefix: com.handoff
+  bundleIdPrefix: dev.omriariav.handoff
   deploymentTarget:
     iOS: "16.0"
   xcodeVersion: "15.0"

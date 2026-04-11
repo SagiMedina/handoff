@@ -25,17 +25,30 @@ final class SSHManager: ObservableObject {
     /// Establish an SSH connection to the remote Mac.
     /// Waits for both TCP connection AND SSH authentication to complete before returning.
     func connect(config: ConnectionConfig) async throws {
+        print("[SSH] connect() starting — ip=\(config.ip) user=\(config.user)")
         // Tear down any existing connection to prevent resource leaks on retry
         disconnect()
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
 
-        let privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
+        print("[SSH] parsing OpenSSH key…")
+        let privateKey: Curve25519.Signing.PrivateKey
+        do {
+            privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
+            print("[SSH] key parsed OK")
+        } catch {
+            print("[SSH] key parse FAILED: \(error)")
+            throw error
+        }
         let authDelegate = PublicKeyAuthDelegate(
             username: config.user,
             privateKey: privateKey
         )
+
+        // Promise that fires when NIOSSH receives UserAuthSuccessEvent
+        let authSuccessPromise = group.next().makePromise(of: Void.self)
+        let authWaiter = AuthSuccessHandler(promise: authSuccessPromise)
 
         let bootstrap = ClientBootstrap(group: group)
             .channelInitializer { channel in
@@ -49,36 +62,48 @@ final class SSHManager: ObservableObject {
                         ),
                         allocator: channel.allocator,
                         inboundChildChannelInitializer: nil
-                    )
+                    ),
+                    authWaiter
                 ])
             }
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .connectTimeout(.seconds(10))
 
-        let channel = try await bootstrap.connect(host: config.ip, port: 22).get()
+        print("[SSH] TCP connecting to \(config.ip):22…")
+        let channel: Channel
+        do {
+            channel = try await bootstrap.connect(host: config.ip, port: 22).get()
+            print("[SSH] TCP connected, channel active=\(channel.isActive)")
+        } catch {
+            print("[SSH] TCP connect FAILED: \(error)")
+            throw error
+        }
         self.parentChannel = channel
 
         // Get the NIOSSHHandler for creating child channels
+        print("[SSH] fetching NIOSSHHandler from pipeline…")
         self.sshHandler = try await channel.pipeline.handler(type: NIOSSHHandler.self).get()
+        print("[SSH] got NIOSSHHandler, waiting for UserAuthSuccessEvent…")
 
-        // Fix #2 from codex review: Wait for SSH auth to complete before returning.
-        // We verify the connection works by opening and immediately closing a test channel.
-        // If auth hasn't completed, createChannel will fail with an appropriate error.
-        try await verifyAuthCompleted()
-    }
-
-    /// Verify SSH authentication is complete by opening a test exec channel.
-    /// This blocks until the SSH handshake + auth are fully done.
-    private func verifyAuthCompleted() async throws {
-        // Run a trivial command to confirm the connection is authenticated and functional
-        _ = try await executeCommand("echo ok")
+        // CRITICAL: Wait for UserAuthSuccessEvent before returning.
+        // SwiftNIO SSH fires this event on the parent channel when auth completes.
+        // Without this wait, createChannel calls will fail with ChannelError.connectPending.
+        do {
+            try await authSuccessPromise.futureResult.get()
+            print("[SSH] auth completed! connect() returning")
+        } catch {
+            print("[SSH] auth wait FAILED: \(error)")
+            throw error
+        }
     }
 
     // MARK: - Discovery (one-shot exec)
 
     /// List tmux sessions on the remote Mac.
     func listSessions(tmuxPath: String) async throws -> [TmuxSession] {
+        print("[SSH] listSessions called with tmuxPath=\(tmuxPath)")
         let output = try await executeCommand("\(tmuxPath) list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null")
+        print("[SSH] listSessions output: \(output.prefix(200))")
 
         return output
             .split(separator: "\n")
@@ -120,33 +145,38 @@ final class SSHManager: ObservableObject {
 
     /// Execute a one-shot command over SSH and return stdout as a string.
     /// Creates a child session channel, sends exec request, collects output, closes.
+    ///
+    /// CRITICAL: NIOSSHHandler.createChannel() is not thread-safe — it MUST be called
+    /// on the parent channel's event loop. We use flatSubmit to hop onto the right loop.
+    /// NIOSSH internally buffers pending channel creations until SSH auth completes.
     private func executeCommand(_ command: String) async throws -> String {
+        print("[SSH] executeCommand: \(command.prefix(100))")
         guard let parentChannel = self.parentChannel,
               let sshHandler = self.sshHandler else {
+            print("[SSH] executeCommand: NOT CONNECTED")
             throw SSHError.notConnected
         }
 
-        let resultPromise = parentChannel.eventLoop.makePromise(of: String.self)
+        return try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<String> in
+            print("[SSH] executeCommand: on event loop, creating child channel")
+            let resultPromise = parentChannel.eventLoop.makePromise(of: String.self)
+            let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
 
-        // Fix #1 from codex review: capture createChannel's returned future so that
-        // if child-channel creation fails, resultPromise is properly failed instead of hanging.
-        let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
-
-        sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
-            guard channelType == .session else {
-                return childChannel.eventLoop.makeFailedFuture(SSHError.channelError("Unexpected channel type"))
+            sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
+                guard channelType == .session else {
+                    return childChannel.eventLoop.makeFailedFuture(SSHError.channelError("Unexpected channel type"))
+                }
+                return childChannel.pipeline.addHandler(
+                    ExecChannelHandler(command: command, promise: resultPromise)
+                )
             }
-            return childChannel.pipeline.addHandler(
-                ExecChannelHandler(command: command, promise: resultPromise)
-            )
-        }
 
-        // If channel creation itself fails, propagate to resultPromise
-        channelPromise.futureResult.whenFailure { error in
-            resultPromise.fail(error)
-        }
+            channelPromise.futureResult.whenFailure { error in
+                resultPromise.fail(error)
+            }
 
-        return try await resultPromise.futureResult.get()
+            return resultPromise.futureResult
+        }.get()
     }
 
     // MARK: - Disconnect
@@ -373,6 +403,51 @@ private final class AcceptAllHostKeysDelegate: NIOSSHClientServerAuthenticationD
     }
 }
 
+// MARK: - Auth success handler
+
+/// Catches UserAuthSuccessEvent from NIOSSH and fulfills a promise.
+/// Added to the parent channel pipeline so connect() can wait for auth before returning.
+///
+/// Promise completion is funneled through handlerRemoved() which NIO guarantees
+/// is called exactly once for any handler added to a pipeline. This prevents the
+/// EventLoopFuture.deinit assertion that fires if a promise is dropped unfulfilled.
+private final class AuthSuccessHandler: ChannelInboundHandler {
+    typealias InboundIn = Any
+
+    private var promise: EventLoopPromise<Void>?
+    private var lastError: Error?
+
+    init(promise: EventLoopPromise<Void>) {
+        self.promise = promise
+    }
+
+    func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
+        print("[SSH] AuthHandler event: \(type(of: event))")
+        if event is UserAuthSuccessEvent, let p = promise {
+            print("[SSH] UserAuthSuccessEvent received — fulfilling promise")
+            promise = nil
+            p.succeed(())
+        }
+        context.fireUserInboundEventTriggered(event)
+    }
+
+    func errorCaught(context: ChannelHandlerContext, error: Error) {
+        print("[SSH] AuthHandler errorCaught: \(error)")
+        lastError = error
+        context.fireErrorCaught(error)
+    }
+
+    func handlerRemoved(context: ChannelHandlerContext) {
+        print("[SSH] AuthHandler removed (promise still pending: \(promise != nil))")
+        // Safety net: if the handler is being torn down and the promise
+        // was never fulfilled, fail it so EventLoopFuture.deinit doesn't trap.
+        if let p = promise {
+            promise = nil
+            p.fail(lastError ?? SSHError.channelError("Connection closed before authentication"))
+        }
+    }
+}
+
 // MARK: - Exec channel handler
 
 /// Handles a one-shot SSH exec channel: sends exec request on channelActive,
@@ -422,6 +497,7 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func channelInactive(context: ChannelHandlerContext) {
+        print("[SSH] ExecChannelHandler channelInactive, buffer size=\(buffer.count)")
         if !promiseCompleted {
             promiseCompleted = true
             let output = String(data: buffer, encoding: .utf8) ?? ""
@@ -430,6 +506,7 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
+        print("[SSH] ExecChannelHandler errorCaught: \(error)")
         if !promiseCompleted {
             promiseCompleted = true
             promise.fail(error)

@@ -115,13 +115,33 @@ struct DebugPasteView: View {
                     .foregroundColor(.secondary)
                     .padding(.horizontal)
 
-                TextEditor(text: $jsonText)
-                    .font(.system(.body, design: .monospaced))
-                    .frame(minHeight: 120)
-                    .padding(8)
-                    .background(Color(.systemGray6))
-                    .cornerRadius(8)
-                    .padding(.horizontal)
+                ZStack(alignment: .topLeading) {
+                    // Visible background so the text field is obvious in dark mode
+                    RoundedRectangle(cornerRadius: 8)
+                        .fill(Color.white.opacity(0.08))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.blue.opacity(0.6), lineWidth: 2)
+                        )
+
+                    if jsonText.isEmpty {
+                        Text("Drop or paste JSON payload here…")
+                            .font(.system(.body, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.4))
+                            .padding(16)
+                            .allowsHitTesting(false)
+                    }
+
+                    TextEditor(text: $jsonText)
+                        .font(.system(.body, design: .monospaced))
+                        .foregroundColor(.white)
+                        .scrollContentBackground(.hidden)
+                        .padding(8)
+                        .autocorrectionDisabled()
+                        .textInputAutocapitalization(.never)
+                }
+                .frame(minHeight: 160)
+                .padding(.horizontal)
 
                 if let error = errorMessage {
                     Text(error)

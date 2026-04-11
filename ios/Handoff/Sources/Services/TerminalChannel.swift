@@ -162,6 +162,8 @@ extension SSHManager {
 
     /// Open an interactive terminal channel attached to a tmux session.
     /// Returns the TerminalChannelHandler for ongoing I/O and resize.
+    ///
+    /// CRITICAL: createChannel must be called on the parent channel's event loop.
     func openTerminal(
         tmuxPath: String,
         session: String,
@@ -177,33 +179,32 @@ extension SSHManager {
         let escaped = session.replacingOccurrences(of: "'", with: "'\\''")
         let command = "\(tmuxPath) attach -t '\(escaped):\(window)'"
 
-        let readyPromise = parentChannel.eventLoop.makePromise(of: Void.self)
-        let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
+        let handler = try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<TerminalChannelHandler> in
+            let readyPromise = parentChannel.eventLoop.makePromise(of: Void.self)
+            let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
 
-        let handler = TerminalChannelHandler(
-            command: command,
-            cols: cols,
-            rows: rows,
-            readyPromise: readyPromise
-        )
+            let handler = TerminalChannelHandler(
+                command: command,
+                cols: cols,
+                rows: rows,
+                readyPromise: readyPromise
+            )
 
-        sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
-            guard channelType == .session else {
-                return childChannel.eventLoop.makeFailedFuture(SSHError.channelError("Unexpected channel type"))
+            sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
+                guard channelType == .session else {
+                    return childChannel.eventLoop.makeFailedFuture(SSHError.channelError("Unexpected channel type"))
+                }
+                return childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).flatMap {
+                    childChannel.pipeline.addHandler(handler)
+                }
             }
-            // Enable half-closure per codex recommendation
-            return childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).flatMap {
-                childChannel.pipeline.addHandler(handler)
+
+            channelPromise.futureResult.whenFailure { error in
+                readyPromise.fail(error)
             }
-        }
 
-        // If channel creation fails, propagate to readyPromise
-        channelPromise.futureResult.whenFailure { error in
-            readyPromise.fail(error)
-        }
-
-        // Wait for the channel to become active and PTY/exec to be set up
-        try await readyPromise.futureResult.get()
+            return readyPromise.futureResult.map { handler }
+        }.get()
 
         return handler
     }
