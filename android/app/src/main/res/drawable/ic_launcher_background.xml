@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     Handoff adaptive-icon background.
+     Radial gradient (GitHub-dark palette) matching the iOS master.
+     Center offset slightly right-and-down of the viewport midpoint so it sits
+     behind the leading chevron's "live" area, producing a subtle glow at
+     large launcher sizes.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:aapt="http://schemas.android.com/aapt"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path android:pathData="M0,0 L108,0 L108,108 L0,108 Z">
+        <aapt:attr name="android:fillColor">
+            <gradient
+                android:type="radial"
+                android:centerX="70.7"
+                android:centerY="60.1"
+                android:gradientRadius="95"
+                android:startColor="#161B22"
+                android:centerColor="#080A0F"
+                android:endColor="#010409"/>
+        </aapt:attr>
+    </path>
+</vector>

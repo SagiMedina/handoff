@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Handoff app icon — master source file.
+  Direction A "The Handoff Chevron", variant v4 (Tight + Intense).
+  Two chevrons: Mac blue trailing + terminal green leading, on a dark radial gradient.
+  See ios/docs/design/philosophy.md for the design rationale.
+
+  Geometry:
+    Viewport:           1024 x 1024
+    Leading chevron:    M 336 256 L 720 512 L 336 768   (green, #3FB950, opacity 1.0)
+    Trailing chevron:   M 248 288 L 632 544 L 248 800   (blue,  #58A6FF, opacity 0.60)
+    Stroke width:       120
+    Linecap / linejoin: round
+    Background center:  (640, 576)
+    Background radius:  900
+    Background colors:  #161B22 -> #010409
+
+  The PNG renders (icon_1024.png, icon_1024_dark.png, icon_1024_tinted.png) are
+  produced by ios/docs/design/render_icons.py, which encodes the same values.
+  This SVG is the canonical spec: if geometry changes, update both.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     width="1024" height="1024"
+     viewBox="0 0 1024 1024">
+  <defs>
+    <radialGradient id="bg"
+                    cx="640" cy="576" r="900"
+                    fx="640" fy="576"
+                    gradientUnits="userSpaceOnUse">
+      <stop offset="0"    stop-color="#161B22"/>
+      <stop offset="0.55" stop-color="#080A0F"/>
+      <stop offset="1"    stop-color="#010409"/>
+    </radialGradient>
+
+    <filter id="leading-glow"
+            x="-25%" y="-25%" width="150%" height="150%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="36"/>
+      <feComponentTransfer>
+        <feFuncA type="linear" slope="0.40"/>
+      </feComponentTransfer>
+    </filter>
+  </defs>
+
+  <!-- Background -->
+  <rect x="0" y="0" width="1024" height="1024" fill="url(#bg)"/>
+
+  <!-- Trailing chevron (Mac blue, ghosted) -->
+  <path d="M 248 288 L 632 544 L 248 800"
+        fill="none"
+        stroke="#58A6FF"
+        stroke-width="120"
+        stroke-linecap="round"
+        stroke-linejoin="round"
+        opacity="0.60"/>
+
+  <!-- Leading chevron glow (blurred copy of the leading stroke) -->
+  <g filter="url(#leading-glow)" opacity="0.40">
+    <path d="M 336 256 L 720 512 L 336 768"
+          fill="none"
+          stroke="#3FB950"
+          stroke-width="120"
+          stroke-linecap="round"
+          stroke-linejoin="round"/>
+  </g>
+
+  <!-- Leading chevron (terminal green, live) -->
+  <path d="M 336 256 L 720 512 L 336 768"
+        fill="none"
+        stroke="#3FB950"
+        stroke-width="120"
+        stroke-linecap="round"
+        stroke-linejoin="round"/>
+</svg>
