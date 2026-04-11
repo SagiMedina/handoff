@@ -20,13 +20,21 @@ This:
 - Configures iTerm2 to run inside tmux automatically (invisible - your terminal looks and feels exactly the same)
 - Generates an SSH key for passwordless phone access
 
-**Phone:**
+**Phone — Android:**
 1. Install the Handoff app on your Android phone
 2. On your Mac, run `handoff pair` - it shows a QR code
 3. Open Handoff on your phone and scan the QR code
 4. Sign in to your Tailscale account (one-time, in browser)
 
 That's it. Tailscale networking is built into the app - no separate VPN app needed.
+
+**Phone — iOS:**
+1. Build the iOS app from `ios/Handoff/` (requires Xcode 15+ and a free Apple ID). See [`ios/README.md`](ios/README.md)
+2. Install Tailscale from the App Store and sign in with the same account as your Mac
+3. On your Mac, run `handoff pair` - it shows a QR code
+4. Open the Handoff app on your iPhone → tap **Scan QR Code** → point at the QR
+
+You're paired. The app saves the SSH key in Keychain and connects over your Tailnet.
 
 ## Daily use
 
