@@ -10,6 +10,7 @@ struct SessionsView: View {
     @State private var sessions: [TmuxSession] = []
     @State private var isLoading = true
     @State private var errorMessage: String?
+    @State private var hasAutoConnected = false
 
     var body: some View {
         ZStack {
@@ -147,9 +148,13 @@ struct SessionsView: View {
                     sessions = discoveredSessions
                     isLoading = false
 
-                    // Auto-connect: single session + single window → skip picker
-                    if discoveredSessions.count == 1,
+                    // Auto-connect: single session + single window → skip picker.
+                    // Only on first load — not on refresh or back-nav, otherwise
+                    // tapping back from terminal would immediately re-enter it.
+                    if !hasAutoConnected,
+                       discoveredSessions.count == 1,
                        discoveredSessions[0].windows.count == 1 {
+                        hasAutoConnected = true
                         let session = discoveredSessions[0]
                         let window = session.windows[0]
                         path.append(ContentView.Route.terminal(
