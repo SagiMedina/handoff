@@ -36,6 +36,7 @@ struct SessionsView: View {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button("Unpair") {
                     sshManager.disconnect()
+                    TerminalSessionStore.shared.closeAll()
                     configStore.unpair()
                     path.removeLast(path.count)
                 }
