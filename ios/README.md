@@ -4,21 +4,48 @@ iOS companion app for [Handoff](../README.md) — continue your Mac terminal ses
 
 ## Requirements
 
-- macOS with Xcode 15+
+- macOS with **Xcode 15+**
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen): `brew install xcodegen`
 - iOS 16.0+ deployment target
+- An Apple ID (free personal team works for development; paid for App Store distribution)
 
 ## Setup
 
-```bash
-# Generate the Xcode project
-./scripts/generate.sh
+1. **Install XcodeGen**
+   ```bash
+   brew install xcodegen
+   ```
 
-# Open in Xcode
-open Handoff/Handoff.xcodeproj
-```
+2. **Find your Apple Developer Team ID**
+   ```bash
+   security find-certificate -c "Apple Development" -p \
+     | openssl x509 -noout -subject | grep -oE 'OU=[A-Z0-9]+' | sed 's/OU=//'
+   ```
+   If no certificate is found, open Xcode once → Settings → Accounts → sign in with your Apple ID, then retry.
 
-Then build and run on a simulator or device.
+3. **Generate the Xcode project** with your team and bundle ID prefix:
+   ```bash
+   cd ios
+   DEVELOPMENT_TEAM=YOURTEAMID \
+   BUNDLE_ID_PREFIX=dev.yourname.handoff \
+     ./scripts/generate.sh
+   ```
+
+   For **simulator-only** builds you can leave `DEVELOPMENT_TEAM` empty:
+   ```bash
+   BUNDLE_ID_PREFIX=dev.yourname.handoff ./scripts/generate.sh
+   ```
+
+4. **Open in Xcode** and build:
+   ```bash
+   open Handoff/Handoff.xcodeproj
+   ```
+
+   Or build from the command line:
+   ```bash
+   cd Handoff
+   xcodebuild -scheme Handoff -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
+   ```
 
 ## Dependencies (via SPM)
 
@@ -29,14 +56,23 @@ Then build and run on a simulator or device.
 
 ```
 Sources/
-├── App/            # App entry point, navigation, theme
-├── Models/         # ConnectionConfig, TmuxSession, TmuxWindow, QR payload
-├── Services/       # ConfigStore (Keychain), SSHManager
-└── Views/          # Welcome, Scan, Sessions, Terminal screens
+├── App/            HandoffApp, ContentView (NavigationStack), Theme
+├── Models/         ConnectionConfig, TmuxSession, TmuxWindow, QRCodePayload
+├── Services/       ConfigStore (Keychain), SSHManager (NIOSSH),
+│                   TerminalChannel (PTY), TerminalSessionStore (lifecycle)
+└── Views/          Welcome, Scan, QRScannerController, Sessions, SessionCard,
+                    Terminal, SwiftTermView, MobileToolbar
 ```
 
 ## Pairing
 
-1. On your Mac: `handoff pair`
-2. On your phone: open app → Scan QR Code
-3. Select a tmux session → you're in
+1. On your Mac: `handoff pair` — prints a QR code
+2. On your phone: open the Handoff app → tap **Scan QR Code** → point at the QR on your Mac
+3. The app parses the JSON payload, saves the SSH private key to iOS Keychain, and lists your tmux sessions
+4. Tap a session → you're attached live
+
+## Notes
+
+- **The generated `.xcodeproj` is not checked in** — regenerate it locally with `./scripts/generate.sh` any time you change `project.yml`
+- `DEVELOPMENT_TEAM` and `BUNDLE_ID_PREFIX` are intentionally kept out of source control so the repo stays team-agnostic
+- For simulator testing without camera access, there's a `Debug: Paste QR Payload` button on the Welcome screen (DEBUG builds only)

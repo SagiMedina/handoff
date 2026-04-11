@@ -1,5 +1,6 @@
 import Foundation
 import SwiftTerm
+import UIKit
 
 /// Holds the currently active terminal connection outside of any view's lifecycle.
 /// This ensures navigating back to Sessions and returning to the same terminal
@@ -46,9 +47,14 @@ final class TerminalSessionStore: ObservableObject {
         active[key]
     }
 
-    /// Register a new active terminal.
+    /// Register a new active terminal. If one already exists for the same key,
+    /// it is closed first to prevent leaks from duplicate reconnect taps.
     func register(_ terminal: ActiveTerminal) {
+        if let existing = active[terminal.key] {
+            existing.sshManager.disconnect()
+        }
         active[terminal.key] = terminal
+        updateIdleTimer()
     }
 
     /// Tear down and remove a specific terminal.
@@ -56,6 +62,7 @@ final class TerminalSessionStore: ObservableObject {
         if let terminal = active.removeValue(forKey: key) {
             terminal.sshManager.disconnect()
         }
+        updateIdleTimer()
     }
 
     /// Tear down all active terminals. Called on unpair or app shutdown.
@@ -64,5 +71,14 @@ final class TerminalSessionStore: ObservableObject {
             terminal.sshManager.disconnect()
         }
         active.removeAll()
+        updateIdleTimer()
+    }
+
+    // MARK: - Idle timer lifecycle
+
+    /// Keep the screen awake only while at least one terminal is active.
+    /// Reset to false when no terminals remain.
+    private func updateIdleTimer() {
+        UIApplication.shared.isIdleTimerDisabled = !active.isEmpty
     }
 }

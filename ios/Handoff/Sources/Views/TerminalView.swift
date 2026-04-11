@@ -16,9 +16,22 @@ struct TerminalView: View {
     @State private var errorMessage: String?
     @State private var activeTerminal: TerminalSessionStore.ActiveTerminal?
     @State private var wasBackgrounded = false
+    @StateObject private var connectState = ConnectState()
 
     private var key: TerminalSessionStore.Key {
         .init(sessionName: sessionName, windowIndex: windowIndex)
+    }
+
+    /// Holds a reference to the in-flight connect Task so repeated triggers
+    /// (Reconnect button spam, foreground race) don't start duplicate SSH sessions.
+    @MainActor
+    private final class ConnectState: ObservableObject {
+        var inFlight: Task<Void, Never>?
+
+        func cancelInFlight() {
+            inFlight?.cancel()
+            inFlight = nil
+        }
     }
 
     var body: some View {
@@ -112,13 +125,19 @@ struct TerminalView: View {
     private func connectAndAttach() {
         guard let config = configStore.config else { return }
 
+        // Cancel any in-flight connect attempt before starting a new one.
+        // Prevents duplicate SSH sessions from rapid Reconnect taps or
+        // foreground/reconnect races.
+        connectState.cancelInFlight()
+
         isConnecting = true
         errorMessage = nil
 
-        Task {
+        let task = Task { @MainActor in
             do {
                 let sshManager = SSHManager()
                 try await sshManager.connect(config: config)
+                try Task.checkCancellation()
 
                 let handler = try await sshManager.openTerminal(
                     tmuxPath: config.tmuxPath,
@@ -127,6 +146,7 @@ struct TerminalView: View {
                     cols: 80,
                     rows: 24
                 )
+                try Task.checkCancellation()
 
                 // Create SwiftTerm view once per connection, keep it alive via the store
                 let termView = SwiftTerm.TerminalView(frame: .zero)
@@ -157,18 +177,21 @@ struct TerminalView: View {
                     }
                 }
 
-                await MainActor.run {
-                    TerminalSessionStore.shared.register(terminal)
-                    activeTerminal = terminal
-                    isConnecting = false
-                }
+                TerminalSessionStore.shared.register(terminal)
+                activeTerminal = terminal
+                isConnecting = false
+                connectState.inFlight = nil
+            } catch is CancellationError {
+                // Task was cancelled — superseded by another connect attempt
+                return
             } catch {
-                await MainActor.run {
-                    errorMessage = error.localizedDescription
-                    isConnecting = false
-                }
+                errorMessage = error.localizedDescription
+                isConnecting = false
+                connectState.inFlight = nil
             }
         }
+
+        connectState.inFlight = task
     }
 
     private func configureTerminalView(_ termView: SwiftTerm.TerminalView) {
@@ -181,8 +204,7 @@ struct TerminalView: View {
 
         termView.nativeBackgroundColor = UIColor(Theme.background)
         termView.nativeForegroundColor = UIColor(Theme.text)
-
-        UIApplication.shared.isIdleTimerDisabled = true
+        // Idle timer is managed centrally by TerminalSessionStore
     }
 
     private func openTailscale() {

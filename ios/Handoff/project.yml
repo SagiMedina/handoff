@@ -1,10 +1,14 @@
 name: Handoff
 options:
-  bundleIdPrefix: dev.omriariav.handoff
+  bundleIdPrefix: ${BUNDLE_ID_PREFIX}
   deploymentTarget:
     iOS: "16.0"
   xcodeVersion: "15.0"
   generateEmptyDirectories: true
+
+# Each developer sets their own BUNDLE_ID_PREFIX and DEVELOPMENT_TEAM via
+# environment variables or a local.yml file, so the repo stays team-agnostic.
+# See ios/README.md for setup.
 
 packages:
   SwiftTerm:
@@ -29,9 +33,8 @@ targets:
     settings:
       base:
         INFOPLIST_FILE: Resources/Info.plist
-        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         SWIFT_VERSION: "5.9"
         TARGETED_DEVICE_FAMILY: "1,2"
         SUPPORTS_MAC_DESIGNED_FOR_IPHONE_IPAD: false
-        DEVELOPMENT_TEAM: W6SR2D4HWY
+        DEVELOPMENT_TEAM: ${DEVELOPMENT_TEAM}
         CODE_SIGN_STYLE: Automatic
