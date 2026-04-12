@@ -81,6 +81,14 @@ class SshManager {
         executeCommand("$tmuxPath new-session -d -s '$sessionName'")
     }
 
+    suspend fun killSession(tmuxPath: String, sessionName: String): Unit = withContext(Dispatchers.IO) {
+        executeCommand("$tmuxPath kill-session -t '$sessionName'")
+    }
+
+    suspend fun killWindow(tmuxPath: String, sessionName: String, windowIndex: Int): Unit = withContext(Dispatchers.IO) {
+        executeCommand("$tmuxPath kill-window -t '$sessionName:$windowIndex'")
+    }
+
     suspend fun createWindow(tmuxPath: String, sessionName: String): Int = withContext(Dispatchers.IO) {
         val output = executeCommand("$tmuxPath new-window -t '$sessionName' -P -F '#{window_index}'")
         output.trim().toIntOrNull() ?: -1

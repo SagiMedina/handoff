@@ -1,10 +1,12 @@
 package com.handoff.app.ui.components
 
+import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
-import androidx.compose.runtime.Composable
+import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontFamily
@@ -20,8 +22,47 @@ fun SessionCard(
     session: TmuxSession,
     onWindowClick: (TmuxWindow) -> Unit,
     onNewWindow: () -> Unit,
+    onKillSession: () -> Unit,
+    onKillWindow: (TmuxWindow) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    var showKillSessionDialog by remember { mutableStateOf(false) }
+    var windowToKill by remember { mutableStateOf<TmuxWindow?>(null) }
+
+    if (showKillSessionDialog) {
+        AlertDialog(
+            onDismissRequest = { showKillSessionDialog = false },
+            title = { Text("Kill session?") },
+            text = { Text("This will close all ${session.windowCount} windows in \"${session.name}\".") },
+            confirmButton = {
+                TextButton(onClick = {
+                    showKillSessionDialog = false
+                    onKillSession()
+                }) { Text("Kill", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { showKillSessionDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
+    windowToKill?.let { window ->
+        AlertDialog(
+            onDismissRequest = { windowToKill = null },
+            title = { Text("Kill window?") },
+            text = { Text("Close \"${window.title}\" in session \"${session.name}\"?") },
+            confirmButton = {
+                TextButton(onClick = {
+                    windowToKill = null
+                    onKillWindow(window)
+                }) { Text("Kill", color = MaterialTheme.colorScheme.error) }
+            },
+            dismissButton = {
+                TextButton(onClick = { windowToKill = null }) { Text("Cancel") }
+            }
+        )
+    }
+
     Card(
         modifier = modifier.fillMaxWidth(),
         shape = RoundedCornerShape(12.dp),
@@ -31,24 +72,38 @@ fun SessionCard(
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
             Row(
+                modifier = Modifier.fillMaxWidth(),
                 verticalAlignment = Alignment.CenterVertically,
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                horizontalArrangement = Arrangement.SpaceBetween
             ) {
+                Row(
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Text(
+                        text = "●",
+                        color = HandoffGreen,
+                        fontSize = 10.sp
+                    )
+                    Text(
+                        text = session.name,
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.SemiBold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = "${session.windowCount} ${if (session.windowCount == 1) "window" else "windows"}",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
                 Text(
-                    text = "●",
-                    color = HandoffGreen,
-                    fontSize = 10.sp
-                )
-                Text(
-                    text = session.name,
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.SemiBold,
-                    color = MaterialTheme.colorScheme.onSurface
-                )
-                Text(
-                    text = "${session.windowCount} ${if (session.windowCount == 1) "window" else "windows"}",
+                    text = "Kill",
+                    modifier = Modifier
+                        .clickable { showKillSessionDialog = true }
+                        .padding(4.dp),
                     style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                    color = MaterialTheme.colorScheme.error
                 )
             }
 
@@ -57,7 +112,8 @@ fun SessionCard(
                 session.windows.forEach { window ->
                     WindowRow(
                         window = window,
-                        onClick = { onWindowClick(window) }
+                        onClick = { onWindowClick(window) },
+                        onLongClick = { windowToKill = window }
                     )
                 }
             }
@@ -88,15 +144,20 @@ fun SessionCard(
     }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
 private fun WindowRow(
     window: TmuxWindow,
-    onClick: () -> Unit
+    onClick: () -> Unit,
+    onLongClick: () -> Unit
 ) {
     Row(
         modifier = Modifier
             .fillMaxWidth()
-            .clickable(onClick = onClick)
+            .combinedClickable(
+                onClick = onClick,
+                onLongClick = onLongClick
+            )
             .padding(vertical = 6.dp, horizontal = 24.dp),
         verticalAlignment = Alignment.CenterVertically,
         horizontalArrangement = Arrangement.spacedBy(8.dp)

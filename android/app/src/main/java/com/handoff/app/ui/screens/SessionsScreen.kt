@@ -15,6 +15,7 @@ import com.handoff.app.data.TmuxSession
 import com.handoff.app.data.TmuxWindow
 import com.handoff.app.ui.components.SessionCard
 import com.handoff.app.ui.theme.HandoffGreen
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 @Composable
@@ -32,9 +33,9 @@ fun SessionsScreen(
     var newSessionName by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
-    fun refresh() {
+    fun refresh(showLoading: Boolean = true) {
         scope.launch {
-            loading = true
+            if (showLoading) loading = true
             error = null
             try {
                 if (!sshManager.isConnected) {
@@ -59,12 +60,19 @@ fun SessionsScreen(
             } catch (e: Exception) {
                 error = "Connection failed: ${e.message}"
             } finally {
-                loading = false
+                if (showLoading) loading = false
             }
         }
     }
 
-    LaunchedEffect(Unit) { refresh() }
+    LaunchedEffect(Unit) {
+        refresh()
+        // Auto-refresh every 5 seconds while screen is visible
+        while (true) {
+            delay(5000)
+            if (!loading) refresh(showLoading = false)
+        }
+    }
 
     if (showNewSessionDialog) {
         AlertDialog(
@@ -241,6 +249,26 @@ fun SessionsScreen(
                                         onWindowSelected(session.name, newWindow)
                                     } catch (e: Exception) {
                                         error = "Failed to create window: ${e.message}"
+                                    }
+                                }
+                            },
+                            onKillSession = {
+                                scope.launch {
+                                    try {
+                                        sshManager.killSession(config.tmuxPath, session.name)
+                                        refresh()
+                                    } catch (e: Exception) {
+                                        error = "Failed to kill session: ${e.message}"
+                                    }
+                                }
+                            },
+                            onKillWindow = { window ->
+                                scope.launch {
+                                    try {
+                                        sshManager.killWindow(config.tmuxPath, session.name, window.index)
+                                        refresh()
+                                    } catch (e: Exception) {
+                                        error = "Failed to kill window: ${e.message}"
                                     }
                                 }
                             }
