@@ -141,6 +141,36 @@ final class SSHManager: ObservableObject {
             }
     }
 
+    // MARK: - Session/window management
+
+    /// Create a new tmux session.
+    func createSession(tmuxPath: String, name: String) async throws {
+        let escaped = name.replacingOccurrences(of: "'", with: "'\\''")
+        _ = try await executeCommand("\(tmuxPath) new-session -d -s '\(escaped)'")
+    }
+
+    /// Kill an entire tmux session.
+    func killSession(tmuxPath: String, name: String) async throws {
+        let escaped = name.replacingOccurrences(of: "'", with: "'\\''")
+        _ = try await executeCommand("\(tmuxPath) kill-session -t '\(escaped)'")
+    }
+
+    /// Kill a single window within a tmux session.
+    func killWindow(tmuxPath: String, session: String, windowIndex: Int) async throws {
+        let escaped = session.replacingOccurrences(of: "'", with: "'\\''")
+        _ = try await executeCommand("\(tmuxPath) kill-window -t '\(escaped):\(windowIndex)'")
+    }
+
+    /// Create a new window in a tmux session. Returns the new window's index.
+    func createWindow(tmuxPath: String, session: String) async throws -> Int {
+        let escaped = session.replacingOccurrences(of: "'", with: "'\\''")
+        let output = try await executeCommand("\(tmuxPath) new-window -t '\(escaped)' -P -F '#{window_index}'")
+        guard let index = Int(output.trimmingCharacters(in: .whitespacesAndNewlines)) else {
+            throw SSHError.commandFailed("Could not parse window index from: \(output)")
+        }
+        return index
+    }
+
     // MARK: - Execute Command
 
     /// Execute a one-shot command over SSH and return stdout as a string.

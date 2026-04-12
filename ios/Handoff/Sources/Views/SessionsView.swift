@@ -12,18 +12,25 @@ struct SessionsView: View {
     @State private var errorMessage: String?
     @State private var hasAutoConnected = false
 
+    // New session dialog
+    @State private var showNewSessionDialog = false
+    @State private var newSessionName = ""
+
+    // Auto-refresh timer
+    let refreshTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
     var body: some View {
         ZStack {
             Theme.background.ignoresSafeArea()
 
-            if isLoading {
+            if isLoading && sessions.isEmpty {
                 VStack(spacing: 16) {
                     ProgressView()
                         .tint(Theme.primary)
                     Text("Connecting...")
                         .foregroundColor(Theme.textSecondary)
                 }
-            } else if let error = errorMessage {
+            } else if let error = errorMessage, sessions.isEmpty {
                 errorView(error)
             } else if sessions.isEmpty {
                 emptyView
@@ -43,7 +50,14 @@ struct SessionsView: View {
                 }
                 .foregroundColor(Theme.red)
             }
-            ToolbarItem(placement: .navigationBarTrailing) {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button {
+                    showNewSessionDialog = true
+                } label: {
+                    Image(systemName: "plus")
+                }
+                .foregroundColor(Theme.primary)
+
                 Button {
                     loadSessions()
                 } label: {
@@ -57,8 +71,26 @@ struct SessionsView: View {
             loadSessions()
         }
         .onDisappear {
-            // TerminalView creates its own SSHManager, so we can safely disconnect discovery
             sshManager.disconnect()
+        }
+        .onReceive(refreshTimer) { _ in
+            // Silent auto-refresh every 5s — no loading spinner
+            if !isLoading {
+                silentRefresh()
+            }
+        }
+        .alert("New Session", isPresented: $showNewSessionDialog) {
+            TextField("Session name", text: $newSessionName)
+                .autocorrectionDisabled()
+                .textInputAutocapitalization(.never)
+            Button("Create") {
+                createNewSession()
+            }
+            Button("Cancel", role: .cancel) {
+                newSessionName = ""
+            }
+        } message: {
+            Text("Enter a name for the new tmux session.")
         }
     }
 
@@ -68,12 +100,24 @@ struct SessionsView: View {
         ScrollView {
             LazyVStack(spacing: 12) {
                 ForEach(sessions) { session in
-                    SessionCard(session: session) { window in
-                        path.append(ContentView.Route.terminal(
-                            session: session.name,
-                            window: window.index
-                        ))
-                    }
+                    SessionCard(
+                        session: session,
+                        onSelectWindow: { window in
+                            path.append(ContentView.Route.terminal(
+                                session: session.name,
+                                window: window.index
+                            ))
+                        },
+                        onNewWindow: {
+                            createNewWindow(in: session)
+                        },
+                        onKillSession: {
+                            killSession(session)
+                        },
+                        onKillWindow: { window in
+                            killWindow(window, in: session)
+                        }
+                    )
                 }
             }
             .padding()
@@ -88,7 +132,7 @@ struct SessionsView: View {
             Text("No tmux sessions running on your Mac.")
                 .foregroundColor(Theme.textSecondary)
                 .multilineTextAlignment(.center)
-            Text("Start a terminal on your Mac first.")
+            Text("Tap + to create one.")
                 .font(.caption)
                 .foregroundColor(Theme.textSecondary)
             Button("Refresh") {
@@ -127,15 +171,12 @@ struct SessionsView: View {
 
         Task {
             do {
-                // Connect if not already connected
                 if !sshManager.isConnected {
                     try await sshManager.connect(config: config)
                 }
 
-                // List sessions
                 var discoveredSessions = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
 
-                // Fetch windows for each session
                 for i in discoveredSessions.indices {
                     let windows = try await sshManager.listWindows(
                         tmuxPath: config.tmuxPath,
@@ -148,9 +189,6 @@ struct SessionsView: View {
                     sessions = discoveredSessions
                     isLoading = false
 
-                    // Auto-connect: single session + single window → skip picker.
-                    // Only on first load — not on refresh or back-nav, otherwise
-                    // tapping back from terminal would immediately re-enter it.
                     if !hasAutoConnected,
                        discoveredSessions.count == 1,
                        discoveredSessions[0].windows.count == 1 {
@@ -168,6 +206,111 @@ struct SessionsView: View {
                     errorMessage = error.localizedDescription
                     isLoading = false
                 }
+            }
+        }
+    }
+
+    /// Silent refresh — updates session list without showing a spinner.
+    /// Used by the 5-second auto-refresh timer.
+    private func silentRefresh() {
+        guard let config = configStore.config, sshManager.isConnected else { return }
+
+        Task {
+            do {
+                var discoveredSessions = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
+                for i in discoveredSessions.indices {
+                    let windows = try await sshManager.listWindows(
+                        tmuxPath: config.tmuxPath,
+                        session: discoveredSessions[i].name
+                    )
+                    discoveredSessions[i].windows = windows
+                }
+                await MainActor.run {
+                    sessions = discoveredSessions
+                }
+            } catch {
+                // Silently ignore errors during auto-refresh
+            }
+        }
+    }
+
+    // MARK: - Session/window management
+
+    private func createNewSession() {
+        guard let config = configStore.config, !newSessionName.isEmpty else {
+            newSessionName = ""
+            return
+        }
+
+        let name = newSessionName
+        newSessionName = ""
+
+        Task {
+            do {
+                try await sshManager.createSession(tmuxPath: config.tmuxPath, name: name)
+                loadSessions()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func createNewWindow(in session: TmuxSession) {
+        guard let config = configStore.config else { return }
+
+        Task {
+            do {
+                let windowIndex = try await sshManager.createWindow(
+                    tmuxPath: config.tmuxPath,
+                    session: session.name
+                )
+                await MainActor.run {
+                    path.append(ContentView.Route.terminal(
+                        session: session.name,
+                        window: windowIndex
+                    ))
+                }
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func killSession(_ session: TmuxSession) {
+        guard let config = configStore.config else { return }
+
+        Task {
+            do {
+                // Close any active terminal for windows in this session
+                for window in session.windows {
+                    TerminalSessionStore.shared.close(
+                        .init(sessionName: session.name, windowIndex: window.index)
+                    )
+                }
+                try await sshManager.killSession(tmuxPath: config.tmuxPath, name: session.name)
+                loadSessions()
+            } catch {
+                errorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func killWindow(_ window: TmuxWindow, in session: TmuxSession) {
+        guard let config = configStore.config else { return }
+
+        Task {
+            do {
+                TerminalSessionStore.shared.close(
+                    .init(sessionName: session.name, windowIndex: window.index)
+                )
+                try await sshManager.killWindow(
+                    tmuxPath: config.tmuxPath,
+                    session: session.name,
+                    windowIndex: window.index
+                )
+                loadSessions()
+            } catch {
+                errorMessage = error.localizedDescription
             }
         }
     }
