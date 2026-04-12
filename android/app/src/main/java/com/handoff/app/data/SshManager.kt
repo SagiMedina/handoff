@@ -22,7 +22,7 @@ class SshManager {
     private val resizeHandler = Handler(Looper.getMainLooper())
     private var pendingResize: Runnable? = null
 
-    suspend fun connect(config: ConnectionConfig) = withContext(Dispatchers.IO) {
+    suspend fun connect(config: ConnectionConfig, proxyPort: Int = 0) = withContext(Dispatchers.IO) {
         disconnect()
 
         // Ensure BouncyCastle is available for Ed25519 key support
@@ -35,7 +35,9 @@ class SshManager {
         Log.d("Handoff", "Key bytes length: ${keyBytes.size}, starts with: ${String(keyBytes.take(30).toByteArray())}")
         jsch.addIdentity("handoff", keyBytes, null, null)
 
-        val sess = jsch.getSession(config.user, config.ip, 22)
+        val host = if (proxyPort > 0) "127.0.0.1" else config.ip
+        val port = if (proxyPort > 0) proxyPort else 22
+        val sess = jsch.getSession(config.user, host, port)
         val props = Properties()
         props["StrictHostKeyChecking"] = "no"
         sess.setConfig(props)
@@ -73,6 +75,10 @@ class SshManager {
                 command = parts.getOrElse(2) { "" }
             )
         }
+    }
+
+    suspend fun createSession(tmuxPath: String, sessionName: String): Unit = withContext(Dispatchers.IO) {
+        executeCommand("$tmuxPath new-session -d -s '$sessionName'")
     }
 
     suspend fun openShell(

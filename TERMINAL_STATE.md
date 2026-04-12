@@ -108,17 +108,22 @@ The TerminalView's `doScroll()` method detects that tmux uses alternate buffer (
 | File | Lines | Purpose |
 |------|-------|---------|
 | `app/.../ui/screens/TerminalScreen.kt` | 213 | Compose screen: creates TerminalView via AndroidView, manages SSH lifecycle |
-| `app/.../data/SshManager.kt` | 130 | JSch SSH connection, tmux commands, shell channel |
+| `app/.../data/SshManager.kt` | 130 | JSch SSH connection, tmux commands, exec channel (proxyPort support for tsnet) |
+| `app/.../data/TailscaleManager.kt` | ~80 | Kotlin wrapper around Go tsnet bridge — StateFlow for state/authUrl, startProxy() |
 | `app/.../ui/components/MobileToolbar.kt` | 118 | Custom extra keys toolbar (Compose Row with buttons) |
 | `app/.../terminal/TerminalSession.java` | 185 | **Modified from upstream** — bridges SSH streams to TerminalEmulator |
 | `app/.../data/ConnectionConfig.kt` | ~20 | Data classes: ConnectionConfig, TmuxSession, TmuxWindow |
 | `app/.../data/ConfigStore.kt` | ~50 | DataStore persistence for connection config |
-| `app/.../MainActivity.kt` | ~110 | Single activity, Compose NavHost with routes: welcome, scan, sessions, terminal |
-| `app/.../ui/screens/SessionsScreen.kt` | ~120 | Lists tmux sessions/windows, refresh, unpair |
+| `app/.../MainActivity.kt` | ~130 | Single activity, Compose NavHost with routes: welcome, scan, tailscale_auth, sessions, terminal |
+| `app/.../ui/screens/TailscaleAuthScreen.kt` | ~130 | Tailscale auth flow: spinner, browser sign-in, error handling |
+| `app/.../ui/screens/SessionsScreen.kt` | ~120 | Lists tmux sessions/windows, starts tsnet proxy before SSH |
 | `app/.../ui/screens/ScanScreen.kt` | ~100 | CameraX + ML Kit QR scanner |
 | `app/.../ui/screens/WelcomeScreen.kt` | ~30 | First launch screen |
 | `app/.../ui/theme/Theme.kt` | ~30 | Dark terminal theme |
 | `app/.../HandoffApp.kt` | ~15 | Application class |
+| `gobridge/bridge.go` | ~200 | Go tsnet bridge — Start/StartProxy/Stop, auth URL detection, Android workarounds |
+| `gobridge/go.mod` | — | Go module (tailscale.com v1.76.6 + x/mobile) |
+| `gobridge/build-aar.sh` | — | Builds gobridge.aar via gomobile |
 
 ### Termux Code (Copied from upstream, identical except TerminalSession)
 All files under `app/src/main/java/com/termux/` are **IDENTICAL** to the upstream Termux repo except:
@@ -309,9 +314,10 @@ When the keyboard appears, the terminal should resize. Currently `imePadding()` 
 
 1. First launch → WelcomeScreen → "Scan QR" button
 2. ScanScreen → CameraX + ML Kit scans QR → JSON: `{"v":1,"ip":"...","user":"...","key":"...","tmux":"..."}`
-3. Config saved to DataStore → navigate to SessionsScreen
-4. SessionsScreen: SSH connection → `tmux list-sessions` → `tmux list-windows` → display cards
-5. Tap a window → TerminalScreen: new SSH connection → open shell/exec channel → attach to tmux → render in TerminalView
+3. Config saved to DataStore → navigate to TailscaleAuthScreen
+4. TailscaleAuthScreen → starts embedded tsnet → first time: shows "Sign in to Tailscale" + browser auth; subsequent: auto-connects (~1-2s)
+5. SessionsScreen: starts tsnet TCP proxy → SSH via `localhost:proxyPort` → `tmux list-sessions` → `tmux list-windows` → display cards
+6. Tap a window → TerminalScreen: new SSH connection via proxy → exec channel → attach to tmux → render in TerminalView
 
 ## Dependencies (build.gradle.kts)
 - Compose BOM 2024.12.01
@@ -321,4 +327,12 @@ When the keyboard appears, the terminal should resize. Currently `imePadding()` 
 - DataStore Preferences 1.1.1
 - Security Crypto 1.1.0-alpha06
 - Kotlin Coroutines 1.9.0
+- gobridge.aar (gomobile-compiled Go tsnet bridge — tailscale.com v1.76.6)
 - minSdk 26, compileSdk 36, targetSdk 35
+
+### Building the Go bridge
+```bash
+cd android/gobridge
+./build-aar.sh  # requires Go, Android NDK, gomobile
+# Output: android/app/libs/gobridge.aar (~15MB)
+```

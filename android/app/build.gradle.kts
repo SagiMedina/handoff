@@ -80,6 +80,9 @@ dependencies {
     implementation("com.github.mwiede:jsch:0.2.21")
     implementation("org.bouncycastle:bcprov-jdk18on:1.78.1")
 
+    // Tailscale bridge (gomobile-generated .aar)
+    implementation(fileTree(mapOf("dir" to "libs", "include" to listOf("*.aar"))))
+
     // DataStore for persistence
     implementation("androidx.datastore:datastore-preferences:1.1.1")
 

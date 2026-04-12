@@ -21,6 +21,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.SshManager
+import com.handoff.app.data.TailscaleManager
 import com.handoff.app.ui.components.MobileToolbar
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
@@ -35,6 +36,7 @@ import java.io.OutputStream
 fun TerminalScreen(
     config: ConnectionConfig,
     sshManager: SshManager,
+    tailscaleManager: TailscaleManager,
     sessionName: String,
     windowIndex: Int,
     onDisconnect: () -> Unit
@@ -171,7 +173,10 @@ fun TerminalScreen(
         Log.d("Handoff", "Terminal: ${actualCols}x${actualRows} (after keyboard)")
 
         try {
-            terminalSsh.connect(config)
+            val proxyPort = tailscaleManager.getProxyPort().let { port ->
+                if (port > 0) port else tailscaleManager.startProxy(config.ip)
+            }
+            terminalSsh.connect(config, proxyPort)
             val (input, output) = terminalSsh.openShell(
                 config.tmuxPath, sessionName, windowIndex, actualCols, actualRows
             )

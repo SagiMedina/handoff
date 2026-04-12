@@ -14,11 +14,14 @@ Two components:
 - `handoff pair` - show QR code for phone setup (contains setup script URL + SSH key + Tailscale IP)
 - `handoff status` - is sharing active?
 
-### 2. Phone side (Termux script + widget)
-- Setup script (delivered via QR code from `handoff pair`)
-- Termux:Widget integration for home screen one-tap access
+### 2. Android app (native)
+- Jetpack Compose UI with CameraX QR scanning for pairing
+- Tailscale embedded via tsnet (Go library compiled to .aar via gomobile) - no separate VPN app needed
+- One-time Tailscale auth: opens browser for login, state persisted for future launches
+- SSH via JSch through a local TCP proxy that routes through tsnet to the Mac
 - Dynamic session discovery: SSH into Mac, list tmux sessions, pick one, attach
 - If only one session exists, skip picker and connect directly
+- Terminal emulation via embedded Termux terminal libraries
 
 ## Key Technical Decisions
 
@@ -33,18 +36,20 @@ Two components:
 - Works across different networks (home, office, mobile)
 - Zero config after initial setup
 - Free tier is sufficient
+- Embedded in the Android app via tsnet (userspace networking) - no separate Tailscale app required
+- Uses gomobile to compile Go tsnet library into an Android .aar
+- Doesn't use Android VpnService, so it doesn't conflict with other VPNs
 
-### Termux (not Termius) on phone
-- Open source - we control the entire UX end-to-end
-- Termux:Widget allows home screen shortcuts (one-tap connect)
-- Can ship scripts that automate the full flow
-- F-Droid distribution
+### Native Android app (not Termux)
+- Native Jetpack Compose app with embedded Termux terminal libraries
+- Full control over the UX end-to-end
+- Tailscale networking built in - one fewer app to install
+- QR code pairing with one-time Tailscale browser auth
 
 ### QR code for pairing
 - Mac generates QR via `qrencode -t ANSIUTF8` (brew install qrencode)
-- QR contains setup one-liner for Termux
-- Handles: SSH key transfer, Tailscale IP discovery, shortcut installation
-- `ssh://` URI scheme works but doesn't support tmux attach - so we use our own script
+- QR contains JSON payload: `{"v":1, "ip":"<tailscale_ip>", "user":"...", "key":"<base64_ssh_key>", "tmux":"<tmux_path>"}`
+- Android app scans QR with CameraX + ML Kit, saves config, starts Tailscale auth flow
 
 ### Multi-session support
 - Users may have multiple tmux sessions (different projects)
@@ -61,15 +66,18 @@ Two components:
 - macOS Remote Login (SSH) enabled
 
 ### Phone (Android)
-- Termux (from F-Droid)
-- Termux:Widget (from F-Droid) - for home screen shortcuts
-- Tailscale (from Play Store)
-- openssh (pkg install openssh in Termux)
+- Handoff native app (all dependencies bundled):
+  - Tailscale networking via embedded tsnet (gomobile .aar)
+  - SSH via JSch + BouncyCastle (Ed25519 support)
+  - Terminal emulation via embedded Termux libraries
+  - CameraX + ML Kit for QR scanning
+- Tailscale account (free tier) for authentication
+- Android NDK required for building the tsnet .aar (build-time only)
 
 ## Package format
 - Homebrew tap for Mac distribution
-- Shell script for Termux side
-- Consider: could also be a Rust CLI for portability
+- Android APK (native app with embedded Tailscale)
+- Go bridge built via gomobile: `cd android/gobridge && ./build-aar.sh`
 
 ## Open questions
 - iOS support? Blink Shell is the best iOS terminal but it's not open source. Could still provide instructions.

@@ -15,6 +15,7 @@ import androidx.navigation.compose.rememberNavController
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.SshManager
+import com.handoff.app.data.TailscaleManager
 import com.handoff.app.ui.screens.*
 import com.handoff.app.ui.theme.HandoffTheme
 import kotlinx.coroutines.launch
@@ -22,6 +23,9 @@ import kotlinx.coroutines.launch
 class MainActivity : ComponentActivity() {
 
     private val sshManager = SshManager()
+    private val tailscaleManager by lazy {
+        TailscaleManager(HandoffApp.appFilesDir)
+    }
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -44,7 +48,7 @@ class MainActivity : ComponentActivity() {
                 val scaffoldPadding = innerPadding
                 NavHost(
                     navController = navController,
-                    startDestination = if (config != null) "sessions" else "welcome",
+                    startDestination = if (config != null) "tailscale_auth" else "welcome",
                 ) {
                     composable("welcome") {
                         Box(Modifier.padding(scaffoldPadding)) {
@@ -63,12 +67,26 @@ class MainActivity : ComponentActivity() {
                                 scope.launch {
                                     configStore.save(scannedConfig)
                                     config = scannedConfig
-                                    navController.navigate("sessions") {
+                                    navController.navigate("tailscale_auth") {
                                         popUpTo("welcome") { inclusive = true }
                                     }
                                 }
                             },
                             onError = { /* TODO: show snackbar */ }
+                        )
+                        }
+                    }
+
+                    composable("tailscale_auth") {
+                        Box(Modifier.padding(scaffoldPadding)) {
+                        TailscaleAuthScreen(
+                            tailscaleManager = tailscaleManager,
+                            onAuthenticated = {
+                                navController.navigate("sessions") {
+                                    popUpTo("tailscale_auth") { inclusive = true }
+                                }
+                            },
+                            onError = { /* shown in auth screen UI */ }
                         )
                         }
                     }
@@ -80,6 +98,7 @@ class MainActivity : ComponentActivity() {
                             SessionsScreen(
                                 config = currentConfig,
                                 sshManager = sshManager,
+                                tailscaleManager = tailscaleManager,
                                 onWindowSelected = { sessionName, window ->
                                     navController.navigate(
                                         "terminal/$sessionName/${window.index}"
@@ -88,6 +107,7 @@ class MainActivity : ComponentActivity() {
                                 onUnpair = {
                                     scope.launch {
                                         sshManager.disconnect()
+                                        tailscaleManager.resetState()
                                         configStore.clear()
                                         config = null
                                         navController.navigate("welcome") {
@@ -109,6 +129,7 @@ class MainActivity : ComponentActivity() {
                             TerminalScreen(
                                 config = currentConfig,
                                 sshManager = sshManager,
+                                tailscaleManager = tailscaleManager,
                                 sessionName = sessionName,
                                 windowIndex = windowIndex,
                                 onDisconnect = {
@@ -126,5 +147,7 @@ class MainActivity : ComponentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         sshManager.disconnect()
+        tailscaleManager.stopProxy()
+        tailscaleManager.stop()
     }
 }

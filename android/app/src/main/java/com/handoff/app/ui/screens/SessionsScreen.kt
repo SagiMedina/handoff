@@ -10,6 +10,7 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.SshManager
+import com.handoff.app.data.TailscaleManager
 import com.handoff.app.data.TmuxSession
 import com.handoff.app.data.TmuxWindow
 import com.handoff.app.ui.components.SessionCard
@@ -20,12 +21,15 @@ import kotlinx.coroutines.launch
 fun SessionsScreen(
     config: ConnectionConfig,
     sshManager: SshManager,
+    tailscaleManager: TailscaleManager,
     onWindowSelected: (String, TmuxWindow) -> Unit,
     onUnpair: () -> Unit
 ) {
     var sessions by remember { mutableStateOf<List<TmuxSession>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
     var error by remember { mutableStateOf<String?>(null) }
+    var showNewSessionDialog by remember { mutableStateOf(false) }
+    var newSessionName by remember { mutableStateOf("") }
     val scope = rememberCoroutineScope()
 
     fun refresh() {
@@ -34,7 +38,8 @@ fun SessionsScreen(
             error = null
             try {
                 if (!sshManager.isConnected) {
-                    sshManager.connect(config)
+                    val proxyPort = tailscaleManager.startProxy(config.ip)
+                    sshManager.connect(config, proxyPort)
                 }
                 val rawSessions = sshManager.listSessions(config.tmuxPath)
 
@@ -61,6 +66,42 @@ fun SessionsScreen(
 
     LaunchedEffect(Unit) { refresh() }
 
+    if (showNewSessionDialog) {
+        AlertDialog(
+            onDismissRequest = { showNewSessionDialog = false },
+            title = { Text("New Session") },
+            text = {
+                OutlinedTextField(
+                    value = newSessionName,
+                    onValueChange = { newSessionName = it },
+                    label = { Text("Session name") },
+                    singleLine = true
+                )
+            },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        val name = newSessionName.trim()
+                        if (name.isNotEmpty()) {
+                            showNewSessionDialog = false
+                            scope.launch {
+                                try {
+                                    sshManager.createSession(config.tmuxPath, name)
+                                    refresh()
+                                } catch (e: Exception) {
+                                    error = "Failed to create session: ${e.message}"
+                                }
+                            }
+                        }
+                    }
+                ) { Text("Create") }
+            },
+            dismissButton = {
+                TextButton(onClick = { showNewSessionDialog = false }) { Text("Cancel") }
+            }
+        )
+    }
+
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -84,7 +125,13 @@ fun SessionsScreen(
                 )
             }
 
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+                TextButton(onClick = {
+                    newSessionName = ""
+                    showNewSessionDialog = true
+                }) {
+                    Text("+ New")
+                }
                 TextButton(onClick = { refresh() }) {
                     Text("Refresh")
                 }
@@ -144,11 +191,18 @@ fun SessionsScreen(
                         )
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Open a terminal on your Mac to get started",
+                            text = "Create a session or open a terminal on your Mac",
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                         Spacer(modifier = Modifier.height(16.dp))
-                        Button(onClick = { refresh() }) {
+                        Button(onClick = {
+                            newSessionName = "main"
+                            showNewSessionDialog = true
+                        }) {
+                            Text("New Session")
+                        }
+                        Spacer(modifier = Modifier.height(8.dp))
+                        TextButton(onClick = { refresh() }) {
                             Text("Refresh")
                         }
                     }

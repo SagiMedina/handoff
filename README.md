@@ -21,12 +21,12 @@ This:
 - Generates an SSH key for passwordless phone access
 
 **Phone:**
-1. Install [Termux](https://play.google.com/store/apps/details?id=com.termux) from Google Play, or from [F-Droid](https://f-droid.org/packages/com.termux/) for the full-featured version
-2. Open Termux
-3. On your Mac, run `handoff pair` - it shows a QR code
-4. Scan it with Termux (installs the handoff script, copies SSH key, done)
+1. Install the Handoff app on your Android phone
+2. On your Mac, run `handoff pair` - it shows a QR code
+3. Open Handoff on your phone and scan the QR code
+4. Sign in to your Tailscale account (one-time, in browser)
 
-You now have a **Handoff** widget on your home screen.
+That's it. Tailscale networking is built into the app - no separate VPN app needed.
 
 ## Daily use
 
@@ -43,7 +43,7 @@ $ handoff
   Ready. Open Handoff on your phone.
 ```
 
-On your phone, tap the Handoff widget:
+On your phone, open Handoff:
 
 ```
   * piko
