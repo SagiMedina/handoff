@@ -81,6 +81,11 @@ class SshManager {
         executeCommand("$tmuxPath new-session -d -s '$sessionName'")
     }
 
+    suspend fun createWindow(tmuxPath: String, sessionName: String): Int = withContext(Dispatchers.IO) {
+        val output = executeCommand("$tmuxPath new-window -t '$sessionName' -P -F '#{window_index}'")
+        output.trim().toIntOrNull() ?: -1
+    }
+
     suspend fun openShell(
         tmuxPath: String,
         sessionName: String,

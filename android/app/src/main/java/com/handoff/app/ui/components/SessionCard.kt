@@ -19,6 +19,7 @@ import com.handoff.app.ui.theme.HandoffGreen
 fun SessionCard(
     session: TmuxSession,
     onWindowClick: (TmuxWindow) -> Unit,
+    onNewWindow: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     Card(
@@ -51,14 +52,37 @@ fun SessionCard(
                 )
             }
 
+            Spacer(modifier = Modifier.height(8.dp))
             if (session.windows.isNotEmpty()) {
-                Spacer(modifier = Modifier.height(8.dp))
                 session.windows.forEach { window ->
                     WindowRow(
                         window = window,
                         onClick = { onWindowClick(window) }
                     )
                 }
+            }
+            Spacer(modifier = Modifier.height(4.dp))
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clickable(onClick = onNewWindow)
+                    .padding(vertical = 10.dp, horizontal = 24.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = "+",
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.Bold
+                )
+                Text(
+                    text = "new window",
+                    fontFamily = FontFamily.Monospace,
+                    color = MaterialTheme.colorScheme.primary,
+                    fontSize = 14.sp
+                )
             }
         }
     }

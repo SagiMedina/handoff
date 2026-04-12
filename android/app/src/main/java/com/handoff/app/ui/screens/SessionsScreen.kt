@@ -232,6 +232,17 @@ fun SessionsScreen(
                             session = session,
                             onWindowClick = { window ->
                                 onWindowSelected(session.name, window)
+                            },
+                            onNewWindow = {
+                                scope.launch {
+                                    try {
+                                        val windowIndex = sshManager.createWindow(config.tmuxPath, session.name)
+                                        val newWindow = TmuxWindow(index = windowIndex, title = "shell", command = "")
+                                        onWindowSelected(session.name, newWindow)
+                                    } catch (e: Exception) {
+                                        error = "Failed to create window: ${e.message}"
+                                    }
+                                }
                             }
                         )
                     }
