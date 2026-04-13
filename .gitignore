@@ -1,0 +1,5 @@
+# macOS
+.DS_Store
+
+# AMQ agent messaging state
+.agent-mail/
