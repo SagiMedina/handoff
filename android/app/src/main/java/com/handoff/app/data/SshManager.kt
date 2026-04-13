@@ -62,17 +62,19 @@ class SshManager {
 
     suspend fun listWindows(tmuxPath: String, sessionName: String): List<TmuxWindow> = withContext(Dispatchers.IO) {
         val output = executeCommand(
-            "$tmuxPath list-windows -t '$sessionName' -F '#{window_index}|#{pane_title}|#{pane_current_command}'"
+            "$tmuxPath list-windows -t '$sessionName' -F '#{window_index}|#{pane_title}|#{pane_current_command}|#{pane_current_path}'"
         )
         if (output.isBlank()) return@withContext emptyList()
 
         output.trim().lines().map { line ->
-            val parts = line.split("|", limit = 3)
+            val parts = line.split("|", limit = 4)
+            val rawPath = parts.getOrElse(3) { "" }
             TmuxWindow(
                 index = parts[0].toIntOrNull() ?: 0,
                 title = (parts.getOrElse(1) { "" }.ifBlank { parts.getOrElse(2) { "shell" } })
                     .replace(Regex("^[^\\p{L}\\p{N}]+"), "").trim(), // Strip leading Unicode symbols (e.g. Claude Code status indicators)
-                command = parts.getOrElse(2) { "" }
+                command = parts.getOrElse(2) { "" },
+                cwd = rawPath.trimEnd('/').substringAfterLast('/')
             )
         }
     }

@@ -16,5 +16,6 @@ data class TmuxSession(
 data class TmuxWindow(
     val index: Int,
     val title: String,
-    val command: String
+    val command: String,
+    val cwd: String = ""
 )

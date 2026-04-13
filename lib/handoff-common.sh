@@ -97,7 +97,7 @@ tmux_sessions() {
     tmux list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null
 }
 
-# Pretty-print tmux sessions
+# Pretty-print tmux sessions with window details
 print_sessions() {
     local sessions
     sessions=$(tmux_sessions)
@@ -106,8 +106,18 @@ print_sessions() {
         return 1
     fi
     while IFS=: read -r name windows; do
-        local label="window"
-        [[ "$windows" -gt 1 ]] && label="windows"
+        local label="tab"
+        [[ "$windows" -gt 1 ]] && label="tabs"
         printf "  ${BOLD}*${RESET} %-16s ${DIM}(%s %s)${RESET}\n" "$name" "$windows" "$label"
+        # List individual windows with cwd
+        local win_info
+        win_info=$(tmux list-windows -t "$name" -F '#{pane_current_command}|#{pane_current_path}' 2>/dev/null)
+        if [[ -n "$win_info" ]]; then
+            while IFS='|' read -r cmd path; do
+                local folder="${path%/}"
+                folder="${folder##*/}"
+                printf "    ${DIM}›${RESET} %-14s ${DIM}%s${RESET}\n" "$cmd" "$folder"
+            done <<< "$win_info"
+        fi
     done <<< "$sessions"
 }

@@ -1,5 +1,6 @@
 package com.handoff.app.ui.screens
 
+import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -31,6 +32,7 @@ fun SessionsScreen(
     var error by remember { mutableStateOf<String?>(null) }
     var showNewSessionDialog by remember { mutableStateOf(false) }
     var newSessionName by remember { mutableStateOf("") }
+    var showIp by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
     fun refresh(showLoading: Boolean = true) {
@@ -126,20 +128,17 @@ fun SessionsScreen(
                     text = "Handoff",
                     style = MaterialTheme.typography.titleLarge
                 )
-                Text(
-                    text = config.ip,
-                    style = MaterialTheme.typography.labelMedium,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant
-                )
+                if (showIp) {
+                    Text(
+                        text = config.ip,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.clickable { showIp = false }
+                    )
+                }
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = {
-                    newSessionName = ""
-                    showNewSessionDialog = true
-                }) {
-                    Text("+ New")
-                }
                 TextButton(onClick = { refresh() }) {
                     Text("Refresh")
                 }
@@ -217,14 +216,15 @@ fun SessionsScreen(
                 }
             }
             else -> {
-                // Connected indicator
+                // Connected indicator — tap to show/hide IP
                 Row(
+                    modifier = Modifier.clickable { showIp = !showIp },
                     verticalAlignment = Alignment.CenterVertically,
                     horizontalArrangement = Arrangement.spacedBy(6.dp)
                 ) {
                     Text("●", color = HandoffGreen, style = MaterialTheme.typography.labelSmall)
                     Text(
-                        text = "Connected",
+                        text = if (showIp) "Connected — ${config.ip}" else "Connected",
                         color = HandoffGreen,
                         style = MaterialTheme.typography.labelMedium
                     )
@@ -248,7 +248,7 @@ fun SessionsScreen(
                                         val newWindow = TmuxWindow(index = windowIndex, title = "shell", command = "")
                                         onWindowSelected(session.name, newWindow)
                                     } catch (e: Exception) {
-                                        error = "Failed to create window: ${e.message}"
+                                        error = "Failed to create tab: ${e.message}"
                                     }
                                 }
                             },
@@ -268,11 +268,26 @@ fun SessionsScreen(
                                         sshManager.killWindow(config.tmuxPath, session.name, window.index)
                                         refresh()
                                     } catch (e: Exception) {
-                                        error = "Failed to kill window: ${e.message}"
+                                        error = "Failed to kill tab: ${e.message}"
                                     }
                                 }
                             }
                         )
+                    }
+                    item {
+                        TextButton(
+                            onClick = {
+                                newSessionName = ""
+                                showNewSessionDialog = true
+                            },
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text(
+                                text = "+ new session",
+                                color = MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.5f),
+                                style = MaterialTheme.typography.labelMedium
+                            )
+                        }
                     }
                 }
             }
