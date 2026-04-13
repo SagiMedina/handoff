@@ -5,27 +5,36 @@ iOS companion app for [Handoff](../README.md) — continue your Mac terminal ses
 ## Requirements
 
 - macOS with **Xcode 15+**
+- **Go** (https://go.dev/dl/) — needed to build the embedded Tailscale framework
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen): `brew install xcodegen`
 - iOS 16.0+ deployment target
 - An Apple ID (free personal team works for development; paid for App Store distribution)
 
 ## Setup
 
-1. **Install XcodeGen**
+1. **Install prerequisites**
    ```bash
    brew install xcodegen
+   # Go: install from https://go.dev/dl/ if not already present
+   go version   # verify
    ```
 
-2. **Find your Apple Developer Team ID**
+2. **Build the Tailscale Go bridge** (embedded networking — no separate VPN app needed):
+   ```bash
+   cd ios
+   ./scripts/build-gobridge.sh
+   ```
+   This compiles the shared `android/gobridge/bridge.go` for iOS via gomobile, producing `Handoff/Frameworks/Gobridge.xcframework` (~91 MB, not checked in).
+
+3. **Find your Apple Developer Team ID**
    ```bash
    security find-certificate -c "Apple Development" -p \
      | openssl x509 -noout -subject | grep -oE 'OU=[A-Z0-9]+' | sed 's/OU=//'
    ```
    If no certificate is found, open Xcode once → Settings → Accounts → sign in with your Apple ID, then retry.
 
-3. **Generate the Xcode project** with your team and bundle ID prefix:
+4. **Generate the Xcode project** with your team and bundle ID prefix:
    ```bash
-   cd ios
    DEVELOPMENT_TEAM=YOURTEAMID \
    BUNDLE_ID_PREFIX=dev.yourname.handoff \
      ./scripts/generate.sh
@@ -36,7 +45,7 @@ iOS companion app for [Handoff](../README.md) — continue your Mac terminal ses
    BUNDLE_ID_PREFIX=dev.yourname.handoff ./scripts/generate.sh
    ```
 
-4. **Open in Xcode** and build:
+5. **Open in Xcode** and build:
    ```bash
    open Handoff/Handoff.xcodeproj
    ```
@@ -47,10 +56,11 @@ iOS companion app for [Handoff](../README.md) — continue your Mac terminal ses
    xcodebuild -scheme Handoff -destination 'platform=iOS Simulator,name=iPhone 17 Pro' build
    ```
 
-## Dependencies (via SPM)
+## Dependencies
 
-- [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) — Terminal emulator
-- [SwiftNIO SSH](https://github.com/apple/swift-nio-ssh) — SSH client
+- [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) — Terminal emulator (SPM)
+- [SwiftNIO SSH](https://github.com/apple/swift-nio-ssh) — SSH client (SPM)
+- [Tailscale tsnet](https://tailscale.com/kb/1244/tsnet) — Embedded networking via Go bridge (gomobile, same source as Android)
 
 ## Architecture
 
@@ -59,20 +69,22 @@ Sources/
 ├── App/            HandoffApp, ContentView (NavigationStack), Theme
 ├── Models/         ConnectionConfig, TmuxSession, TmuxWindow, QRCodePayload
 ├── Services/       ConfigStore (Keychain), SSHManager (NIOSSH),
-│                   TerminalChannel (PTY), TerminalSessionStore (lifecycle)
-└── Views/          Welcome, Scan, QRScannerController, Sessions, SessionCard,
-                    Terminal, SwiftTermView, MobileToolbar
+│                   TerminalChannel (PTY), TerminalSessionStore (lifecycle),
+│                   TailscaleManager (Go bridge wrapper)
+└── Views/          Welcome, TailscaleAuth, Scan, QRScannerController,
+                    Sessions, SessionCard, Terminal, SwiftTermView, MobileToolbar
 ```
 
 ## Pairing
 
 1. On your Mac: `handoff pair` — prints a QR code
-2. On your phone: open the Handoff app → tap **Scan QR Code** → point at the QR on your Mac
+2. On your phone: open the Handoff app → sign in to Tailscale (one-time, in browser) → tap **Scan QR Code** → point at the QR on your Mac
 3. The app parses the JSON payload, saves the SSH private key to iOS Keychain, and lists your tmux sessions
 4. Tap a session → you're attached live
 
 ## Notes
 
 - **The generated `.xcodeproj` is not checked in** — regenerate it locally with `./scripts/generate.sh` any time you change `project.yml`
+- **The `Gobridge.xcframework` is not checked in** (91 MB) — rebuild with `./scripts/build-gobridge.sh` after cloning or if the Go bridge code changes
 - `DEVELOPMENT_TEAM` and `BUNDLE_ID_PREFIX` are intentionally kept out of source control so the repo stays team-agnostic
 - For simulator testing without camera access, there's a `Debug: Paste QR Payload` button on the Welcome screen (DEBUG builds only)

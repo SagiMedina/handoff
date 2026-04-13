@@ -20,22 +20,36 @@ final class TailscaleManager: ObservableObject {
 
     private let stateDir: String
 
+    /// Generation counter: incremented on each start(). Callbacks from a previous
+    /// generation are ignored, preventing stale events from clobbering new state.
+    private var generation: Int = 0
+
     init() {
-        // Persistent directory for Tailscale node state (survives app restarts)
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
         let tsDir = appSupport.appendingPathComponent("tailscale", isDirectory: true)
         try? FileManager.default.createDirectory(at: tsDir, withIntermediateDirectories: true)
         self.stateDir = tsDir.path
     }
 
-    /// Start the Tailscale connection. Calls back with auth URL if login is needed.
+    /// Start the Tailscale connection. Only starts from `.stopped` or `.error` state.
+    /// Calls back with auth URL if login is needed.
     func start(hostname: String = "handoff-ios") {
-        guard state == .stopped || state != .starting else { return }
+        // Only allow start from terminal states — prevent re-entry during
+        // .starting or .needsAuth which would trigger "already started" in Go.
+        switch state {
+        case .stopped, .error:
+            break
+        default:
+            return
+        }
+
+        generation += 1
+        let currentGen = generation
         state = .starting
 
         let callback = StatusCallbackImpl { [weak self] event in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.generation == currentGen else { return }
                 switch event {
                 case .authURL(let url):
                     self.state = .needsAuth(url: url)
@@ -64,6 +78,7 @@ final class TailscaleManager: ObservableObject {
 
     /// Stop the Tailscale connection and proxy.
     func stop() {
+        generation += 1  // Invalidate any in-flight callbacks
         GobridgeStop()
         state = .stopped
     }
