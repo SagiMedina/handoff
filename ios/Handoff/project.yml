@@ -30,6 +30,7 @@ targets:
       - package: SwiftTerm
       - package: swift-nio-ssh
         product: NIOSSH
+      - framework: Frameworks/Gobridge.xcframework
     settings:
       base:
         INFOPLIST_FILE: Resources/Info.plist

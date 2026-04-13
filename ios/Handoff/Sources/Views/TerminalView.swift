@@ -8,6 +8,7 @@ import UIKit
 struct TerminalView: View {
     let sessionName: String
     let windowIndex: Int
+    var tailscale: TailscaleManager
 
     @EnvironmentObject var configStore: ConfigStore
     @Environment(\.scenePhase) private var scenePhase
@@ -136,7 +137,8 @@ struct TerminalView: View {
         let task = Task { @MainActor in
             do {
                 let sshManager = SSHManager()
-                try await sshManager.connect(config: config)
+                let proxyPort = try tailscale.startProxy(targetIP: config.ip)
+                try await sshManager.connect(config: config, proxyPort: proxyPort)
                 try Task.checkCancellation()
 
                 let handler = try await sshManager.openTerminal(

@@ -24,8 +24,10 @@ final class SSHManager: ObservableObject {
 
     /// Establish an SSH connection to the remote Mac.
     /// Waits for both TCP connection AND SSH authentication to complete before returning.
-    func connect(config: ConnectionConfig) async throws {
-        print("[SSH] connect() starting — ip=\(config.ip) user=\(config.user)")
+    /// Connect to the remote Mac. If proxyPort > 0, connects to 127.0.0.1:<proxyPort>
+    /// instead of config.ip:22 (used when routing through the embedded Tailscale proxy).
+    func connect(config: ConnectionConfig, proxyPort: Int = 0) async throws {
+        print("[SSH] connect() starting — ip=\(config.ip) user=\(config.user) proxyPort=\(proxyPort)")
         // Tear down any existing connection to prevent resource leaks on retry
         disconnect()
 
@@ -69,10 +71,12 @@ final class SSHManager: ObservableObject {
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
             .connectTimeout(.seconds(10))
 
-        print("[SSH] TCP connecting to \(config.ip):22…")
+        let connectHost = proxyPort > 0 ? "127.0.0.1" : config.ip
+        let connectPort = proxyPort > 0 ? proxyPort : 22
+        print("[SSH] TCP connecting to \(connectHost):\(connectPort)…")
         let channel: Channel
         do {
-            channel = try await bootstrap.connect(host: config.ip, port: 22).get()
+            channel = try await bootstrap.connect(host: connectHost, port: connectPort).get()
             print("[SSH] TCP connected, channel active=\(channel.isActive)")
         } catch {
             print("[SSH] TCP connect FAILED: \(error)")

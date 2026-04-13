@@ -5,6 +5,7 @@ import SwiftUI
 struct SessionsView: View {
     @EnvironmentObject var configStore: ConfigStore
     @Binding var path: NavigationPath
+    var tailscale: TailscaleManager
 
     @StateObject private var sshManager = SSHManager()
     @State private var sessions: [TmuxSession] = []
@@ -172,7 +173,9 @@ struct SessionsView: View {
         Task {
             do {
                 if !sshManager.isConnected {
-                    try await sshManager.connect(config: config)
+                    // Route SSH through the embedded Tailscale proxy
+                    let proxyPort = try tailscale.startProxy(targetIP: config.ip)
+                    try await sshManager.connect(config: config, proxyPort: proxyPort)
                 }
 
                 var discoveredSessions = try await sshManager.listSessions(tmuxPath: config.tmuxPath)

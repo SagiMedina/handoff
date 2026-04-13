@@ -1,6 +1,9 @@
 # Generated Xcode project — regenerate with: ./scripts/generate.sh
 Handoff/Handoff.xcodeproj/
 
+# Generated Go bridge framework — rebuild with: ./scripts/build-gobridge.sh
+Handoff/Frameworks/
+
 # Xcode user data
 *.xcuserdata/
 *.xcworkspace/xcuserdata/
