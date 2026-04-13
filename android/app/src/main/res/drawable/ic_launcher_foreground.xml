@@ -1,15 +1,36 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+     Handoff adaptive-icon foreground.
+     Two-chevron composition — "The Handoff Chevron", variant v4.
+     See ios/docs/design/app-icon.svg for the canonical master (1024 viewport).
+
+     Geometry here is the iOS master scaled to a 108 viewport:
+       - Leading chevron centered at the 66 dp safe zone center
+       - Trailing chevron offset (-8.4, +3.0) and alpha 0.60 — "Mac passing forward"
+       - Stroke width 11.4 (from iOS stroke 120 × 0.0949 scale factor)
+       - Trailing chevron's lower arm intentionally bleeds a touch past the safe
+         zone so adaptive parallax drifts the ghost on tilt, reinforcing motion.
+-->
 <vector xmlns:android="http://schemas.android.com/apk/res/android"
     android:width="108dp"
     android:height="108dp"
     android:viewportWidth="108"
     android:viewportHeight="108">
-    <!-- Arrow pointing right, representing "handoff" -->
+
+    <!-- Trailing chevron (Mac blue, 60% opacity) -->
     <path
-        android:fillColor="#58A6FF"
-        android:pathData="M44,34 L64,54 L44,74 L44,62 L28,62 L28,46 L44,46 Z"/>
-    <!-- Phone outline -->
+        android:pathData="M 33.5 32.7 L 69.9 57.0 L 33.5 81.3"
+        android:strokeColor="#58A6FF"
+        android:strokeAlpha="0.6"
+        android:strokeWidth="11.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"/>
+
+    <!-- Leading chevron (terminal green, live) -->
     <path
-        android:fillColor="#58A6FF"
-        android:pathData="M68,30 L80,30 C82.2,30 84,31.8 84,34 L84,74 C84,76.2 82.2,78 80,78 L68,78 C65.8,78 64,76.2 64,74 L64,34 C64,31.8 65.8,30 68,30 Z M67,34 L67,74 L81,74 L81,34 Z M72,75 L76,75 L76,77 L72,77 Z"/>
+        android:pathData="M 41.9 29.7 L 78.3 54.0 L 41.9 78.3"
+        android:strokeColor="#3FB950"
+        android:strokeWidth="11.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"/>
 </vector>

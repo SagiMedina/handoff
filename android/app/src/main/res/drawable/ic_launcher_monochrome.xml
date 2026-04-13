@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+     Handoff adaptive-icon monochrome layer (Android 13+ themed icons).
+     The OS tints this drawable to the user's theme color on devices that opt
+     into themed icons. A split-color chevron stripped to one color reads as a
+     shape with a weird shadow, so the monochrome variant drops the trailing
+     chevron entirely and ships the silhouette only — maximum legibility under
+     any theme tint.
+-->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+
+    <path
+        android:pathData="M 41.9 29.7 L 78.3 54.0 L 41.9 78.3"
+        android:strokeColor="#FFFFFF"
+        android:strokeWidth="11.4"
+        android:strokeLineCap="round"
+        android:strokeLineJoin="round"/>
+</vector>
