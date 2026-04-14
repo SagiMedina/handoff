@@ -24,7 +24,7 @@ iOS companion app for [Handoff](../README.md) — continue your Mac terminal ses
    cd ios
    ./scripts/build-tailscalekit.sh
    ```
-   Clones [Tailscale's `libtailscale`](https://github.com/tailscale/libtailscale), runs `make ios-fat`, and installs `Handoff/Frameworks/TailscaleKit.xcframework` (~70 MB, not checked in).
+   Clones [Tailscale's `libtailscale`](https://github.com/tailscale/libtailscale) at a **pinned commit** (see `LIBTAILSCALE_REF` in the script) and runs `make ios-fat`, installing `Handoff/Frameworks/TailscaleKit.xcframework` (~70 MB, not checked in). Pinning makes the build reproducible across machines and CI.
 
 3. **Find your Apple Developer Team ID**
    ```bash

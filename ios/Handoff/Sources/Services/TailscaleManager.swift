@@ -166,17 +166,40 @@ final class TailscaleManager: ObservableObject {
     }
 
     private func handleNotify(_ notify: Ipn.Notify) {
-        // Only transition to .needsAuth if we're NOT already connected.
-        // tsnet emits stale BrowseToURL events even after connection — bouncing
-        // back to the auth screen on those breaks the connected experience.
+        // ---- Process Notify.State first so it informs the BrowseToURL handling ----
+        // tsnet sometimes re-emits a stale BrowseToURL after we connect (a bug, or a
+        // re-auth invitation). To distinguish the two: only transition out of
+        // .connected when we ALSO see a non-Running State change. A bare BrowseToURL
+        // without an accompanying State change is treated as stale and ignored.
+        if let s = notify.State {
+            switch (state, s) {
+            case (.connected, .NeedsLogin), (.connected, .NeedsMachineAuth):
+                // Auth lost while connected — drop back to the auth screen.
+                proxyConfig = nil
+                if let url = notify.BrowseToURL, !url.isEmpty {
+                    state = .needsAuth(url: url)
+                } else {
+                    state = .stopped  // ContentView gate will route to TailscaleAuthView, which calls start() again
+                }
+                return
+            case (.connected, .Stopped), (.connected, .NoState):
+                // Node fully stopped — clear runtime, clear proxy, drop to .stopped.
+                proxyConfig = nil
+                state = .stopped
+                return
+            default:
+                break
+            }
+        }
+
+        // Pre-connection: route BrowseToURL to needsAuth, errors to .error.
         if let url = notify.BrowseToURL, !url.isEmpty, state != .connected {
             state = .needsAuth(url: url)
         }
-        // Same logic for errors — once connected, transient bus errors shouldn't
-        // tear down the UI. Only treat errors as fatal during connection setup.
         if let err = notify.ErrMessage, !err.isEmpty, state != .connected {
             state = .error(err)
         }
+
         if let s = notify.State, s == .Running {
             #if DEBUG
             print("[Tailscale] notify.State == .Running — fetching loopback")
