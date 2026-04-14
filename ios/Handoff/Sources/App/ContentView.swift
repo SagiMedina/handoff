@@ -3,7 +3,8 @@ import SwiftUI
 /// Root navigation: routes based on pairing state + Tailscale connection.
 struct ContentView: View {
     @EnvironmentObject var configStore: ConfigStore
-    @StateObject private var tailscale = TailscaleManager()
+    /// Owned at app root in HandoffApp; injected via environmentObject.
+    @EnvironmentObject var tailscale: TailscaleManager
 
     enum Route: Hashable {
         case scan

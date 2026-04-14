@@ -1,10 +1,18 @@
 import SwiftUI
+import SafariServices
 
 /// Handles Tailscale authentication when the embedded tsnet needs a browser sign-in.
 /// Shows a spinner while connecting, a sign-in button when auth is needed,
 /// and error states with retry/reset options.
+///
+/// Auth uses `SFSafariViewController` (in-app system Safari) instead of
+/// `UIApplication.shared.open(url)` because the latter backgrounds the app, and
+/// iOS kills our process while in background — taking down the embedded tsnet
+/// server. SFSafariViewController keeps the app foregrounded AND shares Safari's
+/// cookie jar (so the user's existing Tailscale session is reused).
 struct TailscaleAuthView: View {
     @ObservedObject var tailscale: TailscaleManager
+    @State private var safariURL: URL?
 
     var body: some View {
         ZStack {
@@ -42,7 +50,10 @@ struct TailscaleAuthView: View {
 
                     Button {
                         if let authURL = URL(string: url) {
-                            UIApplication.shared.open(authURL)
+                            // Present in-app Safari to keep our process foregrounded.
+                            // UIApplication.shared.open(url) would background the app
+                            // and iOS would kill our process, taking tsnet down with it.
+                            safariURL = authURL
                         }
                     } label: {
                         Label("Open Browser to Sign In", systemImage: "safari")
@@ -102,5 +113,35 @@ struct TailscaleAuthView: View {
         }
         .navigationTitle("Tailscale")
         .navigationBarTitleDisplayMode(.inline)
+        .sheet(item: $safariURL) { url in
+            SafariView(url: url)
+                .ignoresSafeArea()
+        }
+        .onChange(of: tailscale.state) { newState in
+            // Auto-dismiss the Safari sheet once Tailscale has connected.
+            if case .connected = newState, safariURL != nil {
+                safariURL = nil
+            }
+        }
     }
+}
+
+/// SwiftUI wrapper around SFSafariViewController.
+private struct SafariView: UIViewControllerRepresentable {
+    let url: URL
+
+    func makeUIViewController(context: Context) -> SFSafariViewController {
+        let config = SFSafariViewController.Configuration()
+        config.entersReaderIfAvailable = false
+        let vc = SFSafariViewController(url: url, configuration: config)
+        vc.preferredControlTintColor = UIColor(Theme.primary)
+        return vc
+    }
+
+    func updateUIViewController(_ uiViewController: SFSafariViewController, context: Context) {}
+}
+
+// URL needs Identifiable for .sheet(item:)
+extension URL: @retroactive Identifiable {
+    public var id: String { absoluteString }
 }

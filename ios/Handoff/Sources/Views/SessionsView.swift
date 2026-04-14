@@ -12,7 +12,7 @@ struct SessionsView: View {
     @State private var isLoading = true
     @State private var errorMessage: String?
     @State private var hasAutoConnected = false
-    @State private var showIP = false
+    @State private var showSignOutConfirmation = false
 
     // New session dialog
     @State private var showNewSessionDialog = false
@@ -58,13 +58,19 @@ struct SessionsView: View {
                 .foregroundColor(Theme.red)
             }
             ToolbarItem(placement: .navigationBarTrailing) {
-                Button {
-                    loadSessions()
-                } label: {
-                    Image(systemName: "arrow.clockwise")
+                if isLoading {
+                    // Visible feedback that refresh is in flight
+                    ProgressView()
+                        .controlSize(.small)
+                        .tint(Theme.primary)
+                } else {
+                    Button {
+                        loadSessions()
+                    } label: {
+                        Image(systemName: "arrow.clockwise")
+                    }
+                    .foregroundColor(Theme.primary)
                 }
-                .foregroundColor(Theme.primary)
-                .disabled(isLoading)
             }
         }
         .onAppear {
@@ -91,27 +97,69 @@ struct SessionsView: View {
         } message: {
             Text("Enter a name for the new tmux session.")
         }
+        .alert("Sign out of Tailscale?", isPresented: $showSignOutConfirmation) {
+            Button("Sign Out", role: .destructive) {
+                signOutOfTailscale()
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("You'll need to sign in again on next launch. Your Mac pairing stays intact.")
+        }
+    }
+
+    private func signOutOfTailscale() {
+        // Close any open terminals before tearing down the network
+        TerminalSessionStore.shared.closeAll()
+        sshManager.disconnect()
+        // resetState() closes the Tailscale node and deletes the persisted state dir,
+        // so the next start() requires fresh browser sign-in.
+        tailscale.resetState()
+        // Pop back to root — ContentView will now show TailscaleAuthView since
+        // tailscale.state == .stopped (Sessions screen is only reachable when .connected).
+        path.removeLast(path.count)
     }
 
     // MARK: - Subviews
 
-    /// "● Connected" indicator. Tap to reveal/hide the Tailscale IP.
+    /// "● Connected" indicator. Tap opens a Menu with the Tailscale IP and
+    /// Tailscale-scoped actions (Copy IP, Sign out of Tailscale).
+    /// Per designer: Tailscale-scoped actions cluster under the Tailscale status indicator,
+    /// keeping them separate from Unpair (which is SSH/pairing-scoped, top-left).
     private var connectedHeader: some View {
-        HStack(spacing: 6) {
-            Text("●")
-                .foregroundColor(Theme.green)
-                .font(.system(size: 10))
-            Text(showIP ? "Connected — \(configStore.config?.ip ?? "")" : "Connected")
-                .foregroundColor(Theme.green)
-                .font(.system(size: 12))
-            Spacer()
+        let macIP = configStore.config?.ip ?? ""
+        return Menu {
+            Section {
+                Text(macIP)
+                    .font(.system(.body, design: .monospaced))
+                Button {
+                    UIPasteboard.general.string = macIP
+                    UINotificationFeedbackGenerator().notificationOccurred(.success)
+                } label: {
+                    Label("Copy IP", systemImage: "doc.on.doc")
+                }
+            }
+            Section {
+                Button(role: .destructive) {
+                    showSignOutConfirmation = true
+                } label: {
+                    Label("Sign out of Tailscale", systemImage: "person.crop.circle.badge.xmark")
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Text("●")
+                    .foregroundColor(Theme.green)
+                    .font(.system(size: 10))
+                Text("Connected")
+                    .foregroundColor(Theme.green)
+                    .font(.system(size: 12))
+                Spacer()
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+            .contentShape(Rectangle())
         }
-        .padding(.horizontal, 16)
-        .padding(.vertical, 8)
-        .contentShape(Rectangle())
-        .onTapGesture {
-            showIP.toggle()
-        }
+        .menuStyle(.borderlessButton)
     }
 
     private var sessionList: some View {
@@ -207,9 +255,18 @@ struct SessionsView: View {
         Task {
             do {
                 if !sshManager.isConnected {
-                    // Route SSH through the embedded Tailscale proxy
-                    let proxyPort = try tailscale.startProxy(targetIP: config.ip)
-                    try await sshManager.connect(config: config, proxyPort: proxyPort)
+                    // Embedded Tailscale mode: never SSH without a proxy config.
+                    // Direct-dialing the Tailscale IP would fail (no system VPN).
+                    guard let proxyConfig = tailscale.proxyConfig else {
+                        throw TailscaleError.notConnected
+                    }
+                    let proxy = SSHManager.SOCKSProxy(
+                        host: proxyConfig.host,
+                        port: proxyConfig.port,
+                        username: proxyConfig.username,
+                        password: proxyConfig.password
+                    )
+                    try await sshManager.connect(config: config, proxy: proxy)
                 }
 
                 var discoveredSessions = try await sshManager.listSessions(tmuxPath: config.tmuxPath)

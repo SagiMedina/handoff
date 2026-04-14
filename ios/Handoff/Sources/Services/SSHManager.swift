@@ -22,10 +22,20 @@ final class SSHManager: ObservableObject {
 
     // MARK: - Connect
 
-    /// Connect to the remote Mac. If proxyPort > 0, connects to 127.0.0.1:<proxyPort>
-    /// instead of config.ip:22 (used when routing through the embedded Tailscale proxy).
+    /// SOCKS5 proxy info for routing SSH through (e.g., Tailscale's loopback).
+    struct SOCKSProxy {
+        let host: String
+        let port: Int
+        let username: String
+        let password: String
+    }
+
+    /// Connect to the remote Mac, optionally tunneled through a SOCKS5 proxy.
+    /// When `proxy` is non-nil, the TCP socket goes to the SOCKS5 server and SOCKS5
+    /// handshakes the actual connection to `config.ip:22`. SSH handlers are added
+    /// only after the SOCKS handshake completes (via PostSOCKSUpgrader).
     /// Waits for both TCP connection AND SSH authentication to complete before returning.
-    func connect(config: ConnectionConfig, proxyPort: Int = 0) async throws {
+    func connect(config: ConnectionConfig, proxy: SOCKSProxy? = nil) async throws {
         // Tear down any existing connection to prevent resource leaks on retry
         disconnect()
 
@@ -42,35 +52,52 @@ final class SSHManager: ObservableObject {
         let authSuccessPromise = group.next().makePromise(of: Void.self)
         let authWaiter = AuthSuccessHandler(promise: authSuccessPromise)
 
+        let nioSSHHandler = NIOSSHHandler(
+            role: .client(
+                .init(
+                    userAuthDelegate: authDelegate,
+                    serverAuthDelegate: AcceptAllHostKeysDelegate()
+                )
+            ),
+            allocator: ByteBufferAllocator(),
+            inboundChildChannelInitializer: nil
+        )
+
         let bootstrap = ClientBootstrap(group: group)
             .channelInitializer { channel in
-                channel.pipeline.addHandlers([
-                    NIOSSHHandler(
-                        role: .client(
-                            .init(
-                                userAuthDelegate: authDelegate,
-                                serverAuthDelegate: AcceptAllHostKeysDelegate()
-                            )
-                        ),
-                        allocator: channel.allocator,
-                        inboundChildChannelInitializer: nil
-                    ),
-                    authWaiter
-                ])
+                if let proxy {
+                    // SOCKS5 path: handshake first, then PostSOCKSUpgrader installs SSH
+                    let socks = SOCKS5AuthConnectHandler(
+                        username: proxy.username,
+                        password: proxy.password,
+                        targetHost: config.ip,
+                        targetPort: 22
+                    )
+                    let upgrade = PostSOCKSUpgrader(
+                        nioSSHHandler: nioSSHHandler,
+                        authWaiter: authWaiter
+                    )
+                    return channel.pipeline.addHandlers([socks, upgrade])
+                } else {
+                    // Direct path
+                    return channel.pipeline.addHandlers([nioSSHHandler, authWaiter])
+                }
             }
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .connectTimeout(.seconds(10))
+            .connectTimeout(.seconds(15))
 
-        let connectHost = proxyPort > 0 ? "127.0.0.1" : config.ip
-        let connectPort = proxyPort > 0 ? proxyPort : 22
+        let connectHost = proxy?.host ?? config.ip
+        let connectPort = proxy?.port ?? 22
         let channel = try await bootstrap.connect(host: connectHost, port: connectPort).get()
         self.parentChannel = channel
 
-        self.sshHandler = try await channel.pipeline.handler(type: NIOSSHHandler.self).get()
+        // We already hold a reference to the NIOSSHHandler we constructed.
+        // Don't query the pipeline — in the SOCKS5 path it isn't installed until
+        // PostSOCKSUpgrader runs after the handshake completes. Use our reference
+        // directly; once the handler is added to the pipeline, it's the same object.
+        self.sshHandler = nioSSHHandler
 
-        // CRITICAL: Wait for UserAuthSuccessEvent before returning.
-        // SwiftNIO SSH fires this event on the parent channel when auth completes.
-        // Without this wait, createChannel calls will fail with ChannelError.connectPending.
+        // Wait for SSH auth complete
         try await authSuccessPromise.futureResult.get()
     }
 

@@ -4,8 +4,8 @@ iOS companion app for [Handoff](../README.md) — continue your Mac terminal ses
 
 ## Requirements
 
-- macOS with **Xcode 15+**
-- **Go** (https://go.dev/dl/) — needed to build the embedded Tailscale framework
+- macOS with **Xcode 16.1+**
+- **Go** (https://go.dev/dl/) — needed to build TailscaleKit (libtailscale's Swift framework)
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen): `brew install xcodegen`
 - iOS 16.0+ deployment target
 - An Apple ID (free personal team works for development; paid for App Store distribution)
@@ -19,12 +19,12 @@ iOS companion app for [Handoff](../README.md) — continue your Mac terminal ses
    go version   # verify
    ```
 
-2. **Build the Tailscale Go bridge** (embedded networking — no separate VPN app needed):
+2. **Build TailscaleKit.xcframework** (embedded Tailscale networking — no separate VPN app needed):
    ```bash
    cd ios
-   ./scripts/build-gobridge.sh
+   ./scripts/build-tailscalekit.sh
    ```
-   This compiles the shared `android/gobridge/bridge.go` for iOS via gomobile, producing `Handoff/Frameworks/Gobridge.xcframework` (~91 MB, not checked in).
+   Clones [Tailscale's `libtailscale`](https://github.com/tailscale/libtailscale), runs `make ios-fat`, and installs `Handoff/Frameworks/TailscaleKit.xcframework` (~70 MB, not checked in).
 
 3. **Find your Apple Developer Team ID**
    ```bash
@@ -60,7 +60,7 @@ iOS companion app for [Handoff](../README.md) — continue your Mac terminal ses
 
 - [SwiftTerm](https://github.com/migueldeicaza/SwiftTerm) — Terminal emulator (SPM)
 - [SwiftNIO SSH](https://github.com/apple/swift-nio-ssh) — SSH client (SPM)
-- [Tailscale tsnet](https://tailscale.com/kb/1244/tsnet) — Embedded networking via Go bridge (gomobile, same source as Android)
+- [TailscaleKit](https://github.com/tailscale/libtailscale) — Tailscale's official iOS framework (vendored xcframework). SSH dials through the Tailscale node's SOCKS5 loopback proxy via a custom NIO handler.
 
 ## Architecture
 
@@ -70,7 +70,8 @@ Sources/
 ├── Models/         ConnectionConfig, TmuxSession, TmuxWindow, QRCodePayload
 ├── Services/       ConfigStore (Keychain), SSHManager (NIOSSH),
 │                   TerminalChannel (PTY), TerminalSessionStore (lifecycle),
-│                   TailscaleManager (Go bridge wrapper)
+│                   TailscaleManager (TailscaleKit wrapper),
+│                   SOCKS5AuthHandler (NIO SOCKS5 + RFC 1929 username/password)
 └── Views/          Welcome, TailscaleAuth, Scan, QRScannerController,
                     Sessions, SessionCard, Terminal, SwiftTermView, MobileToolbar
 ```
@@ -85,6 +86,6 @@ Sources/
 ## Notes
 
 - **The generated `.xcodeproj` is not checked in** — regenerate it locally with `./scripts/generate.sh` any time you change `project.yml`
-- **The `Gobridge.xcframework` is not checked in** (91 MB) — rebuild with `./scripts/build-gobridge.sh` after cloning or if the Go bridge code changes
+- **The `TailscaleKit.xcframework` is not checked in** (~70 MB) — rebuild with `./scripts/build-tailscalekit.sh` after cloning
 - `DEVELOPMENT_TEAM` and `BUNDLE_ID_PREFIX` are intentionally kept out of source control so the repo stays team-agnostic
 - For simulator testing without camera access, there's a `Debug: Paste QR Payload` button on the Welcome screen (DEBUG builds only)
