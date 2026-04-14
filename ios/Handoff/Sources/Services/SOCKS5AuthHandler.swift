@@ -285,17 +285,24 @@ final class PostSOCKSUpgrader: ChannelInboundHandler, RemovableChannelHandler {
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
         if event is SOCKS5AuthConnectHandler.EstablishedEvent {
-            // Install SSH handlers BEFORE removing self so any leftover bytes
-            // forwarded by the SOCKS handler land in the right place.
+            // CRITICAL: install SSH handlers SYNCHRONOUSLY on the event loop.
+            // SOCKS5AuthConnectHandler fires this event and then immediately fires
+            // any leftover bytes via fireChannelRead. If we add the handlers via
+            // the async addHandlers(...).flatMap pattern, those leftover bytes
+            // would land in a pipeline that doesn't have NIOSSHHandler yet and
+            // be dropped. syncOperations guarantees the install completes before
+            // we return from this event handler, so leftover bytes flow into
+            // NIOSSH correctly.
             let pipeline = context.pipeline
-            pipeline.addHandlers([nioSSHHandler, authWaiter], position: .after(self))
-                .flatMap { _ in
-                    pipeline.removeHandler(self)
-                }
-                .whenFailure { error in
-                    context.fireErrorCaught(error)
-                    context.close(promise: nil)
-                }
+            do {
+                try pipeline.syncOperations.addHandler(nioSSHHandler, position: .after(self))
+                try pipeline.syncOperations.addHandler(authWaiter, position: .after(nioSSHHandler))
+                // Remove can stay async — by then NIOSSH owns the pipeline path.
+                pipeline.removeHandler(self, promise: nil)
+            } catch {
+                context.fireErrorCaught(error)
+                context.close(promise: nil)
+            }
             return
         }
         context.fireUserInboundEventTriggered(event)
