@@ -5,7 +5,6 @@ import SwiftUI
 /// and error states with retry/reset options.
 struct TailscaleAuthView: View {
     @ObservedObject var tailscale: TailscaleManager
-    let onConnected: () -> Void
 
     var body: some View {
         ZStack {
@@ -65,15 +64,13 @@ struct TailscaleAuthView: View {
                 }
 
             case .connected:
+                // Briefly visible before ContentView's derived gate switches to SessionsView
                 VStack(spacing: 16) {
                     Image(systemName: "checkmark.circle.fill")
                         .font(.system(size: 48))
                         .foregroundColor(Theme.green)
                     Text("Connected to Tailscale")
                         .foregroundColor(Theme.text)
-                }
-                .onAppear {
-                    onConnected()
                 }
 
             case .error(let message):

@@ -12,7 +12,12 @@ struct ContentView: View {
     }
 
     @State private var path = NavigationPath()
-    @State private var tailscaleReady = false
+
+    /// Derived from `tailscale.state` — Sessions is reachable only while connected.
+    /// On `.error` / `.stopped` / `.needsAuth` the user drops back to TailscaleAuthView.
+    private var tailscaleReady: Bool {
+        tailscale.state == .connected
+    }
 
     var body: some View {
         NavigationStack(path: $path) {
@@ -20,9 +25,7 @@ struct ContentView: View {
                 if !configStore.isPaired {
                     WelcomeView(path: $path)
                 } else if !tailscaleReady {
-                    TailscaleAuthView(tailscale: tailscale) {
-                        tailscaleReady = true
-                    }
+                    TailscaleAuthView(tailscale: tailscale)
                 } else {
                     SessionsView(path: $path, tailscale: tailscale)
                 }
@@ -43,19 +46,12 @@ struct ContentView: View {
             if isPaired && tailscale.state == .stopped {
                 tailscale.start()
             }
-            if !isPaired {
-                tailscaleReady = false
-            }
         }
         .onAppear {
-            // If already paired and Tailscale is already connected (persisted state),
-            // skip the auth screen.
-            if configStore.isPaired {
-                if tailscale.isConnected {
-                    tailscaleReady = true
-                } else {
-                    tailscale.start()
-                }
+            // If already paired but Tailscale isn't running yet, start it.
+            // (If it's already connected, the derived gate will route to SessionsView.)
+            if configStore.isPaired, tailscale.state == .stopped {
+                tailscale.start()
             }
         }
     }

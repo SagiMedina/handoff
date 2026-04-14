@@ -22,27 +22,17 @@ final class SSHManager: ObservableObject {
 
     // MARK: - Connect
 
-    /// Establish an SSH connection to the remote Mac.
-    /// Waits for both TCP connection AND SSH authentication to complete before returning.
     /// Connect to the remote Mac. If proxyPort > 0, connects to 127.0.0.1:<proxyPort>
     /// instead of config.ip:22 (used when routing through the embedded Tailscale proxy).
+    /// Waits for both TCP connection AND SSH authentication to complete before returning.
     func connect(config: ConnectionConfig, proxyPort: Int = 0) async throws {
-        print("[SSH] connect() starting — ip=\(config.ip) user=\(config.user) proxyPort=\(proxyPort)")
         // Tear down any existing connection to prevent resource leaks on retry
         disconnect()
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
 
-        print("[SSH] parsing OpenSSH key…")
-        let privateKey: Curve25519.Signing.PrivateKey
-        do {
-            privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
-            print("[SSH] key parsed OK")
-        } catch {
-            print("[SSH] key parse FAILED: \(error)")
-            throw error
-        }
+        let privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
         let authDelegate = PublicKeyAuthDelegate(
             username: config.user,
             privateKey: privateKey
@@ -73,41 +63,22 @@ final class SSHManager: ObservableObject {
 
         let connectHost = proxyPort > 0 ? "127.0.0.1" : config.ip
         let connectPort = proxyPort > 0 ? proxyPort : 22
-        print("[SSH] TCP connecting to \(connectHost):\(connectPort)…")
-        let channel: Channel
-        do {
-            channel = try await bootstrap.connect(host: connectHost, port: connectPort).get()
-            print("[SSH] TCP connected, channel active=\(channel.isActive)")
-        } catch {
-            print("[SSH] TCP connect FAILED: \(error)")
-            throw error
-        }
+        let channel = try await bootstrap.connect(host: connectHost, port: connectPort).get()
         self.parentChannel = channel
 
-        // Get the NIOSSHHandler for creating child channels
-        print("[SSH] fetching NIOSSHHandler from pipeline…")
         self.sshHandler = try await channel.pipeline.handler(type: NIOSSHHandler.self).get()
-        print("[SSH] got NIOSSHHandler, waiting for UserAuthSuccessEvent…")
 
         // CRITICAL: Wait for UserAuthSuccessEvent before returning.
         // SwiftNIO SSH fires this event on the parent channel when auth completes.
         // Without this wait, createChannel calls will fail with ChannelError.connectPending.
-        do {
-            try await authSuccessPromise.futureResult.get()
-            print("[SSH] auth completed! connect() returning")
-        } catch {
-            print("[SSH] auth wait FAILED: \(error)")
-            throw error
-        }
+        try await authSuccessPromise.futureResult.get()
     }
 
     // MARK: - Discovery (one-shot exec)
 
     /// List tmux sessions on the remote Mac.
     func listSessions(tmuxPath: String) async throws -> [TmuxSession] {
-        print("[SSH] listSessions called with tmuxPath=\(tmuxPath)")
         let output = try await executeCommand("\(tmuxPath) list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null")
-        print("[SSH] listSessions output: \(output.prefix(200))")
 
         return output
             .split(separator: "\n")
@@ -211,15 +182,12 @@ final class SSHManager: ObservableObject {
     /// on the parent channel's event loop. We use flatSubmit to hop onto the right loop.
     /// NIOSSH internally buffers pending channel creations until SSH auth completes.
     private func executeCommand(_ command: String) async throws -> String {
-        print("[SSH] executeCommand: \(command.prefix(100))")
         guard let parentChannel = self.parentChannel,
               let sshHandler = self.sshHandler else {
-            print("[SSH] executeCommand: NOT CONNECTED")
             throw SSHError.notConnected
         }
 
         return try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<String> in
-            print("[SSH] executeCommand: on event loop, creating child channel")
             let resultPromise = parentChannel.eventLoop.makePromise(of: String.self)
             let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
 
@@ -483,9 +451,7 @@ private final class AuthSuccessHandler: ChannelInboundHandler {
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        print("[SSH] AuthHandler event: \(type(of: event))")
         if event is UserAuthSuccessEvent, let p = promise {
-            print("[SSH] UserAuthSuccessEvent received — fulfilling promise")
             promise = nil
             p.succeed(())
         }
@@ -493,15 +459,13 @@ private final class AuthSuccessHandler: ChannelInboundHandler {
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        print("[SSH] AuthHandler errorCaught: \(error)")
         lastError = error
         context.fireErrorCaught(error)
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
-        print("[SSH] AuthHandler removed (promise still pending: \(promise != nil))")
-        // Safety net: if the handler is being torn down and the promise
-        // was never fulfilled, fail it so EventLoopFuture.deinit doesn't trap.
+        // Safety net: if the handler is torn down and the promise was never fulfilled,
+        // fail it so EventLoopFuture.deinit doesn't trap.
         if let p = promise {
             promise = nil
             p.fail(lastError ?? SSHError.channelError("Connection closed before authentication"))
@@ -558,7 +522,6 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        print("[SSH] ExecChannelHandler channelInactive, buffer size=\(buffer.count)")
         if !promiseCompleted {
             promiseCompleted = true
             let output = String(data: buffer, encoding: .utf8) ?? ""
@@ -567,7 +530,6 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        print("[SSH] ExecChannelHandler errorCaught: \(error)")
         if !promiseCompleted {
             promiseCompleted = true
             promise.fail(error)

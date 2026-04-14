@@ -66,7 +66,6 @@ struct TerminalView: View {
         .onAppear {
             // Reuse existing terminal if one is already active for this session/window
             if let existing = TerminalSessionStore.shared.get(key) {
-                print("[Term] reusing existing terminal for \(sessionName):\(windowIndex)")
                 activeTerminal = existing
                 isConnecting = false
             } else {
