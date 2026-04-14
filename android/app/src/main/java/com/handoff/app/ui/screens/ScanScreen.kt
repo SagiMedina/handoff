@@ -1,5 +1,7 @@
 package com.handoff.app.ui.screens
 
+import com.handoff.app.BuildConfig
+
 import android.Manifest
 import android.content.pm.PackageManager
 import android.util.Log
@@ -186,7 +188,7 @@ private fun parseQrPayload(raw: String): ConnectionConfig? {
             tmuxPath = json.getString("tmux")
         )
     } catch (e: Exception) {
-        Log.w("Handoff", "QR parse failed: ${e.message}")
+        if (BuildConfig.DEBUG) Log.w("Handoff", "QR parse failed: ${e.message}")
         null
     }
 }

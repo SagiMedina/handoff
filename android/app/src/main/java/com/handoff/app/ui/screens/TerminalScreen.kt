@@ -1,5 +1,7 @@
 package com.handoff.app.ui.screens
 
+import com.handoff.app.BuildConfig
+
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Typeface
@@ -16,10 +18,12 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import com.handoff.app.data.ConnectionConfig
+import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
 import com.handoff.app.ui.components.MobileToolbar
@@ -56,7 +60,7 @@ fun TerminalScreen(
                 if (view != null) {
                     view.onScreenUpdated()
                 } else {
-                    Log.w("Handoff", "onTextChanged but termView is null!")
+                    if (BuildConfig.DEBUG) Log.w("Handoff", "onTextChanged but termView is null!")
                 }
             }
             override fun onTitleChanged(changedSession: TerminalSession) {}
@@ -79,7 +83,7 @@ fun TerminalScreen(
             override fun onTerminalCursorStateChange(state: Boolean) {}
             override fun setTerminalShellPid(session: TerminalSession, pid: Int) {}
             override fun getTerminalCursorStyle(): Int = 0
-            override fun logError(tag: String?, message: String?) { Log.e(tag ?: "Handoff", message ?: "") }
+            override fun logError(tag: String?, message: String?) { if (BuildConfig.DEBUG) Log.e(tag ?: "Handoff", message ?: "") }
             override fun logWarn(tag: String?, message: String?) {}
             override fun logInfo(tag: String?, message: String?) {}
             override fun logDebug(tag: String?, message: String?) {}
@@ -170,7 +174,7 @@ fun TerminalScreen(
         val emulator = view.mEmulator
         val actualCols = emulator?.mColumns ?: cols
         val actualRows = emulator?.mRows ?: rows
-        Log.d("Handoff", "Terminal: ${actualCols}x${actualRows} (after keyboard)")
+        if (BuildConfig.DEBUG) Log.d("Handoff", "Terminal: ${actualCols}x${actualRows} (after keyboard)")
 
         try {
             val proxyPort = tailscaleManager.getProxyPort().let { port ->
@@ -184,17 +188,25 @@ fun TerminalScreen(
             session.setOutputStream(output)
             session.startReading(input)
             sshReady = true
-            Log.d("Handoff", "SSH ready")
+            if (BuildConfig.DEBUG) Log.d("Handoff", "SSH ready")
         } catch (e: Exception) {
-            Log.e("Handoff", "SSH failed", e)
-            error = "Failed to connect: ${e.message}"
+            if (BuildConfig.DEBUG) Log.e("Handoff", "SSH failed", e)
+            error = friendlyConnectionError(e)
         }
     }
 
     if (error != null) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(text = error!!, color = MaterialTheme.colorScheme.error)
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.padding(horizontal = 32.dp)
+            ) {
+                Text(
+                    text = error!!,
+                    color = MaterialTheme.colorScheme.error,
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.bodyLarge
+                )
                 Spacer(modifier = Modifier.height(16.dp))
                 Button(onClick = onDisconnect) { Text("Back") }
             }

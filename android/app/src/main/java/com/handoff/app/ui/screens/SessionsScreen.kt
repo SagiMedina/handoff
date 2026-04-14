@@ -8,8 +8,11 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import com.handoff.app.data.ConnectionConfig
+import com.handoff.app.data.friendlyActionError
+import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
 import com.handoff.app.data.TmuxSession
@@ -25,7 +28,8 @@ fun SessionsScreen(
     sshManager: SshManager,
     tailscaleManager: TailscaleManager,
     onWindowSelected: (String, TmuxWindow) -> Unit,
-    onUnpair: () -> Unit
+    onUnpair: () -> Unit,
+    onLicenses: () -> Unit = {}
 ) {
     var sessions by remember { mutableStateOf<List<TmuxSession>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
@@ -60,7 +64,7 @@ fun SessionsScreen(
                     return@launch
                 }
             } catch (e: Exception) {
-                error = "Connection failed: ${e.message}"
+                error = friendlyConnectionError(e)
             } finally {
                 if (showLoading) loading = false
             }
@@ -99,7 +103,7 @@ fun SessionsScreen(
                                     sshManager.createSession(config.tmuxPath, name)
                                     refresh()
                                 } catch (e: Exception) {
-                                    error = "Failed to create session: ${e.message}"
+                                    error = friendlyActionError("create session", e)
                                 }
                             }
                         }
@@ -142,6 +146,9 @@ fun SessionsScreen(
                 TextButton(onClick = { refresh() }) {
                     Text("Refresh")
                 }
+                TextButton(onClick = onLicenses) {
+                    Text("Licenses")
+                }
                 TextButton(onClick = onUnpair) {
                     Text("Unpair", color = MaterialTheme.colorScheme.error)
                 }
@@ -173,10 +180,15 @@ fun SessionsScreen(
                     modifier = Modifier.fillMaxSize(),
                     contentAlignment = Alignment.Center
                 ) {
-                    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        modifier = Modifier.padding(horizontal = 32.dp)
+                    ) {
                         Text(
                             text = error!!,
-                            color = MaterialTheme.colorScheme.error
+                            color = MaterialTheme.colorScheme.error,
+                            textAlign = TextAlign.Center,
+                            style = MaterialTheme.typography.bodyLarge
                         )
                         Spacer(modifier = Modifier.height(16.dp))
                         Button(onClick = { refresh() }) {
@@ -248,7 +260,7 @@ fun SessionsScreen(
                                         val newWindow = TmuxWindow(index = windowIndex, title = "shell", command = "")
                                         onWindowSelected(session.name, newWindow)
                                     } catch (e: Exception) {
-                                        error = "Failed to create tab: ${e.message}"
+                                        error = friendlyActionError("create tab", e)
                                     }
                                 }
                             },
@@ -258,7 +270,7 @@ fun SessionsScreen(
                                         sshManager.killSession(config.tmuxPath, session.name)
                                         refresh()
                                     } catch (e: Exception) {
-                                        error = "Failed to kill session: ${e.message}"
+                                        error = friendlyActionError("close session", e)
                                     }
                                 }
                             },
@@ -268,7 +280,7 @@ fun SessionsScreen(
                                         sshManager.killWindow(config.tmuxPath, session.name, window.index)
                                         refresh()
                                     } catch (e: Exception) {
-                                        error = "Failed to kill tab: ${e.message}"
+                                        error = friendlyActionError("close tab", e)
                                     }
                                 }
                             }

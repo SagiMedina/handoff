@@ -11,6 +11,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import com.handoff.app.data.friendlyTailscaleError
 import com.handoff.app.data.TailscaleManager
 import com.handoff.app.data.TailscaleState
 import com.handoff.app.ui.theme.HandoffGreen
@@ -123,7 +124,7 @@ fun TailscaleAuthScreen(
 
             TailscaleState.ERROR -> {
                 Text(
-                    text = tsError ?: "Connection failed",
+                    text = friendlyTailscaleError(tsError),
                     color = MaterialTheme.colorScheme.error,
                     textAlign = TextAlign.Center
                 )

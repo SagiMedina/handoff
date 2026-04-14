@@ -104,6 +104,9 @@ class MainActivity : ComponentActivity() {
                                         "terminal/$sessionName/${window.index}"
                                     )
                                 },
+                                onLicenses = {
+                                    navController.navigate("licenses")
+                                },
                                 onUnpair = {
                                     scope.launch {
                                         sshManager.disconnect()
@@ -117,6 +120,14 @@ class MainActivity : ComponentActivity() {
                                 }
                             )
                         }
+                        }
+                    }
+
+                    composable("licenses") {
+                        Box(Modifier.padding(scaffoldPadding)) {
+                            LicensesScreen(
+                                onBack = { navController.popBackStack() }
+                            )
                         }
                     }
 

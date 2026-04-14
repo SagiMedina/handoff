@@ -1,5 +1,7 @@
 package com.handoff.app.data
 
+import com.handoff.app.BuildConfig
+
 import android.util.Log
 import gobridge.Gobridge
 import gobridge.StatusCallback
@@ -38,20 +40,20 @@ class TailscaleManager(private val stateDir: String) {
 
             Gobridge.start(tsDir, hostname, object : StatusCallback {
                 override fun onAuthURL(url: String) {
-                    Log.d("Handoff", "Tailscale auth URL: $url")
+                    if (BuildConfig.DEBUG) Log.d("Handoff", "Tailscale auth URL: $url")
                     _authUrl.value = url
                     _state.value = TailscaleState.NEEDS_AUTH
                 }
 
                 override fun onConnected() {
-                    Log.d("Handoff", "Tailscale connected")
+                    if (BuildConfig.DEBUG) Log.d("Handoff", "Tailscale connected")
                     _state.value = TailscaleState.CONNECTED
                     _authUrl.value = null
                     if (cont.isActive) cont.resume(Unit)
                 }
 
                 override fun onError(err: String) {
-                    Log.e("Handoff", "Tailscale error: $err")
+                    if (BuildConfig.DEBUG) Log.e("Handoff", "Tailscale error: $err")
                     _state.value = TailscaleState.ERROR
                     _error.value = err
                     if (cont.isActive) cont.resumeWithException(
@@ -64,7 +66,7 @@ class TailscaleManager(private val stateDir: String) {
 
     fun startProxy(targetIp: String, targetPort: Int = 22): Int {
         proxyPort = Gobridge.startProxy(targetIp, targetPort.toLong()).toInt()
-        Log.d("Handoff", "Tailscale proxy: $targetIp:$targetPort -> localhost:$proxyPort")
+        if (BuildConfig.DEBUG) Log.d("Handoff", "Tailscale proxy: $targetIp:$targetPort -> localhost:$proxyPort")
         return proxyPort
     }
 

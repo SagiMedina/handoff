@@ -1,5 +1,7 @@
 package com.handoff.app.data
 
+import com.handoff.app.BuildConfig
+
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
@@ -32,7 +34,7 @@ class SshManager {
 
         val jsch = JSch()
         val keyBytes = Base64.getDecoder().decode(config.privateKey)
-        Log.d("Handoff", "Key bytes length: ${keyBytes.size}, starts with: ${String(keyBytes.take(30).toByteArray())}")
+        if (BuildConfig.DEBUG) Log.d("Handoff", "Key bytes length: ${keyBytes.size}, starts with: ${String(keyBytes.take(30).toByteArray())}")
         jsch.addIdentity("handoff", keyBytes, null, null)
 
         val host = if (proxyPort > 0) "127.0.0.1" else config.ip
@@ -45,7 +47,7 @@ class SshManager {
         sess.setServerAliveCountMax(3)
         sess.connect(10_000)
         session = sess
-        Log.d("Handoff", "SSH connected via JSch")
+        if (BuildConfig.DEBUG) Log.d("Handoff", "SSH connected via JSch")
     }
 
     suspend fun listSessions(tmuxPath: String): List<TmuxSession> = withContext(Dispatchers.IO) {
@@ -122,7 +124,7 @@ class SshManager {
         channel.connect(10_000)
         shellChannel = channel
 
-        Log.d("Handoff", "Exec channel connected, running: tmux attach -t '${sessionName}:${windowIndex}'")
+        if (BuildConfig.DEBUG) Log.d("Handoff", "Exec channel connected, running: tmux attach -t '${sessionName}:${windowIndex}'")
 
         Pair(inputFromRemote, outputToRemote)
     }
@@ -133,7 +135,7 @@ class SshManager {
         pendingResize?.let { resizeHandler.removeCallbacks(it) }
         pendingResize = Runnable {
             val ch = shellChannel ?: return@Runnable
-            Log.d("Handoff", "resizeShell: ${cols}x${rows}")
+            if (BuildConfig.DEBUG) Log.d("Handoff", "resizeShell: ${cols}x${rows}")
             ch.setPtySize(cols, rows, cols * 8, rows * 16)
         }
         resizeHandler.postDelayed(pendingResize!!, 150)
