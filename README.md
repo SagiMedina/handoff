@@ -30,11 +30,11 @@ That's it. Tailscale networking is built into the app - no separate VPN app need
 
 **Phone — iOS:**
 1. Build the iOS app from `ios/Handoff/` (requires Xcode 15+ and a free Apple ID). See [`ios/README.md`](ios/README.md)
-2. Install Tailscale from the App Store and sign in with the same account as your Mac
-3. On your Mac, run `handoff pair` - it shows a QR code
-4. Open the Handoff app on your iPhone → tap **Scan QR Code** → point at the QR
+2. On your Mac, run `handoff pair` - it shows a QR code
+3. Open the Handoff app on your iPhone and scan the QR code
+4. Sign in to your Tailscale account (one-time, in browser)
 
-You're paired. The app saves the SSH key in Keychain and connects over your Tailnet.
+Same as Android — Tailscale networking is built into the app, no separate VPN app needed.
 
 ## Daily use
 
