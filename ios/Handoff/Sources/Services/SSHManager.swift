@@ -123,26 +123,53 @@ final class SSHManager: ObservableObject {
             }
     }
 
-    /// List windows in a tmux session.
+    /// List windows (tabs) in a tmux session.
     func listWindows(tmuxPath: String, session: String) async throws -> [TmuxWindow] {
         let escaped = session.replacingOccurrences(of: "'", with: "'\\''")
-        let output = try await executeCommand("\(tmuxPath) list-windows -t '\(escaped)' -F '#{window_index}|#{pane_title}|#{pane_current_command}' 2>/dev/null")
+        let output = try await executeCommand(
+            "\(tmuxPath) list-windows -t '\(escaped)' -F '#{window_index}|#{pane_title}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null"
+        )
 
         return output
-            .split(separator: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: true)
             .compactMap { line -> TmuxWindow? in
-                let parts = line.split(separator: "|", maxSplits: 2)
-                guard parts.count == 3,
+                let parts = line.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false)
+                guard parts.count >= 3,
                       let index = Int(parts[0]) else { return nil }
 
-                let title = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                let rawTitle = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                let command = String(parts[2]).trimmingCharacters(in: .whitespaces)
+                let rawPath = parts.count >= 4 ? String(parts[3]) : ""
+
+                // Title fallback: pane_title → pane_current_command → "shell"
+                let candidate = rawTitle.isEmpty ? (command.isEmpty ? "shell" : command) : rawTitle
+                // Strip leading non-letter/non-number chars (e.g., Claude Code status glyphs)
+                let title = stripLeadingNonAlphanumeric(candidate)
+
+                // cwd: take basename of the path
+                let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let cwd = (trimmedPath as NSString).lastPathComponent == "/" ? "" : (trimmedPath as NSString).lastPathComponent
 
                 return TmuxWindow(
                     index: index,
-                    title: title,
-                    command: String(parts[2])
+                    title: title.isEmpty ? "shell" : title,
+                    command: command,
+                    cwd: cwd
                 )
             }
+    }
+
+    /// Strips leading characters that are not letters or numbers.
+    /// Mirrors Android's regex `^[^\p{L}\p{N}]+`.
+    private func stripLeadingNonAlphanumeric(_ s: String) -> String {
+        var scalars = Array(s.unicodeScalars)
+        while let first = scalars.first,
+              !CharacterSet.letters.contains(first),
+              !CharacterSet.decimalDigits.contains(first) {
+            scalars.removeFirst()
+        }
+        return String(String.UnicodeScalarView(scalars)).trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: - Session/window management
