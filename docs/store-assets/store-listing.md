@@ -38,6 +38,9 @@ Security:
 • Tailscale embedded — no extra VPN app needed
 • Open source: github.com/SagiMedina/handoff
 
+Disclaimer:
+Handoff is provided "as is" without warranty. Use at your own risk. The authors are not responsible for any damage, data loss, or security issues. Securing your Tailscale account and devices is your responsibility.
+
 Setup takes 2 minutes:
 • Mac: brew install handoff (tmux + Tailscale required)
 • Phone: scan QR, authenticate Tailscale once, done
