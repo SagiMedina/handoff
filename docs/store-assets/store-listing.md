@@ -2,37 +2,43 @@
 
 ## Short description (80 chars max)
 
-Continue your Mac terminal sessions on your phone — seamlessly, securely.
+Continue Claude Code, Codex & Gemini CLI sessions from Mac to phone.
 
 ## Full description
 
-Handoff lets you pick up your Mac terminal sessions right where you left them — from your phone. Walk away from your desk and keep working.
+Your AI coding agent is mid-task on your Mac. You need to leave your desk. What now?
+
+Handoff. Open your phone, tap the session, and you're back — cursor blinking, context intact, agent still running.
+
+Works with every terminal tool:
+• Claude Code — see it think, approve edits, keep prompting
+• OpenAI Codex CLI — full TUI, right on your phone
+• Gemini CLI — same session, different screen
+• vim, ssh, docker, git — anything running in tmux
 
 How it works:
-1. Run `handoff pair` on your Mac
-2. Scan the QR code with the app
-3. Your terminal sessions appear on your phone
+1. Run "handoff pair" on your Mac
+2. Scan the QR code
+3. All your terminal sessions appear on your phone — tap to connect
 
-Your Mac terminal tabs show up as sessions you can tap into. Running Claude Code, vim, a dev server, or SSH? It's all there, exactly as you left it.
+No cloud relay. No port forwarding. Your Mac and phone talk directly over an encrypted WireGuard tunnel via Tailscale. Your terminal data never touches a third-party server.
 
-Built for developers who don't want to stop working just because they stood up.
+Why developers love it:
+• Walk away from your desk without killing a long-running agent
+• Check on a build from the couch
+• Approve a Claude Code edit from your phone while grabbing coffee
+• Monitor logs on the go
+• Pair once, connect instantly every time after
 
-Key features:
-- Instant session discovery — all your tmux sessions and tabs, one tap away
-- Secure by default — peer-to-peer encrypted connection via Tailscale (WireGuard)
-- No port forwarding, no exposed servers, no cloud relay
-- Works across any network — home, office, coffee shop, mobile data
-- Native terminal emulator with full keyboard support
-- One-time setup, zero daily friction
+Security:
+• Peer-to-peer encrypted (WireGuard via Tailscale)
+• Ed25519 SSH keys stored in Android encrypted storage
+• Per-device identity with server-side permission control
+• Biometric lock option for SSH key access
+• Tailscale embedded — no extra VPN app needed
+• Open source: github.com/SagiMedina/handoff
 
-Technical details:
-- Uses tmux on your Mac (invisible via iTerm2's tmux integration)
-- Connects over Tailscale's WireGuard mesh network
-- SSH authentication with Ed25519 keys
-- All credentials stored locally in Android encrypted storage
-- Tailscale networking embedded — no extra VPN app needed
-- Open source: github.com/SagiMedina/handoff
-
-Requirements:
-- Mac with tmux and Tailscale installed
-- Free Tailscale account
+Setup takes 2 minutes:
+• Mac: brew install handoff (tmux + Tailscale required)
+• Phone: scan QR, authenticate Tailscale once, done
+• Free Tailscale account is all you need
