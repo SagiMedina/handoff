@@ -80,8 +80,10 @@ fun SessionsScreen(
                 }
             } catch (e: GateException) {
                 error = friendlyGateError(e.gateError)
+                sshManager.disconnect()
             } catch (e: Exception) {
                 error = friendlyConnectionError(e)
+                sshManager.disconnect()
             } finally {
                 if (showLoading) loading = false
             }

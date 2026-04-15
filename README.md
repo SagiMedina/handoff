@@ -143,6 +143,10 @@ cd android/gobridge && ./build-aar.sh
 cd android && ./gradlew assembleDebug
 ```
 
+## Disclaimer
+
+Handoff is provided "as is", without warranty of any kind. Use at your own risk. The authors are not responsible for any damage, data loss, or security issues arising from the use of this software. Handoff enables SSH access to your Mac over Tailscale — securing your Tailscale account and paired devices is your responsibility.
+
 ## License
 
 [MIT](LICENSE)

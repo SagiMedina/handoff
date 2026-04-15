@@ -17,7 +17,8 @@ import com.handoff.app.data.ConnectionConfig
 fun SettingsScreen(
     config: ConnectionConfig,
     biometricKeyStore: BiometricKeyStore,
-    onBack: () -> Unit
+    onBack: () -> Unit,
+    onLicenses: () -> Unit = {}
 ) {
     val context = LocalContext.current
     var biometricEnabled by remember { mutableStateOf(biometricKeyStore.isBiometricEnabled) }
@@ -117,6 +118,18 @@ fun SettingsScreen(
         }
         SettingsRow("Mac IP", config.ip)
         SettingsRow("Mac user", config.user)
+
+        Spacer(modifier = Modifier.weight(1f))
+
+        TextButton(
+            onClick = onLicenses,
+            modifier = Modifier.fillMaxWidth()
+        ) {
+            Text(
+                text = "Open Source Licenses",
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
     }
 }
 

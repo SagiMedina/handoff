@@ -209,7 +209,8 @@ class MainActivity : FragmentActivity() {
                                 SettingsScreen(
                                     config = currentConfig,
                                     biometricKeyStore = biometricKeyStore,
-                                    onBack = { navController.popBackStack() }
+                                    onBack = { navController.popBackStack() },
+                                    onLicenses = { navController.navigate("licenses") }
                                 )
                             }
                         }
