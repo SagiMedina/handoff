@@ -26,6 +26,7 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.handoff.app.data.TmuxSession
 import com.handoff.app.data.TmuxWindow
+import com.handoff.app.ui.theme.HandoffAmber
 import com.handoff.app.ui.theme.HandoffGreen
 
 private fun Modifier.dashedBorder(
@@ -55,15 +56,16 @@ private fun Modifier.dashedBorder(
 fun SessionCard(
     session: TmuxSession,
     onWindowClick: (TmuxWindow) -> Unit,
-    onNewWindow: () -> Unit,
-    onKillSession: () -> Unit,
-    onKillWindow: (TmuxWindow) -> Unit,
+    onNewWindow: (() -> Unit)? = null,
+    onKillSession: (() -> Unit)? = null,
+    onKillWindow: ((TmuxWindow) -> Unit)? = null,
+    readOnly: Boolean = false,
     modifier: Modifier = Modifier
 ) {
     var showKillSessionDialog by remember { mutableStateOf(false) }
     var windowToKill by remember { mutableStateOf<TmuxWindow?>(null) }
 
-    if (showKillSessionDialog) {
+    if (showKillSessionDialog && onKillSession != null) {
         AlertDialog(
             onDismissRequest = { showKillSessionDialog = false },
             title = { Text("Kill session?") },
@@ -81,20 +83,22 @@ fun SessionCard(
     }
 
     windowToKill?.let { window ->
-        AlertDialog(
-            onDismissRequest = { windowToKill = null },
-            title = { Text("Kill tab?") },
-            text = { Text("Close \"${window.title}\" in session \"${session.name}\"?") },
-            confirmButton = {
-                TextButton(onClick = {
-                    windowToKill = null
-                    onKillWindow(window)
-                }) { Text("Kill", color = MaterialTheme.colorScheme.error) }
-            },
-            dismissButton = {
-                TextButton(onClick = { windowToKill = null }) { Text("Cancel") }
-            }
-        )
+        if (onKillWindow != null) {
+            AlertDialog(
+                onDismissRequest = { windowToKill = null },
+                title = { Text("Kill tab?") },
+                text = { Text("Close \"${window.title}\" in session \"${session.name}\"?") },
+                confirmButton = {
+                    TextButton(onClick = {
+                        windowToKill = null
+                        onKillWindow(window)
+                    }) { Text("Kill", color = MaterialTheme.colorScheme.error) }
+                },
+                dismissButton = {
+                    TextButton(onClick = { windowToKill = null }) { Text("Cancel") }
+                }
+            )
+        }
     }
 
     Card(
@@ -106,13 +110,13 @@ fun SessionCard(
         border = BorderStroke(0.5.dp, MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.15f))
     ) {
         Column(modifier = Modifier.padding(16.dp)) {
-            // Session header — long-press to kill
+            // Session header — long-press to kill (if allowed)
             Row(
                 modifier = Modifier
                     .fillMaxWidth()
                     .combinedClickable(
                         onClick = {},
-                        onLongClick = { showKillSessionDialog = true }
+                        onLongClick = { if (onKillSession != null) showKillSessionDialog = true }
                     ),
                 verticalAlignment = Alignment.CenterVertically,
                 horizontalArrangement = Arrangement.spacedBy(8.dp)
@@ -133,6 +137,18 @@ fun SessionCard(
                     style = MaterialTheme.typography.labelMedium,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
+                if (readOnly) {
+                    Text(
+                        text = "·",
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        fontSize = 10.sp
+                    )
+                    Text(
+                        text = "view only",
+                        style = MaterialTheme.typography.labelMedium.copy(fontSize = 11.sp),
+                        color = HandoffAmber
+                    )
+                }
             }
 
             Spacer(modifier = Modifier.height(10.dp))
@@ -160,35 +176,37 @@ fun SessionCard(
                     WindowRow(
                         window = window,
                         onClick = { onWindowClick(window) },
-                        onLongClick = { windowToKill = window }
+                        onLongClick = { if (onKillWindow != null) windowToKill = window }
                     )
                 }
             }
 
-            Spacer(modifier = Modifier.height(8.dp))
+            if (onNewWindow != null) {
+                Spacer(modifier = Modifier.height(8.dp))
 
-            // New window button — visually distinct
-            Box(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .padding(horizontal = 16.dp)
-                    .clickable(onClick = onNewWindow)
-                    .dashedBorder(
-                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.35f),
-                        shape = RoundedCornerShape(8.dp),
-                        strokeWidth = 1.dp,
-                        dashLength = 6.dp,
-                        gapLength = 4.dp
+                // New window button — visually distinct
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp)
+                        .clickable(onClick = onNewWindow)
+                        .dashedBorder(
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.35f),
+                            shape = RoundedCornerShape(8.dp),
+                            strokeWidth = 1.dp,
+                            dashLength = 6.dp,
+                            gapLength = 4.dp
+                        )
+                        .padding(vertical = 10.dp),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Text(
+                        text = "+ new tab",
+                        fontFamily = FontFamily.Monospace,
+                        color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
+                        fontSize = 13.sp
                     )
-                    .padding(vertical = 10.dp),
-                contentAlignment = Alignment.Center
-            ) {
-                Text(
-                    text = "+ new tab",
-                    fontFamily = FontFamily.Monospace,
-                    color = MaterialTheme.colorScheme.primary.copy(alpha = 0.7f),
-                    fontSize = 13.sp
-                )
+                }
             }
         }
     }

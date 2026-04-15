@@ -2,7 +2,10 @@
 # handoff-common.sh — Shared utilities for Handoff
 
 HANDOFF_DIR="$HOME/.handoff"
-HANDOFF_KEY="$HANDOFF_DIR/phone_key"
+HANDOFF_KEY="$HANDOFF_DIR/phone_key"           # v1 legacy
+HANDOFF_KEYS_DIR="$HANDOFF_DIR/keys"           # v2 per-device keys
+HANDOFF_DEVICES="$HANDOFF_DIR/devices.json"    # v2 device registry
+HANDOFF_ACCESS_LOG="$HANDOFF_DIR/access.log"   # gate access log
 
 # Colors
 RED='\033[0;31m'
@@ -120,4 +123,218 @@ print_sessions() {
             done <<< "$win_info"
         fi
     done <<< "$sessions"
+}
+
+# ─── Device Registry (v2) ─────────────────────────────────────────
+
+# Initialize devices.json if it doesn't exist
+devices_json_init() {
+    mkdir -p "$HANDOFF_KEYS_DIR"
+    if [[ ! -f "$HANDOFF_DEVICES" ]]; then
+        echo '{"version":1,"devices":[]}' > "$HANDOFF_DEVICES"
+    fi
+    touch "$HANDOFF_ACCESS_LOG"
+}
+
+# Add a device to devices.json
+# Usage: devices_json_add_device name fingerprint key_file sessions read_only nonce soft_expiry hard_expiry
+devices_json_add_device() {
+    local name="$1" fingerprint="$2" key_file="$3" sessions="$4" \
+          read_only="$5" nonce="$6" soft_expiry="$7" hard_expiry="$8"
+    local now
+    now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    local ro_py="False"
+    [[ "$read_only" == "true" ]] && ro_py="True"
+    python3 -c "
+import json, sys
+with open('$HANDOFF_DEVICES', 'r') as f:
+    data = json.load(f)
+device = {
+    'name': '$name',
+    'fingerprint': '$fingerprint',
+    'key_file': '$key_file',
+    'status': 'pending',
+    'sessions': $sessions,
+    'read_only': $ro_py,
+    'nonce': '$nonce',
+    'created_at': '$now',
+    'soft_expiry': '$soft_expiry',
+    'hard_expiry': '$hard_expiry',
+    'renewal_requested': False,
+    'last_seen': None,
+    'last_command': None
+}
+data['devices'].append(device)
+with open('$HANDOFF_DEVICES', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+}
+
+# Update a field on a device by fingerprint
+# Usage: devices_json_update_device fingerprint field value
+devices_json_update_device() {
+    local fingerprint="$1" field="$2" value="$3"
+    python3 -c "
+import json
+with open('$HANDOFF_DEVICES', 'r') as f:
+    data = json.load(f)
+for d in data['devices']:
+    if d['fingerprint'] == '$fingerprint':
+        val = '$value'
+        if val == 'true': val = True
+        elif val == 'false': val = False
+        elif val == 'null': val = None
+        d['$field'] = val
+        break
+with open('$HANDOFF_DEVICES', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+}
+
+# Get a device field by fingerprint
+# Usage: devices_json_get_field fingerprint field
+devices_json_get_field() {
+    local fingerprint="$1" field="$2"
+    python3 -c "
+import json
+with open('$HANDOFF_DEVICES', 'r') as f:
+    data = json.load(f)
+for d in data['devices']:
+    if d['fingerprint'] == '$fingerprint':
+        v = d.get('$field')
+        if v is None: print('')
+        elif isinstance(v, bool): print(str(v).lower())
+        elif isinstance(v, list): print(';'.join(v))
+        else: print(v)
+        break
+"
+}
+
+# Get full device JSON by fingerprint
+devices_json_get_device() {
+    local fingerprint="$1"
+    python3 -c "
+import json
+with open('$HANDOFF_DEVICES', 'r') as f:
+    data = json.load(f)
+for d in data['devices']:
+    if d['fingerprint'] == '$fingerprint':
+        print(json.dumps(d))
+        break
+"
+}
+
+# Remove a device by fingerprint
+devices_json_remove_device() {
+    local fingerprint="$1"
+    python3 -c "
+import json
+with open('$HANDOFF_DEVICES', 'r') as f:
+    data = json.load(f)
+data['devices'] = [d for d in data['devices'] if d['fingerprint'] != '$fingerprint']
+with open('$HANDOFF_DEVICES', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+}
+
+# List all devices as "fingerprint|name|status" lines
+devices_json_list() {
+    python3 -c "
+import json
+with open('$HANDOFF_DEVICES', 'r') as f:
+    data = json.load(f)
+for d in data['devices']:
+    sessions = ';'.join(d.get('sessions', ['*']))
+    ro = 'read-only' if d.get('read_only') else 'read/write'
+    exp = d.get('soft_expiry', 'never')
+    last = d.get('last_seen') or 'never'
+    print(f\"{d['fingerprint']}|{d['name']}|{d['status']}|{sessions}|{ro}|{exp}|{last}\")
+"
+}
+
+# Get the SHA256 fingerprint of a public key file
+device_fingerprint() {
+    local pub_key_file="$1"
+    ssh-keygen -l -E sha256 -f "$pub_key_file" | awk '{print $2}'
+}
+
+# Generate a per-device Ed25519 key pair in HANDOFF_KEYS_DIR
+# Returns the fingerprint
+generate_device_key() {
+    local key_name="$1"
+    local key_path="$HANDOFF_KEYS_DIR/$key_name"
+    ssh-keygen -t ed25519 -f "$key_path" -N "" -C "handoff:$key_name" -q
+    device_fingerprint "${key_path}.pub"
+}
+
+# Add a device's public key to authorized_keys with forced command
+add_device_to_authorized_keys() {
+    local fingerprint="$1" pub_key_file="$2" hard_expiry="$3" device_label="$4"
+    local pubkey
+    pubkey=$(cat "$pub_key_file")
+    # Resolve handoff binary: prefer installed, fall back to the script that sourced us
+    local handoff_bin
+    handoff_bin=$(which handoff 2>/dev/null || echo "")
+    if [[ -z "$handoff_bin" || ! -x "$handoff_bin" ]]; then
+        # Find the bin/handoff relative to this lib file
+        local lib_dir
+        lib_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+        handoff_bin="$(cd "$lib_dir/../bin" 2>/dev/null && pwd)/handoff"
+    fi
+    if [[ ! -x "$handoff_bin" ]]; then
+        handoff_bin="/usr/local/bin/handoff"
+    fi
+    # Format: command="...",restrict,pty,expiry-time="YYYYMMDD" <pubkey>
+    local expiry_date
+    expiry_date=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$hard_expiry" +%Y%m%d 2>/dev/null || echo "")
+    local line
+    if [[ -n "$expiry_date" ]]; then
+        line="command=\"${handoff_bin} gate ${fingerprint}\",restrict,pty,expiry-time=\"${expiry_date}\" ${pubkey}"
+    else
+        line="command=\"${handoff_bin} gate ${fingerprint}\",restrict,pty ${pubkey}"
+    fi
+    mkdir -p "$HOME/.ssh"
+    chmod 700 "$HOME/.ssh"
+    echo "$line" >> "$HOME/.ssh/authorized_keys"
+    chmod 600 "$HOME/.ssh/authorized_keys"
+}
+
+# Remove a device's key from authorized_keys by fingerprint
+remove_device_from_authorized_keys() {
+    local fingerprint="$1"
+    if [[ -f "$HOME/.ssh/authorized_keys" ]]; then
+        grep -v "$fingerprint" "$HOME/.ssh/authorized_keys" > "$HOME/.ssh/authorized_keys.tmp" || true
+        mv "$HOME/.ssh/authorized_keys.tmp" "$HOME/.ssh/authorized_keys"
+        chmod 600 "$HOME/.ssh/authorized_keys"
+    fi
+}
+
+# Check if a session name matches any of the given glob patterns
+# Usage: session_matches_patterns session_name pattern1 pattern2 ...
+session_matches_patterns() {
+    local session_name="$1"
+    shift
+    local pattern
+    for pattern in "$@"; do
+        # shellcheck disable=SC2254
+        if [[ "$session_name" == $pattern ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Generate a random hex nonce (12 chars = 6 bytes)
+generate_nonce() {
+    openssl rand -hex 6
+}
+
+# Derive a 6-digit verification code from fingerprint + nonce
+derive_verification_code() {
+    local fingerprint="$1" nonce="$2"
+    local material
+    material=$(printf '%s%s' "$fingerprint" "$nonce" | shasum -a 256 | awk '{print $1}')
+    local num
+    num=$(printf '%d' "0x${material:0:8}")
+    printf '%06d' $(( num % 1000000 ))
 }

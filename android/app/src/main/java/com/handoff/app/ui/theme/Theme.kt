@@ -22,6 +22,8 @@ private val Green = Color(0xFF3FB950)
 private val Error = Color(0xFFF85149)
 
 val HandoffGreen = Green
+val HandoffAmber = Color(0xFFD29922)
+val HandoffAmberDim = Color(0xFF3D2E0A)
 
 private val DarkColorScheme = darkColorScheme(
     primary = Primary,

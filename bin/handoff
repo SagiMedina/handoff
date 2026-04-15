@@ -15,13 +15,18 @@ usage() {
 ${BOLD}handoff${RESET} — Continue your Mac terminal on your phone.
 
 ${BOLD}Usage:${RESET}
-  handoff              Show active sessions and connection info
-  handoff setup        One-time setup (Tailscale, SSH, tmux, keys)
-  handoff pair         Show QR code for phone pairing
-  handoff status       Check if everything is ready
-  handoff unpair       Remove phone access and clean up
-  handoff version      Show version
-  handoff help         Show this help
+  handoff                Show active sessions and connection info
+  handoff setup          One-time setup (Tailscale, SSH, tmux, keys)
+  handoff pair           Pair a new device (with permissions)
+  handoff status         Check if everything is ready
+  handoff unpair         Remove all paired devices
+  handoff devices        List paired devices
+  handoff devices rm <n>    Revoke a device
+  handoff devices edit <n>  Change device permissions
+  handoff devices renew <n> Approve access renewal
+  handoff devices log [n]   Show access log
+  handoff version        Show version
+  handoff help           Show this help
 
 "
 }
@@ -97,27 +102,16 @@ cmd_setup() {
         success "  ✓ Remote Login (SSH) enabled"
     fi
 
-    # 5. Generate SSH keypair for phone
+    # 5. Initialize device registry (v2)
     mkdir -p "$HANDOFF_DIR"
-    if [[ -f "$HANDOFF_KEY" ]]; then
-        success "  ✓ Phone SSH key exists"
-    else
-        info "  Generating SSH key for phone access..."
-        ssh-keygen -t ed25519 -f "$HANDOFF_KEY" -N "" -C "handoff-phone"
-        success "  ✓ Phone SSH key generated"
-    fi
+    devices_json_init
+    success "  ✓ Device registry initialized"
 
-    # 6. Add public key to authorized_keys
-    mkdir -p "$HOME/.ssh"
-    chmod 700 "$HOME/.ssh"
-    local pubkey
-    pubkey=$(cat "${HANDOFF_KEY}.pub")
-    if grep -qF "$pubkey" "$HOME/.ssh/authorized_keys" 2>/dev/null; then
-        success "  ✓ Phone key in authorized_keys"
-    else
-        echo "$pubkey" >> "$HOME/.ssh/authorized_keys"
-        chmod 600 "$HOME/.ssh/authorized_keys"
-        success "  ✓ Phone key added to authorized_keys"
+    # Legacy v1 key detection
+    if [[ -f "$HANDOFF_KEY" ]]; then
+        warn "  ! Legacy v1 phone key detected."
+        echo "    v2 uses per-device keys with permissions."
+        echo "    Run 'handoff unpair' to remove v1 key, then 'handoff pair' to re-pair."
     fi
 
     # 7. Configure tmux auto-start
@@ -153,7 +147,7 @@ cmd_setup() {
 cmd_pair() {
     echo ""
 
-    if [[ ! -f "$HANDOFF_KEY" ]]; then
+    if [[ ! -f "$HANDOFF_DEVICES" ]]; then
         error "  Setup not complete. Run 'handoff setup' first."
         exit 1
     fi
@@ -170,19 +164,20 @@ cmd_pair() {
     local user
     user=$(whoami)
 
-    # Base64-encode the private key (single line, no wrapping)
-    local key_b64
-    key_b64=$(base64 < "$HANDOFF_KEY" | tr -d '\n')
-
-    # Get the absolute path to tmux (varies between Apple Silicon and Intel Macs)
+    # Get the absolute path to tmux
     local tmux_path
     tmux_path=$(which tmux)
 
+    # Legacy Termux mode
     if [[ "${1:-}" == "--termux" ]]; then
-        # Legacy Termux mode
+        if [[ ! -f "$HANDOFF_KEY" ]]; then
+            error "  Termux mode requires v1 key. Run 'handoff setup' in v1 mode first."
+            exit 1
+        fi
+        local key_b64
+        key_b64=$(base64 < "$HANDOFF_KEY" | tr -d '\n')
         local setup_url="https://raw.githubusercontent.com/SagiMedina/handoff/main/termux/setup.sh"
         local oneliner="curl -fsSL '${setup_url}' | bash -s -- '${ip}' '${user}' '${key_b64}' '${tmux_path}'"
-
         info "  Scan this QR code in Termux on your phone:"
         echo ""
         qrencode -t ANSIUTF8 "$oneliner"
@@ -192,21 +187,198 @@ cmd_pair() {
         return
     fi
 
-    # JSON payload for the Handoff Android app
-    local json_payload
-    json_payload=$(printf '{"v":1,"ip":"%s","user":"%s","key":"%s","tmux":"%s"}' \
-        "$ip" "$user" "$key_b64" "$tmux_path")
+    # ─── v2 pairing with per-device identity ──────────────────
 
-    info "  Scan this QR code with the Handoff app on your phone:"
+    info "  Pair New Device"
+    echo "  ───────────────"
     echo ""
-    qrencode -t ANSIUTF8 "$json_payload"
+
+    # Device name will be auto-detected from the phone
+    local device_name="pending"
+
+    # 1. Session patterns
     echo ""
-    echo "  ${DIM}Steps:${RESET}"
-    echo "  1. Install the Handoff app on your phone"
-    echo "  2. Open the app and tap \"Scan QR Code\""
-    echo "  3. Point your phone camera at the QR code above"
+    echo "  Which tmux sessions should this device access?"
+    local current_sessions
+    current_sessions=$(tmux_sessions 2>/dev/null || true)
+    if [[ -n "$current_sessions" ]]; then
+        printf "  ${DIM}Active sessions:${RESET}\n"
+        while IFS=: read -r sname _; do
+            printf "    ${DIM}• %s${RESET}\n" "$sname"
+        done <<< "$current_sessions"
+    fi
+    printf "  ${DIM}Use * for all, or comma-separated names/patterns (e.g. main,work-*)${RESET}\n"
+    local sessions_input
+    read -rp "  Sessions [*]: " sessions_input
+    sessions_input="${sessions_input:-*}"
+
+    # Parse comma-separated into JSON array
+    local sessions_json
+    sessions_json=$(python3 -c "
+import json
+patterns = [p.strip() for p in '${sessions_input}'.split(',') if p.strip()]
+print(json.dumps(patterns))
+")
+
+    # 3. Read-only?
     echo ""
-    printf "  ${DIM}For Termux users: handoff pair --termux${RESET}\n"
+    local read_only_input
+    read -rp "  Read-only access? [y/N]: " read_only_input
+    local read_only="false"
+    [[ "$read_only_input" =~ ^[Yy]$ ]] && read_only="true"
+
+    # 4. Expiry duration
+    echo ""
+    echo "  Access duration:"
+    echo "    [1] 24 hours"
+    echo "    [2] 7 days"
+    echo "    [3] 30 days"
+    echo "    [4] Never"
+    local expiry_choice
+    read -rp "  Choose [3]: " expiry_choice
+    expiry_choice="${expiry_choice:-3}"
+
+    local soft_expiry hard_expiry
+    case "$expiry_choice" in
+        1) soft_expiry=$(date -v+1d -u +%Y-%m-%dT%H:%M:%SZ)
+           hard_expiry=$(date -v+1d -v+48H -u +%Y-%m-%dT%H:%M:%SZ) ;;
+        2) soft_expiry=$(date -v+7d -u +%Y-%m-%dT%H:%M:%SZ)
+           hard_expiry=$(date -v+7d -v+48H -u +%Y-%m-%dT%H:%M:%SZ) ;;
+        3) soft_expiry=$(date -v+30d -u +%Y-%m-%dT%H:%M:%SZ)
+           hard_expiry=$(date -v+30d -v+48H -u +%Y-%m-%dT%H:%M:%SZ) ;;
+        4) soft_expiry=""
+           hard_expiry="" ;;
+        *) soft_expiry=$(date -v+30d -u +%Y-%m-%dT%H:%M:%SZ)
+           hard_expiry=$(date -v+30d -v+48H -u +%Y-%m-%dT%H:%M:%SZ) ;;
+    esac
+
+    # 5. Generate per-device key
+    echo ""
+    info "  Generating key for \"$device_name\"..."
+    local key_name
+    key_name="device_$(echo "$device_name" | tr ' ' '_' | tr -cd 'a-zA-Z0-9_')"
+    # Ensure unique name
+    while [[ -f "$HANDOFF_KEYS_DIR/${key_name}" ]]; do
+        key_name="${key_name}_$(openssl rand -hex 2)"
+    done
+
+    local fingerprint
+    fingerprint=$(generate_device_key "$key_name")
+
+    # 6. Generate nonce for verification
+    local nonce
+    nonce=$(generate_nonce)
+
+    # 7. Register device as pending
+    devices_json_add_device "$device_name" "$fingerprint" "$key_name" \
+        "$sessions_json" "$read_only" "$nonce" "$soft_expiry" "$hard_expiry"
+
+    # 8. Add to authorized_keys with forced command
+    add_device_to_authorized_keys "$fingerprint" \
+        "$HANDOFF_KEYS_DIR/${key_name}.pub" "$hard_expiry" "$device_name"
+
+    # 9. Build QR v2 payload (compact: strip PEM headers, short keys)
+    local key_inner
+    key_inner=$(sed -n '/^[^-]/p' "$HANDOFF_KEYS_DIR/$key_name" | tr -d '\n')
+
+    local json_payload
+    json_payload=$(printf '{"v":2,"i":"%s","u":"%s","k":"%s","t":"%s","n":"%s"}' \
+        "$ip" "$user" "$key_inner" "$tmux_path" "$nonce")
+
+    # 10. Display QR code
+    echo ""
+    info "  Scan this QR code with the Handoff app:"
+    echo ""
+
+    # Generate QR as PNG and open in Preview for reliable scanning
+    local qr_png="$HANDOFF_DIR/pair_qr.png"
+    if qrencode -t PNG -o "$qr_png" -s 8 -m 2 "$json_payload" 2>/dev/null; then
+        open "$qr_png" 2>/dev/null &
+        info "  QR code opened in Preview."
+    else
+        # Fallback to terminal
+        qrencode -t ANSIUTF8 -m 1 "$json_payload"
+    fi
+    echo ""
+
+    # Show summary
+    printf "  ${DIM}Device:   %s${RESET}\n" "$device_name"
+    printf "  ${DIM}Sessions: %s${RESET}\n" "$sessions_input"
+    printf "  ${DIM}Mode:     %s${RESET}\n" "$([ "$read_only" = "true" ] && echo "read-only" || echo "read/write")"
+    if [[ -n "$soft_expiry" ]]; then
+        printf "  ${DIM}Expires:  %s${RESET}\n" "$soft_expiry"
+    else
+        printf "  ${DIM}Expires:  never${RESET}\n"
+    fi
+    echo ""
+
+    # 11. Wait for verification
+    info "  Waiting for device to connect (5 min timeout)..."
+    printf "  ${DIM}Open the Handoff app and scan the QR code.${RESET}\n"
+    printf "  ${DIM}Press Ctrl+C to cancel and clean up.${RESET}\n"
+    echo ""
+
+    local pair_marker="$HANDOFF_KEYS_DIR/.pair-$(echo "$fingerprint" | tr -cd 'a-zA-Z0-9')"
+
+    # Clean up on Ctrl+C
+    cleanup_pair() {
+        echo ""
+        warn "  Pairing cancelled. Cleaning up..."
+        devices_json_remove_device "$fingerprint"
+        remove_device_from_authorized_keys "$fingerprint"
+        rm -f "$HANDOFF_KEYS_DIR/$key_name" "$HANDOFF_KEYS_DIR/${key_name}.pub"
+        rm -f "$pair_marker"
+        echo ""
+        exit 1
+    }
+    trap cleanup_pair INT
+
+    local elapsed=0
+    while [[ $elapsed -lt 300 ]]; do
+        if [[ -f "$pair_marker" ]]; then
+            # Device connected — read device name from marker file
+            local reported_name
+            reported_name=$(cat "$pair_marker" 2>/dev/null || echo "")
+            rm -f "$pair_marker"
+            if [[ -n "$reported_name" && "$reported_name" != "pending" ]]; then
+                device_name="$reported_name"
+            fi
+            local code
+            code=$(derive_verification_code "$fingerprint" "$nonce")
+            echo ""
+            printf "  ${BOLD}Verification code:  %s %s${RESET}\n" "${code:0:3}" "${code:3:3}"
+            echo ""
+            local confirm
+            read -rp "  Does the phone show the same code? [y/N]: " confirm
+            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                devices_json_update_device "$fingerprint" "status" "active"
+                echo ""
+                success "  ✓ \"$device_name\" paired successfully!"
+                echo ""
+                trap - INT
+                return 0
+            else
+                # Rejected — clean up
+                warn "  Pairing rejected."
+                devices_json_remove_device "$fingerprint"
+                remove_device_from_authorized_keys "$fingerprint"
+                rm -f "$HANDOFF_KEYS_DIR/$key_name" "$HANDOFF_KEYS_DIR/${key_name}.pub"
+                echo ""
+                trap - INT
+                return 1
+            fi
+        fi
+        sleep 2
+        elapsed=$((elapsed + 2))
+    done
+
+    # Timeout — clean up
+    warn "  Pairing timed out. Cleaning up..."
+    devices_json_remove_device "$fingerprint"
+    remove_device_from_authorized_keys "$fingerprint"
+    rm -f "$HANDOFF_KEYS_DIR/$key_name" "$HANDOFF_KEYS_DIR/${key_name}.pub"
+    rm -f "$pair_marker"
+    trap - INT
     echo ""
 }
 
@@ -247,11 +419,28 @@ cmd_status() {
         error "  ✗ tmux: not installed"
     fi
 
-    # Phone key
-    if [[ -f "$HANDOFF_KEY" ]]; then
-        success "  ✓ Phone key: configured"
+    # Device registry (v2)
+    if [[ -f "$HANDOFF_DEVICES" ]]; then
+        local device_count
+        device_count=$(python3 -c "
+import json
+with open('$HANDOFF_DEVICES') as f:
+    d = json.load(f)
+active = [x for x in d['devices'] if x['status'] == 'active']
+print(len(active))
+")
+        if [[ "$device_count" -gt 0 ]]; then
+            success "  ✓ Devices: $device_count paired (v2)"
+        else
+            warn "  ~ Devices: none active (run: handoff pair)"
+        fi
     else
-        error "  ✗ Phone key: not found (run: handoff setup)"
+        warn "  ~ Device registry: not initialized (run: handoff setup)"
+    fi
+
+    # Legacy v1 key
+    if [[ -f "$HANDOFF_KEY" ]]; then
+        warn "  ! Legacy v1 phone key: present (run: handoff unpair to clean up)"
     fi
 
     # qrencode
@@ -272,43 +461,641 @@ cmd_unpair() {
     echo "  ──────────────"
     echo ""
 
-    if [[ ! -f "$HANDOFF_KEY" ]]; then
-        warn "  No phone key found — nothing to unpair."
+    local has_v1=false has_v2=false
+    [[ -f "$HANDOFF_KEY" ]] && has_v1=true
+    [[ -f "$HANDOFF_DEVICES" ]] && has_v2=true
+
+    if [[ "$has_v1" == "false" && "$has_v2" == "false" ]]; then
+        warn "  Nothing to unpair."
         echo ""
         return
     fi
 
-    # 1. Remove public key from authorized_keys
-    local pubkey
-    pubkey=$(cat "${HANDOFF_KEY}.pub")
-    if [[ -f "$HOME/.ssh/authorized_keys" ]]; then
-        grep -vF "$pubkey" "$HOME/.ssh/authorized_keys" > "$HOME/.ssh/authorized_keys.tmp" || true
-        mv "$HOME/.ssh/authorized_keys.tmp" "$HOME/.ssh/authorized_keys"
-        chmod 600 "$HOME/.ssh/authorized_keys"
-        success "  ✓ Removed phone key from authorized_keys"
+    local confirm
+    read -rp "  This will revoke ALL devices and remove all keys. Continue? [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "  Cancelled."
+        echo ""
+        return
     fi
 
-    # 2. Delete the keypair
-    rm -f "$HANDOFF_KEY" "${HANDOFF_KEY}.pub"
-    success "  ✓ Deleted phone SSH keypair"
+    # v2: remove all device keys from authorized_keys
+    if [[ "$has_v2" == "true" ]]; then
+        while IFS='|' read -r fp name _ _ _ _ _; do
+            [[ -z "$fp" ]] && continue
+            remove_device_from_authorized_keys "$fp"
+        done <<< "$(devices_json_list 2>/dev/null)"
+        success "  ✓ Removed all v2 device keys from authorized_keys"
+    fi
 
-    # 3. Clean up ~/.handoff directory
+    # v1: remove legacy phone key from authorized_keys
+    if [[ "$has_v1" == "true" ]]; then
+        local pubkey
+        pubkey=$(cat "${HANDOFF_KEY}.pub" 2>/dev/null || echo "")
+        if [[ -n "$pubkey" && -f "$HOME/.ssh/authorized_keys" ]]; then
+            grep -vF "$pubkey" "$HOME/.ssh/authorized_keys" > "$HOME/.ssh/authorized_keys.tmp" || true
+            mv "$HOME/.ssh/authorized_keys.tmp" "$HOME/.ssh/authorized_keys"
+            chmod 600 "$HOME/.ssh/authorized_keys"
+        fi
+        rm -f "$HANDOFF_KEY" "${HANDOFF_KEY}.pub"
+        success "  ✓ Removed v1 phone key"
+    fi
+
+    # Remove all handoff data
     rm -rf "$HANDOFF_DIR"
     success "  ✓ Removed ~/.handoff"
 
     echo ""
-    success "  Mac side cleaned up."
+    success "  All devices unpaired. Mac side cleaned up."
+    echo ""
+}
+
+# ─── handoff gate (SSH forced command) ───────────────────────────────
+
+cmd_gate() {
+    local fingerprint="${1:-}"
+    local original_cmd="${SSH_ORIGINAL_COMMAND:-}"
+    local tmux_path
+
+    # ─── Validate device ──────────────────────────────────────
+    if [[ -z "$fingerprint" ]]; then
+        echo "error:not_found"
+        exit 1
+    fi
+
+    local device_json
+    device_json=$(devices_json_get_device "$fingerprint")
+    if [[ -z "$device_json" ]]; then
+        echo "error:not_found"
+        exit 1
+    fi
+
+    # Extract device fields
+    local device_status device_name read_only sessions_raw soft_expiry
+    device_status=$(devices_json_get_field "$fingerprint" "status")
+    device_name=$(devices_json_get_field "$fingerprint" "name")
+    read_only=$(devices_json_get_field "$fingerprint" "read_only")
+    sessions_raw=$(devices_json_get_field "$fingerprint" "sessions")  # semicolon-separated
+    soft_expiry=$(devices_json_get_field "$fingerprint" "soft_expiry")
+    tmux_path=$(which tmux 2>/dev/null || echo "/opt/homebrew/bin/tmux")
+
+    # Split sessions into array
+    IFS=';' read -ra device_sessions <<< "$sessions_raw"
+
+    # Update last_seen
+    local now_ts
+    now_ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+    devices_json_update_device "$fingerprint" "last_seen" "$now_ts"
+
+    # Parse command
+    if [[ -z "$original_cmd" ]]; then
+        original_cmd="list"  # default to list if no command
+    fi
+    local cmd args
+    cmd="${original_cmd%% *}"
+    args="${original_cmd#* }"
+    [[ "$cmd" == "$args" ]] && args=""
+
+    # Log helper
+    gate_log() {
+        local result="$1"
+        touch "$HANDOFF_ACCESS_LOG" 2>/dev/null || true
+        printf '{"ts":"%s","fp":"%s","name":"%s","cmd":"%s","result":"%s"}\n' \
+            "$now_ts" "$fingerprint" "$device_name" "$original_cmd" "$result" \
+            >> "$HANDOFF_ACCESS_LOG" 2>/dev/null || true
+    }
+
+    # ─── Status-based gating ──────────────────────────────────
+
+    # Pending: only "pair" allowed
+    if [[ "$device_status" == "pending" ]]; then
+        if [[ "$cmd" != "pair" ]]; then
+            gate_log "denied:pending"
+            echo "error:pending"
+            exit 1
+        fi
+    fi
+
+    # Revoked: nothing allowed
+    if [[ "$device_status" == "revoked" ]]; then
+        gate_log "denied:revoked"
+        echo "error:not_found"
+        exit 1
+    fi
+
+    # Soft expiry check (for active/soft_expired devices)
+    if [[ -n "$soft_expiry" && "$device_status" != "pending" ]]; then
+        local now_epoch soft_epoch
+        now_epoch=$(date +%s)
+        soft_epoch=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$soft_expiry" +%s 2>/dev/null || echo "0")
+        if [[ "$now_epoch" -gt "$soft_epoch" && "$soft_epoch" -gt 0 ]]; then
+            # Soft expired — only "renew" allowed
+            if [[ "$cmd" != "renew" ]]; then
+                gate_log "denied:soft_expired"
+                echo "error:soft_expired"
+                exit 1
+            fi
+        fi
+    fi
+
+    # Update last_command
+    devices_json_update_device "$fingerprint" "last_command" "$original_cmd"
+
+    # ─── Command dispatch ─────────────────────────────────────
+
+    case "$cmd" in
+        pair)
+            # Phone sends: pair <device_name>
+            # Update device name from what the phone reports
+            local phone_name="$args"
+            if [[ -n "$phone_name" ]]; then
+                devices_json_update_device "$fingerprint" "name" "$phone_name"
+                device_name="$phone_name"
+            fi
+            # Write marker file so the pairing loop detects connection
+            echo "$device_name" > "$HANDOFF_KEYS_DIR/.pair-$(echo "$fingerprint" | tr -cd 'a-zA-Z0-9')"
+            # Return verification code
+            local nonce
+            nonce=$(devices_json_get_field "$fingerprint" "nonce")
+            local code
+            code=$(derive_verification_code "$fingerprint" "$nonce")
+            gate_log "ok"
+            echo "verify:$code"
+            ;;
+
+        list)
+            # Return filtered session list with permissions header
+            local mode="read/write"
+            [[ "$read_only" == "true" ]] && mode="read_only"
+            echo "#permissions:read_only=${read_only},sessions=${sessions_raw}"
+
+            local all_sessions
+            all_sessions=$("$tmux_path" list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null || true)
+            if [[ -n "$all_sessions" ]]; then
+                while IFS= read -r line; do
+                    local sname="${line%%:*}"
+                    if session_matches_patterns "$sname" "${device_sessions[@]}"; then
+                        echo "$line"
+                    fi
+                done <<< "$all_sessions"
+            fi
+            gate_log "ok"
+            ;;
+
+        windows)
+            # Usage: windows <session>
+            local session="$args"
+            if [[ -z "$session" ]]; then
+                gate_log "denied:missing_session"
+                echo "error:denied"
+                exit 1
+            fi
+            if ! session_matches_patterns "$session" "${device_sessions[@]}"; then
+                gate_log "denied:session_not_allowed"
+                echo "error:denied"
+                exit 1
+            fi
+            "$tmux_path" list-windows -t "$session" \
+                -F '#{window_index}|#{pane_title}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null || true
+            gate_log "ok"
+            ;;
+
+        attach)
+            # Usage: attach <session> [window_index]
+            local session window
+            session="${args%% *}"
+            local rest="${args#* }"
+            [[ "$session" == "$rest" ]] && rest=""
+            window="${rest:-}"
+
+            if [[ -z "$session" ]]; then
+                gate_log "denied:missing_session"
+                echo "error:denied"
+                exit 1
+            fi
+            if ! session_matches_patterns "$session" "${device_sessions[@]}"; then
+                gate_log "denied:session_not_allowed"
+                echo "error:denied"
+                exit 1
+            fi
+
+            local target="$session"
+            [[ -n "$window" ]] && target="${session}:${window}"
+
+            gate_log "ok"
+
+            # exec replaces the gate process — SSH PTY connects directly to tmux
+            if [[ "$read_only" == "true" ]]; then
+                exec env LANG=en_US.UTF-8 "$tmux_path" attach -t "$target" -r
+            else
+                exec env LANG=en_US.UTF-8 "$tmux_path" attach -t "$target"
+            fi
+            ;;
+
+        create-session)
+            # Usage: create-session <name>
+            local session_name="$args"
+            if [[ "$read_only" == "true" ]]; then
+                gate_log "denied:read_only"
+                echo "error:read_only"
+                exit 1
+            fi
+            if [[ -z "$session_name" ]]; then
+                gate_log "denied:missing_name"
+                echo "error:denied"
+                exit 1
+            fi
+            if ! session_matches_patterns "$session_name" "${device_sessions[@]}"; then
+                gate_log "denied:session_not_allowed"
+                echo "error:denied"
+                exit 1
+            fi
+            "$tmux_path" new-session -d -s "$session_name" 2>/dev/null && echo "ok" || echo "error:failed"
+            gate_log "ok"
+            ;;
+
+        create-window)
+            # Usage: create-window <session>
+            local session="$args"
+            if [[ "$read_only" == "true" ]]; then
+                gate_log "denied:read_only"
+                echo "error:read_only"
+                exit 1
+            fi
+            if [[ -z "$session" ]]; then
+                gate_log "denied:missing_session"
+                echo "error:denied"
+                exit 1
+            fi
+            if ! session_matches_patterns "$session" "${device_sessions[@]}"; then
+                gate_log "denied:session_not_allowed"
+                echo "error:denied"
+                exit 1
+            fi
+            "$tmux_path" new-window -t "$session" -P -F '#{window_index}' 2>/dev/null || echo "error:failed"
+            gate_log "ok"
+            ;;
+
+        kill-session)
+            # Usage: kill-session <session>
+            local session="$args"
+            if [[ "$read_only" == "true" ]]; then
+                gate_log "denied:read_only"
+                echo "error:read_only"
+                exit 1
+            fi
+            if [[ -z "$session" ]]; then
+                gate_log "denied:missing_session"
+                echo "error:denied"
+                exit 1
+            fi
+            if ! session_matches_patterns "$session" "${device_sessions[@]}"; then
+                gate_log "denied:session_not_allowed"
+                echo "error:denied"
+                exit 1
+            fi
+            "$tmux_path" kill-session -t "$session" 2>/dev/null && echo "ok" || echo "error:failed"
+            gate_log "ok"
+            ;;
+
+        kill-window)
+            # Usage: kill-window <session> <index>
+            local session="${args%% *}"
+            local rest="${args#* }"
+            [[ "$session" == "$rest" ]] && rest=""
+            local idx="${rest:-}"
+            if [[ "$read_only" == "true" ]]; then
+                gate_log "denied:read_only"
+                echo "error:read_only"
+                exit 1
+            fi
+            if [[ -z "$session" || -z "$idx" ]]; then
+                gate_log "denied:missing_args"
+                echo "error:denied"
+                exit 1
+            fi
+            if ! session_matches_patterns "$session" "${device_sessions[@]}"; then
+                gate_log "denied:session_not_allowed"
+                echo "error:denied"
+                exit 1
+            fi
+            "$tmux_path" kill-window -t "${session}:${idx}" 2>/dev/null && echo "ok" || echo "error:failed"
+            gate_log "ok"
+            ;;
+
+        renew)
+            # Only allowed when soft_expired
+            if [[ "$device_status" != "soft_expired" && "$device_status" != "active" ]]; then
+                gate_log "denied:invalid_status"
+                echo "error:denied"
+                exit 1
+            fi
+            devices_json_update_device "$fingerprint" "renewal_requested" "true"
+            gate_log "ok"
+            echo "requested"
+            ;;
+
+        *)
+            gate_log "denied:unknown_command"
+            echo "error:unknown_command"
+            exit 1
+            ;;
+    esac
+}
+
+# ─── handoff devices ────────────────────────────────────────────────
+
+cmd_devices() {
+    case "${1:-}" in
+        "")     cmd_devices_list ;;
+        rm)     shift; cmd_devices_rm "$@" ;;
+        edit)   shift; cmd_devices_edit "$@" ;;
+        renew)  shift; cmd_devices_renew "$@" ;;
+        log)    shift; cmd_devices_log "$@" ;;
+        *)      error "Unknown devices command: $1"; exit 1 ;;
+    esac
+}
+
+cmd_devices_list() {
+    echo ""
+    info "  Paired Devices"
+    echo "  ──────────────"
     echo ""
 
-    # 4. Show QR code for phone cleanup
-    local cleanup_cmd="rm -rf ~/.handoff ~/.shortcuts/handoff ~/.ssh/handoff_key; sed -i '/# Handoff/,/ServerAliveCountMax/d' ~/.ssh/config; sed -i '/alias handoff=/d' ~/.bashrc; echo 'Handoff removed.'"
+    if [[ ! -f "$HANDOFF_DEVICES" ]]; then
+        warn "  No device registry found. Run 'handoff setup' first."
+        echo ""
+        return
+    fi
 
-    info "  Scan this QR code in Termux to clean up your phone:"
+    local devices
+    devices=$(devices_json_list)
+    if [[ -z "$devices" ]]; then
+        warn "  No paired devices."
+        echo ""
+        return
+    fi
+
+    printf "  ${BOLD}%-18s %-14s %-12s %-10s %-22s${RESET}\n" "NAME" "SESSIONS" "MODE" "STATUS" "LAST SEEN"
+    echo "  ────────────────────────────────────────────────────────────────────────────"
+
+    while IFS='|' read -r fp name status sessions mode expiry last_seen; do
+        local status_color="$GREEN"
+        case "$status" in
+            pending)      status_color="$YELLOW" ;;
+            soft_expired) status_color="$RED"; status="expired" ;;
+            revoked)      status_color="$RED" ;;
+        esac
+        printf "  %-18s %-14s %-12s ${status_color}%-10s${RESET} %-22s\n" \
+            "$name" "$sessions" "$mode" "$status" "$last_seen"
+    done <<< "$devices"
     echo ""
-    qrencode -t ANSIUTF8 "$cleanup_cmd"
+}
+
+cmd_devices_rm() {
+    local target_name="$1"
+    if [[ -z "$target_name" ]]; then
+        error "  Usage: handoff devices rm <device-name>"
+        exit 1
+    fi
+
+    # Find device by name
+    local found_fp="" found_keyfile=""
+    while IFS='|' read -r fp name _ _ _ _ _; do
+        if [[ "$name" == "$target_name" ]]; then
+            found_fp="$fp"
+            found_keyfile=$(devices_json_get_field "$fp" "key_file")
+            break
+        fi
+    done <<< "$(devices_json_list)"
+
+    if [[ -z "$found_fp" ]]; then
+        error "  Device \"$target_name\" not found."
+        exit 1
+    fi
+
+    local confirm
+    read -rp "  Remove \"$target_name\"? This will revoke all access. [y/N]: " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "  Cancelled."
+        return
+    fi
+
+    devices_json_remove_device "$found_fp"
+    remove_device_from_authorized_keys "$found_fp"
+    rm -f "$HANDOFF_KEYS_DIR/$found_keyfile" "$HANDOFF_KEYS_DIR/${found_keyfile}.pub"
+    success "  ✓ Revoked access for \"$target_name\"."
     echo ""
-    printf "  ${DIM}Or paste manually:${RESET}\n"
-    printf "  ${DIM}%s${RESET}\n" "$cleanup_cmd"
+}
+
+cmd_devices_renew() {
+    local target_name="$1"
+    if [[ -z "$target_name" ]]; then
+        error "  Usage: handoff devices renew <device-name>"
+        exit 1
+    fi
+
+    # Find device by name
+    local found_fp=""
+    while IFS='|' read -r fp name _ _ _ _ _; do
+        if [[ "$name" == "$target_name" ]]; then
+            found_fp="$fp"
+            break
+        fi
+    done <<< "$(devices_json_list)"
+
+    if [[ -z "$found_fp" ]]; then
+        error "  Device \"$target_name\" not found."
+        exit 1
+    fi
+
+    echo ""
+    info "  Renew access for \"$target_name\""
+    echo ""
+    echo "  New access duration:"
+    echo "    [1] 24 hours"
+    echo "    [2] 7 days"
+    echo "    [3] 30 days"
+    echo "    [4] Never"
+    local choice
+    read -rp "  Choose [3]: " choice
+    choice="${choice:-3}"
+
+    local soft_expiry hard_expiry
+    case "$choice" in
+        1) soft_expiry=$(date -v+1d -u +%Y-%m-%dT%H:%M:%SZ)
+           hard_expiry=$(date -v+1d -v+48H -u +%Y-%m-%dT%H:%M:%SZ) ;;
+        2) soft_expiry=$(date -v+7d -u +%Y-%m-%dT%H:%M:%SZ)
+           hard_expiry=$(date -v+7d -v+48H -u +%Y-%m-%dT%H:%M:%SZ) ;;
+        3) soft_expiry=$(date -v+30d -u +%Y-%m-%dT%H:%M:%SZ)
+           hard_expiry=$(date -v+30d -v+48H -u +%Y-%m-%dT%H:%M:%SZ) ;;
+        4) soft_expiry=""
+           hard_expiry="" ;;
+        *) soft_expiry=$(date -v+30d -u +%Y-%m-%dT%H:%M:%SZ)
+           hard_expiry=$(date -v+30d -v+48H -u +%Y-%m-%dT%H:%M:%SZ) ;;
+    esac
+
+    # Update devices.json
+    devices_json_update_device "$found_fp" "soft_expiry" "$soft_expiry"
+    devices_json_update_device "$found_fp" "hard_expiry" "$hard_expiry"
+    devices_json_update_device "$found_fp" "status" "active"
+    devices_json_update_device "$found_fp" "renewal_requested" "false"
+
+    # Update expiry-time in authorized_keys
+    if [[ -n "$hard_expiry" ]]; then
+        local expiry_date
+        expiry_date=$(date -jf "%Y-%m-%dT%H:%M:%SZ" "$hard_expiry" +%Y%m%d 2>/dev/null || echo "")
+        if [[ -n "$expiry_date" && -f "$HOME/.ssh/authorized_keys" ]]; then
+            # Replace the expiry-time for this device's key
+            local key_file
+            key_file=$(devices_json_get_field "$found_fp" "key_file")
+            local pubkey
+            pubkey=$(cat "$HANDOFF_KEYS_DIR/${key_file}.pub" 2>/dev/null || echo "")
+            if [[ -n "$pubkey" ]]; then
+                # Remove old line, add new one with updated expiry
+                remove_device_from_authorized_keys "$found_fp"
+                add_device_to_authorized_keys "$found_fp" "$HANDOFF_KEYS_DIR/${key_file}.pub" "$hard_expiry" "$target_name"
+            fi
+        fi
+    fi
+
+    echo ""
+    success "  ✓ Renewed access for \"$target_name\"."
+    if [[ -n "$soft_expiry" ]]; then
+        printf "  ${DIM}New expiry: %s${RESET}\n" "$soft_expiry"
+    else
+        printf "  ${DIM}Expires: never${RESET}\n"
+    fi
+    echo ""
+}
+
+cmd_devices_edit() {
+    local target_name="$1"
+    if [[ -z "$target_name" ]]; then
+        error "  Usage: handoff devices edit <device-name>"
+        exit 1
+    fi
+
+    # Find device by name
+    local found_fp=""
+    while IFS='|' read -r fp name _ _ _ _ _; do
+        if [[ "$name" == "$target_name" ]]; then
+            found_fp="$fp"
+            break
+        fi
+    done <<< "$(devices_json_list)"
+
+    if [[ -z "$found_fp" ]]; then
+        error "  Device \"$target_name\" not found."
+        exit 1
+    fi
+
+    local current_sessions current_readonly
+    current_sessions=$(devices_json_get_field "$found_fp" "sessions")
+    current_readonly=$(devices_json_get_field "$found_fp" "read_only")
+
+    echo ""
+    info "  Edit \"$target_name\""
+    echo ""
+
+    # Sessions
+    printf "  Current sessions: %s\n" "$current_sessions"
+    printf "  ${DIM}Use * for all, or comma-separated names/patterns${RESET}\n"
+    local sessions_input
+    read -rp "  Sessions [$current_sessions]: " sessions_input
+    if [[ -n "$sessions_input" ]]; then
+        local sessions_json
+        sessions_json=$(python3 -c "
+import json
+patterns = [p.strip() for p in '${sessions_input}'.split(',') if p.strip()]
+print(json.dumps(patterns))
+")
+        # Update sessions array directly via python
+        python3 -c "
+import json
+with open('$HANDOFF_DEVICES', 'r') as f:
+    data = json.load(f)
+for d in data['devices']:
+    if d['fingerprint'] == '$found_fp':
+        d['sessions'] = $sessions_json
+        break
+with open('$HANDOFF_DEVICES', 'w') as f:
+    json.dump(data, f, indent=2)
+"
+    fi
+
+    # Read-only
+    printf "  Current mode: %s\n" "$([ "$current_readonly" = "true" ] && echo "read-only" || echo "read/write")"
+    local ro_input
+    read -rp "  Read-only? [y/N]: " ro_input
+    if [[ "$ro_input" =~ ^[Yy]$ ]]; then
+        devices_json_update_device "$found_fp" "read_only" "true"
+    else
+        devices_json_update_device "$found_fp" "read_only" "false"
+    fi
+
+    echo ""
+    success "  ✓ Updated permissions for \"$target_name\"."
+    echo ""
+}
+
+cmd_devices_log() {
+    local target_name="${1:-}"
+    local target_fp=""
+
+    if [[ -n "$target_name" ]]; then
+        while IFS='|' read -r fp name _ _ _ _ _; do
+            if [[ "$name" == "$target_name" ]]; then
+                target_fp="$fp"
+                break
+            fi
+        done <<< "$(devices_json_list)"
+        if [[ -z "$target_fp" ]]; then
+            error "  Device \"$target_name\" not found."
+            exit 1
+        fi
+    fi
+
+    echo ""
+    if [[ -n "$target_name" ]]; then
+        info "  Access Log — $target_name"
+    else
+        info "  Access Log"
+    fi
+    echo "  ──────────"
+    echo ""
+
+    if [[ ! -f "$HANDOFF_ACCESS_LOG" ]] || [[ ! -s "$HANDOFF_ACCESS_LOG" ]]; then
+        warn "  No log entries."
+        echo ""
+        return
+    fi
+
+    # Show last 50 entries (filtered by device if specified)
+    python3 -c "
+import json, sys
+entries = []
+with open('$HANDOFF_ACCESS_LOG') as f:
+    for line in f:
+        line = line.strip()
+        if not line: continue
+        try:
+            entry = json.loads(line)
+            fp_filter = '$target_fp'
+            if fp_filter and entry.get('fp') != fp_filter:
+                continue
+            entries.append(entry)
+        except: pass
+
+for e in entries[-50:]:
+    ts = e.get('ts', '?')[:16].replace('T', ' ')
+    name = e.get('name', '?')
+    cmd = e.get('cmd', '?')
+    result = e.get('result', '?')
+    color = '\033[0;32m' if result == 'ok' else '\033[0;31m'
+    reset = '\033[0m'
+    print(f'  {ts}  {name:<16s}  {cmd:<28s}  {color}{result}{reset}')
+"
     echo ""
 }
 
@@ -319,6 +1106,8 @@ case "${1:-}" in
     pair)    shift; cmd_pair "$@" ;;
     unpair)  cmd_unpair ;;
     status)  cmd_status ;;
+    gate)    shift; cmd_gate "$@" ;;
+    devices) shift; cmd_devices "$@" ;;
     version) echo "handoff $VERSION" ;;
     help|-h|--help) usage ;;
     "")      cmd_default ;;

@@ -11,6 +11,8 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import android.util.Log
+import com.handoff.app.BuildConfig
 import com.handoff.app.data.friendlyTailscaleError
 import com.handoff.app.data.TailscaleManager
 import com.handoff.app.data.TailscaleState
@@ -28,13 +30,30 @@ fun TailscaleAuthScreen(
     val tsError by tailscaleManager.error.collectAsState()
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    var navigated by remember { mutableStateOf(false) }
 
     LaunchedEffect(Unit) {
         try {
+            if (BuildConfig.DEBUG) Log.d("Handoff", "TailscaleAuth: starting")
             tailscaleManager.start()
-            onAuthenticated()
+            if (BuildConfig.DEBUG) Log.d("Handoff", "TailscaleAuth: start() returned, calling onAuthenticated")
+            if (!navigated) {
+                navigated = true
+                onAuthenticated()
+            }
         } catch (e: Exception) {
-            // Error state handled by UI below
+            if (BuildConfig.DEBUG) Log.d("Handoff", "TailscaleAuth: start() threw: ${e.message}")
+            // Error state handled by UI below — will call onAuthenticated when state becomes CONNECTED
+        }
+    }
+
+    // Watch for CONNECTED state (covers re-auth flow where start() threw but browser login succeeds)
+    LaunchedEffect(state) {
+        if (BuildConfig.DEBUG) Log.d("Handoff", "TailscaleAuth: state=$state navigated=$navigated")
+        if (state == TailscaleState.CONNECTED && !navigated) {
+            navigated = true
+            if (BuildConfig.DEBUG) Log.d("Handoff", "TailscaleAuth: state=CONNECTED, calling onAuthenticated")
+            onAuthenticated()
         }
     }
 

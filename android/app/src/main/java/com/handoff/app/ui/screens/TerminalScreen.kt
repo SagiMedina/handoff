@@ -22,10 +22,16 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
+import com.handoff.app.ui.theme.HandoffAmber
+import com.handoff.app.ui.theme.HandoffAmberDim
 import com.handoff.app.ui.components.MobileToolbar
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
@@ -214,10 +220,37 @@ fun TerminalScreen(
         return
     }
 
+    val isReadOnly = sshManager.devicePermissions?.readOnly == true
+
     Column(modifier = Modifier.fillMaxSize()
         .windowInsetsPadding(WindowInsets.statusBars)
         .imePadding()
     ) {
+        // Read-only indicator bar
+        if (isReadOnly) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(HandoffAmberDim)
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = "READ-ONLY",
+                    color = HandoffAmber,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp
+                )
+                Text(
+                    text = "  ·  viewing only, input disabled",
+                    color = HandoffAmber.copy(alpha = 0.6f),
+                    fontSize = 11.sp
+                )
+            }
+        }
+
         AndroidView(
             factory = { ctx ->
                 TerminalView(ctx, null).apply {

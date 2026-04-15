@@ -4,7 +4,10 @@ data class ConnectionConfig(
     val ip: String,
     val user: String,
     val privateKey: String, // base64 encoded
-    val tmuxPath: String
+    val tmuxPath: String,
+    val protocolVersion: Int = 1,  // 1 = raw tmux, 2 = gate protocol
+    val deviceName: String = "",
+    val nonce: String = ""
 )
 
 data class TmuxSession(
@@ -18,4 +21,9 @@ data class TmuxWindow(
     val title: String,
     val command: String,
     val cwd: String = ""
+)
+
+data class DevicePermissions(
+    val readOnly: Boolean = false,
+    val sessions: List<String> = listOf("*")
 )

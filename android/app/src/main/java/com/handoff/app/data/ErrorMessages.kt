@@ -59,6 +59,7 @@ fun friendlyTailscaleError(rawError: String?): String {
 }
 
 fun friendlyActionError(action: String, e: Exception): String {
+    if (e is GateException) return friendlyGateError(e.gateError)
     val msg = (e.message ?: "").lowercase()
     return when {
         "not connected" in msg || "session is down" in msg ->
@@ -66,4 +67,14 @@ fun friendlyActionError(action: String, e: Exception): String {
         else ->
             "Couldn't $action — tap Refresh to try again."
     }
+}
+
+fun friendlyGateError(error: String): String = when (error) {
+    "error:denied" -> "This session is not available on this device."
+    "error:read_only" -> "This device has read-only access."
+    "error:soft_expired" -> "Your access has expired.\nRequest a renewal from the Mac owner."
+    "error:pending" -> "Pairing is not yet complete.\nWait for verification on your Mac."
+    "error:not_found" -> "This device is not registered.\nRe-pair from your Mac with `handoff pair`."
+    "error:unknown_command" -> "Protocol error.\nYour Mac may need a Handoff update."
+    else -> "Access denied: ${error.removePrefix("error:")}"
 }
