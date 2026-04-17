@@ -1,5 +1,7 @@
 package com.handoff.app.ui.screens
 
+import com.handoff.app.BuildConfig
+
 import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Typeface
@@ -16,12 +18,20 @@ import androidx.compose.material3.*
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.sp
 import com.handoff.app.data.ConnectionConfig
+import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
+import com.handoff.app.ui.theme.HandoffAmber
+import com.handoff.app.ui.theme.HandoffAmberDim
 import com.handoff.app.ui.components.MobileToolbar
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
@@ -56,7 +66,7 @@ fun TerminalScreen(
                 if (view != null) {
                     view.onScreenUpdated()
                 } else {
-                    Log.w("Handoff", "onTextChanged but termView is null!")
+                    if (BuildConfig.DEBUG) Log.w("Handoff", "onTextChanged but termView is null!")
                 }
             }
             override fun onTitleChanged(changedSession: TerminalSession) {}
@@ -79,7 +89,7 @@ fun TerminalScreen(
             override fun onTerminalCursorStateChange(state: Boolean) {}
             override fun setTerminalShellPid(session: TerminalSession, pid: Int) {}
             override fun getTerminalCursorStyle(): Int = 0
-            override fun logError(tag: String?, message: String?) { Log.e(tag ?: "Handoff", message ?: "") }
+            override fun logError(tag: String?, message: String?) { if (BuildConfig.DEBUG) Log.e(tag ?: "Handoff", message ?: "") }
             override fun logWarn(tag: String?, message: String?) {}
             override fun logInfo(tag: String?, message: String?) {}
             override fun logDebug(tag: String?, message: String?) {}
@@ -170,7 +180,7 @@ fun TerminalScreen(
         val emulator = view.mEmulator
         val actualCols = emulator?.mColumns ?: cols
         val actualRows = emulator?.mRows ?: rows
-        Log.d("Handoff", "Terminal: ${actualCols}x${actualRows} (after keyboard)")
+        if (BuildConfig.DEBUG) Log.d("Handoff", "Terminal: ${actualCols}x${actualRows} (after keyboard)")
 
         try {
             val proxyPort = tailscaleManager.getProxyPort().let { port ->
@@ -184,17 +194,25 @@ fun TerminalScreen(
             session.setOutputStream(output)
             session.startReading(input)
             sshReady = true
-            Log.d("Handoff", "SSH ready")
+            if (BuildConfig.DEBUG) Log.d("Handoff", "SSH ready")
         } catch (e: Exception) {
-            Log.e("Handoff", "SSH failed", e)
-            error = "Failed to connect: ${e.message}"
+            if (BuildConfig.DEBUG) Log.e("Handoff", "SSH failed", e)
+            error = friendlyConnectionError(e)
         }
     }
 
     if (error != null) {
         Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                Text(text = error!!, color = MaterialTheme.colorScheme.error)
+            Column(
+                horizontalAlignment = Alignment.CenterHorizontally,
+                modifier = Modifier.padding(horizontal = 32.dp)
+            ) {
+                Text(
+                    text = error!!,
+                    color = MaterialTheme.colorScheme.error,
+                    textAlign = TextAlign.Center,
+                    style = MaterialTheme.typography.bodyLarge
+                )
                 Spacer(modifier = Modifier.height(16.dp))
                 Button(onClick = onDisconnect) { Text("Back") }
             }
@@ -202,10 +220,37 @@ fun TerminalScreen(
         return
     }
 
+    val isReadOnly = sshManager.devicePermissions?.readOnly == true
+
     Column(modifier = Modifier.fillMaxSize()
         .windowInsetsPadding(WindowInsets.statusBars)
         .imePadding()
     ) {
+        // Read-only indicator bar
+        if (isReadOnly) {
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .background(HandoffAmberDim)
+                    .padding(horizontal = 12.dp, vertical = 4.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.Center
+            ) {
+                Text(
+                    text = "READ-ONLY",
+                    color = HandoffAmber,
+                    fontSize = 11.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp
+                )
+                Text(
+                    text = "  ·  viewing only, input disabled",
+                    color = HandoffAmber.copy(alpha = 0.6f),
+                    fontSize = 11.sp
+                )
+            }
+        }
+
         AndroidView(
             factory = { ctx ->
                 TerminalView(ctx, null).apply {
@@ -218,6 +263,18 @@ fun TerminalScreen(
                     isFocusable = true
                     isFocusableInTouchMode = true
                     keepScreenOn = true
+
+                    // Compose's imePadding() changes this view's bounds when the
+                    // keyboard shows/hides, but onSizeChanged may not fire reliably
+                    // through AndroidView. Explicitly trigger terminal resize.
+                    addOnLayoutChangeListener { v, left, top, right, bottom,
+                                                oldLeft, oldTop, oldRight, oldBottom ->
+                        if ((right - left) != (oldRight - oldLeft) ||
+                            (bottom - top) != (oldBottom - oldTop)) {
+                            v.post { (v as TerminalView).updateSize() }
+                        }
+                    }
+
                     termView = this
                 }
             },

@@ -79,6 +79,48 @@ Two components:
 - Android APK (native app with embedded Tailscale)
 - Go bridge built via gomobile: `cd android/gobridge && ./build-aar.sh`
 
+## Permission Layers (v2)
+
+### Per-device identity
+- Each `handoff pair` generates a unique Ed25519 key per device
+- Device registry at `~/.handoff/devices.json` tracks all paired devices
+- Device identified by SSH key fingerprint (SHA256:...)
+- Device name auto-detected from Android `Build.MODEL`
+
+### SSH forced command (`handoff gate`)
+- All device SSH keys use `command="handoff gate <fingerprint>"` in authorized_keys
+- Phone can never execute arbitrary commands — only gate protocol commands
+- Protocol: `list`, `windows <session>`, `attach <session> [window]`, `create-session`, `kill-session`, `create-window`, `kill-window`, `pair`, `renew`
+- Gate enforces all permissions server-side: session filtering, read-only, expiry
+
+### Device lifecycle
+```
+PENDING → (verification) → ACTIVE → (expiry) → SOFT_EXPIRED → (renew) → ACTIVE
+                                   → (revoke) → removed
+```
+
+### Two-tier expiry
+- **Soft expiry**: enforced in `handoff gate`, blocks list/attach, allows only `renew`
+- **Hard expiry**: SSH `expiry-time` in authorized_keys = soft + 48h, key truly dies
+- 48h grace window between soft and hard allows phone to request renewal
+
+### Pairing verification
+- Both Mac and phone derive a 6-digit code from `SHA256(fingerprint + nonce)`
+- Mac user must confirm codes match before device is activated
+- 60-second timeout with automatic cleanup on rejection/timeout
+
+### Device management
+- `handoff devices` — list all paired devices with status
+- `handoff devices rm/edit/renew/log` — manage permissions, approve renewals, view audit log
+- Access log at `~/.handoff/access.log` (JSON lines, every gate invocation)
+
+### Android security
+- v2 QR payloads include `device_name` and `nonce` for verification
+- `SshManager` speaks gate protocol (falls back to raw tmux for v1)
+- `GateException` for structured error handling from gate responses
+- Read-only mode hides create/kill UI controls
+- Biometric lock (Phase 8): SSH key in Android Keystore with hardware-backed biometric binding
+
 ## Open questions
 - iOS support? Blink Shell is the best iOS terminal but it's not open source. Could still provide instructions.
 - Should we also support Linux hosts (not just Mac)?

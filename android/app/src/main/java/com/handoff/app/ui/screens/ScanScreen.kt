@@ -1,5 +1,7 @@
 package com.handoff.app.ui.screens
 
+import com.handoff.app.BuildConfig
+
 import android.Manifest
 import android.content.pm.PackageManager
 import android.util.Log
@@ -94,9 +96,12 @@ fun ScanScreen(
                                         scanner.process(image)
                                             .addOnSuccessListener { barcodes ->
                                                 for (barcode in barcodes) {
+                                                    if (BuildConfig.DEBUG) Log.d("Handoff", "Barcode detected: type=${barcode.valueType}, length=${barcode.rawValue?.length ?: 0}")
                                                     if (barcode.valueType == Barcode.TYPE_TEXT) {
                                                         val raw = barcode.rawValue ?: continue
+                                                        if (BuildConfig.DEBUG) Log.d("Handoff", "QR raw (first 80): ${raw.take(80)}")
                                                         val config = parseQrPayload(raw)
+                                                        if (BuildConfig.DEBUG) Log.d("Handoff", "QR parse result: ${if (config != null) "v${config.protocolVersion}" else "null"}")
                                                         if (config != null && !scanned) {
                                                             scanned = true
                                                             onConfigScanned(config)
@@ -178,15 +183,39 @@ fun ScanScreen(
 private fun parseQrPayload(raw: String): ConnectionConfig? {
     return try {
         val json = JSONObject(raw)
-        if (json.optInt("v") != 1) return null
-        ConnectionConfig(
-            ip = json.getString("ip"),
-            user = json.getString("user"),
-            privateKey = json.getString("key"),
-            tmuxPath = json.getString("tmux")
-        )
+        val version = json.optInt("v", 0)
+        when (version) {
+            1 -> ConnectionConfig(
+                ip = json.getString("ip"),
+                user = json.getString("user"),
+                privateKey = json.getString("key"),
+                tmuxPath = json.getString("tmux"),
+                protocolVersion = 1
+            )
+            2 -> {
+                // v2 uses compact keys: i, u, k, t, n
+                val innerKey = json.getString("k")
+                // Reconstruct PEM and base64-encode it for JSch compatibility
+                val pem = "-----BEGIN OPENSSH PRIVATE KEY-----\n" +
+                    innerKey.chunked(70).joinToString("\n") +
+                    "\n-----END OPENSSH PRIVATE KEY-----\n"
+                val pemBase64 = android.util.Base64.encodeToString(
+                    pem.toByteArray(Charsets.UTF_8),
+                    android.util.Base64.NO_WRAP
+                )
+                ConnectionConfig(
+                    ip = json.getString("i"),
+                    user = json.getString("u"),
+                    privateKey = pemBase64,
+                    tmuxPath = json.getString("t"),
+                    protocolVersion = 2,
+                    nonce = json.optString("n", "")
+                )
+            }
+            else -> null
+        }
     } catch (e: Exception) {
-        Log.w("Handoff", "QR parse failed: ${e.message}")
+        if (BuildConfig.DEBUG) Log.w("Handoff", "QR parse failed: ${e.message}", e)
         null
     }
 }
