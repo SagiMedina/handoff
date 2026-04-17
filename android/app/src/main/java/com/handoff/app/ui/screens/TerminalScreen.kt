@@ -116,7 +116,20 @@ fun TerminalScreen(
             override fun shouldUseCtrlSpaceWorkaround(): Boolean = false
             override fun isTerminalViewSelected(): Boolean = true
             override fun copyModeChanged(copyMode: Boolean) {}
-            override fun onKeyDown(keyCode: Int, e: KeyEvent?, session: TerminalSession?): Boolean = false
+            override fun onKeyDown(keyCode: Int, e: KeyEvent?, session: TerminalSession?): Boolean {
+                // Shift+Enter from the soft/hardware keyboard: emit LF instead of CR so
+                // Claude Code treats it as newline-without-submit. We intercept here
+                // BEFORE TerminalView consumes the shift flag in its own handling.
+                if (keyCode == KeyEvent.KEYCODE_ENTER && modifiers.shift) {
+                    modifiers.shift = false
+                    val os = outputStream ?: return true
+                    scope.launch(Dispatchers.IO) {
+                        try { os.write(10); os.flush() } catch (_: Exception) {}
+                    }
+                    return true
+                }
+                return false
+            }
             override fun onKeyUp(keyCode: Int, e: KeyEvent?): Boolean = false
             override fun onLongPress(event: MotionEvent?): Boolean = false
             // Sticky modifiers from the toolbar are consumed here so the next

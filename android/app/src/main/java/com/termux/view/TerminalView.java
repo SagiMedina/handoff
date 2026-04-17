@@ -394,7 +394,14 @@ public final class TerminalView extends View {
                     }
 
                     // Check onKeyDown() for details.
-                    if (mClient.readShiftKey())
+                    boolean shiftDown = mClient.readShiftKey();
+                    // Shift+Enter: emit LF instead of CR so apps (e.g. Claude Code)
+                    // treat it as newline-without-submit.
+                    if (shiftDown && (codePoint == '\n' || codePoint == '\r')) {
+                        inputCodePoint(KEY_EVENT_SOURCE_SOFT_KEYBOARD, 10, false, false);
+                        continue;
+                    }
+                    if (shiftDown)
                         codePoint = Character.toUpperCase(codePoint);
 
                     boolean ctrlHeld = false;
