@@ -24,12 +24,17 @@ targets:
     platform: iOS
     sources:
       - Sources
+      - Resources/Assets.xcassets
     resources:
-      - Resources
+      - path: Resources
+        excludes:
+          - Assets.xcassets
     dependencies:
       - package: SwiftTerm
       - package: swift-nio-ssh
         product: NIOSSH
+      - framework: Frameworks/TailscaleKit.xcframework
+        embed: true
     settings:
       base:
         INFOPLIST_FILE: Resources/Info.plist

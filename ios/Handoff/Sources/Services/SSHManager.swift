@@ -22,25 +22,27 @@ final class SSHManager: ObservableObject {
 
     // MARK: - Connect
 
-    /// Establish an SSH connection to the remote Mac.
+    /// SOCKS5 proxy info for routing SSH through (e.g., Tailscale's loopback).
+    struct SOCKSProxy {
+        let host: String
+        let port: Int
+        let username: String
+        let password: String
+    }
+
+    /// Connect to the remote Mac, optionally tunneled through a SOCKS5 proxy.
+    /// When `proxy` is non-nil, the TCP socket goes to the SOCKS5 server and SOCKS5
+    /// handshakes the actual connection to `config.ip:22`. SSH handlers are added
+    /// only after the SOCKS handshake completes (via PostSOCKSUpgrader).
     /// Waits for both TCP connection AND SSH authentication to complete before returning.
-    func connect(config: ConnectionConfig) async throws {
-        print("[SSH] connect() starting — ip=\(config.ip) user=\(config.user)")
+    func connect(config: ConnectionConfig, proxy: SOCKSProxy? = nil) async throws {
         // Tear down any existing connection to prevent resource leaks on retry
         disconnect()
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
 
-        print("[SSH] parsing OpenSSH key…")
-        let privateKey: Curve25519.Signing.PrivateKey
-        do {
-            privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
-            print("[SSH] key parsed OK")
-        } catch {
-            print("[SSH] key parse FAILED: \(error)")
-            throw error
-        }
+        let privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
         let authDelegate = PublicKeyAuthDelegate(
             username: config.user,
             privateKey: privateKey
@@ -50,60 +52,60 @@ final class SSHManager: ObservableObject {
         let authSuccessPromise = group.next().makePromise(of: Void.self)
         let authWaiter = AuthSuccessHandler(promise: authSuccessPromise)
 
+        let nioSSHHandler = NIOSSHHandler(
+            role: .client(
+                .init(
+                    userAuthDelegate: authDelegate,
+                    serverAuthDelegate: AcceptAllHostKeysDelegate()
+                )
+            ),
+            allocator: ByteBufferAllocator(),
+            inboundChildChannelInitializer: nil
+        )
+
         let bootstrap = ClientBootstrap(group: group)
             .channelInitializer { channel in
-                channel.pipeline.addHandlers([
-                    NIOSSHHandler(
-                        role: .client(
-                            .init(
-                                userAuthDelegate: authDelegate,
-                                serverAuthDelegate: AcceptAllHostKeysDelegate()
-                            )
-                        ),
-                        allocator: channel.allocator,
-                        inboundChildChannelInitializer: nil
-                    ),
-                    authWaiter
-                ])
+                if let proxy {
+                    // SOCKS5 path: handshake first, then PostSOCKSUpgrader installs SSH
+                    let socks = SOCKS5AuthConnectHandler(
+                        username: proxy.username,
+                        password: proxy.password,
+                        targetHost: config.ip,
+                        targetPort: 22
+                    )
+                    let upgrade = PostSOCKSUpgrader(
+                        nioSSHHandler: nioSSHHandler,
+                        authWaiter: authWaiter
+                    )
+                    return channel.pipeline.addHandlers([socks, upgrade])
+                } else {
+                    // Direct path
+                    return channel.pipeline.addHandlers([nioSSHHandler, authWaiter])
+                }
             }
             .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .connectTimeout(.seconds(10))
+            .connectTimeout(.seconds(15))
 
-        print("[SSH] TCP connecting to \(config.ip):22…")
-        let channel: Channel
-        do {
-            channel = try await bootstrap.connect(host: config.ip, port: 22).get()
-            print("[SSH] TCP connected, channel active=\(channel.isActive)")
-        } catch {
-            print("[SSH] TCP connect FAILED: \(error)")
-            throw error
-        }
+        let connectHost = proxy?.host ?? config.ip
+        let connectPort = proxy?.port ?? 22
+        let channel = try await bootstrap.connect(host: connectHost, port: connectPort).get()
         self.parentChannel = channel
 
-        // Get the NIOSSHHandler for creating child channels
-        print("[SSH] fetching NIOSSHHandler from pipeline…")
-        self.sshHandler = try await channel.pipeline.handler(type: NIOSSHHandler.self).get()
-        print("[SSH] got NIOSSHHandler, waiting for UserAuthSuccessEvent…")
+        // We already hold a reference to the NIOSSHHandler we constructed.
+        // Don't query the pipeline — in the SOCKS5 path it isn't installed until
+        // PostSOCKSUpgrader runs after the handshake completes. Use our reference
+        // directly; once the handler is added to the pipeline, it's the same object.
+        self.sshHandler = nioSSHHandler
 
-        // CRITICAL: Wait for UserAuthSuccessEvent before returning.
-        // SwiftNIO SSH fires this event on the parent channel when auth completes.
-        // Without this wait, createChannel calls will fail with ChannelError.connectPending.
-        do {
-            try await authSuccessPromise.futureResult.get()
-            print("[SSH] auth completed! connect() returning")
-        } catch {
-            print("[SSH] auth wait FAILED: \(error)")
-            throw error
-        }
+        // Wait for SSH auth complete
+        try await authSuccessPromise.futureResult.get()
     }
 
     // MARK: - Discovery (one-shot exec)
 
     /// List tmux sessions on the remote Mac.
     func listSessions(tmuxPath: String) async throws -> [TmuxSession] {
-        print("[SSH] listSessions called with tmuxPath=\(tmuxPath)")
         let output = try await executeCommand("\(tmuxPath) list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null")
-        print("[SSH] listSessions output: \(output.prefix(200))")
 
         return output
             .split(separator: "\n")
@@ -119,26 +121,53 @@ final class SSHManager: ObservableObject {
             }
     }
 
-    /// List windows in a tmux session.
+    /// List windows (tabs) in a tmux session.
     func listWindows(tmuxPath: String, session: String) async throws -> [TmuxWindow] {
         let escaped = session.replacingOccurrences(of: "'", with: "'\\''")
-        let output = try await executeCommand("\(tmuxPath) list-windows -t '\(escaped)' -F '#{window_index}|#{pane_title}|#{pane_current_command}' 2>/dev/null")
+        let output = try await executeCommand(
+            "\(tmuxPath) list-windows -t '\(escaped)' -F '#{window_index}|#{pane_title}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null"
+        )
 
         return output
-            .split(separator: "\n")
+            .split(separator: "\n", omittingEmptySubsequences: true)
             .compactMap { line -> TmuxWindow? in
-                let parts = line.split(separator: "|", maxSplits: 2)
-                guard parts.count == 3,
+                let parts = line.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false)
+                guard parts.count >= 3,
                       let index = Int(parts[0]) else { return nil }
 
-                let title = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                let rawTitle = String(parts[1]).trimmingCharacters(in: .whitespaces)
+                let command = String(parts[2]).trimmingCharacters(in: .whitespaces)
+                let rawPath = parts.count >= 4 ? String(parts[3]) : ""
+
+                // Title fallback: pane_title → pane_current_command → "shell"
+                let candidate = rawTitle.isEmpty ? (command.isEmpty ? "shell" : command) : rawTitle
+                // Strip leading non-letter/non-number chars (e.g., Claude Code status glyphs)
+                let title = stripLeadingNonAlphanumeric(candidate)
+
+                // cwd: take basename of the path
+                let trimmedPath = rawPath.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+                let cwd = (trimmedPath as NSString).lastPathComponent == "/" ? "" : (trimmedPath as NSString).lastPathComponent
 
                 return TmuxWindow(
                     index: index,
-                    title: title,
-                    command: String(parts[2])
+                    title: title.isEmpty ? "shell" : title,
+                    command: command,
+                    cwd: cwd
                 )
             }
+    }
+
+    /// Strips leading characters that are not letters or numbers.
+    /// Mirrors Android's regex `^[^\p{L}\p{N}]+`.
+    private func stripLeadingNonAlphanumeric(_ s: String) -> String {
+        var scalars = Array(s.unicodeScalars)
+        while let first = scalars.first,
+              !CharacterSet.letters.contains(first),
+              !CharacterSet.decimalDigits.contains(first) {
+            scalars.removeFirst()
+        }
+        return String(String.UnicodeScalarView(scalars)).trimmingCharacters(in: .whitespaces)
     }
 
     // MARK: - Session/window management
@@ -180,15 +209,12 @@ final class SSHManager: ObservableObject {
     /// on the parent channel's event loop. We use flatSubmit to hop onto the right loop.
     /// NIOSSH internally buffers pending channel creations until SSH auth completes.
     private func executeCommand(_ command: String) async throws -> String {
-        print("[SSH] executeCommand: \(command.prefix(100))")
         guard let parentChannel = self.parentChannel,
               let sshHandler = self.sshHandler else {
-            print("[SSH] executeCommand: NOT CONNECTED")
             throw SSHError.notConnected
         }
 
         return try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<String> in
-            print("[SSH] executeCommand: on event loop, creating child channel")
             let resultPromise = parentChannel.eventLoop.makePromise(of: String.self)
             let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
 
@@ -452,9 +478,7 @@ private final class AuthSuccessHandler: ChannelInboundHandler {
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        print("[SSH] AuthHandler event: \(type(of: event))")
         if event is UserAuthSuccessEvent, let p = promise {
-            print("[SSH] UserAuthSuccessEvent received — fulfilling promise")
             promise = nil
             p.succeed(())
         }
@@ -462,15 +486,13 @@ private final class AuthSuccessHandler: ChannelInboundHandler {
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        print("[SSH] AuthHandler errorCaught: \(error)")
         lastError = error
         context.fireErrorCaught(error)
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
-        print("[SSH] AuthHandler removed (promise still pending: \(promise != nil))")
-        // Safety net: if the handler is being torn down and the promise
-        // was never fulfilled, fail it so EventLoopFuture.deinit doesn't trap.
+        // Safety net: if the handler is torn down and the promise was never fulfilled,
+        // fail it so EventLoopFuture.deinit doesn't trap.
         if let p = promise {
             promise = nil
             p.fail(lastError ?? SSHError.channelError("Connection closed before authentication"))
@@ -527,7 +549,6 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        print("[SSH] ExecChannelHandler channelInactive, buffer size=\(buffer.count)")
         if !promiseCompleted {
             promiseCompleted = true
             let output = String(data: buffer, encoding: .utf8) ?? ""
@@ -536,7 +557,6 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        print("[SSH] ExecChannelHandler errorCaught: \(error)")
         if !promiseCompleted {
             promiseCompleted = true
             promise.fail(error)

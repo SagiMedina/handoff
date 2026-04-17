@@ -1,7 +1,8 @@
 import SwiftUI
 
-/// Displays a tmux session with its windows as tappable rows.
-/// Supports: tap window to open, long-press window to kill, kill session, new window.
+/// Displays a tmux session with its tabs (windows) as tappable rows.
+/// Matches Sagi's polish (commit 967587d): cwd per tab, long-press on header
+/// to kill session, dashed-border "+ new tab", wrapped titles, thin card border.
 struct SessionCard: View {
     let session: TmuxSession
     let onSelectWindow: (TmuxWindow) -> Void
@@ -12,96 +13,79 @@ struct SessionCard: View {
     @State private var showKillSessionDialog = false
     @State private var windowToKill: TmuxWindow?
 
+    private var tabsLabel: String { session.windowCount == 1 ? "tab" : "tabs" }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
-            // Session header
-            HStack {
-                Image(systemName: "terminal")
+            // Session header — long-press to kill
+            HStack(spacing: 8) {
+                Text("●")
                     .foregroundColor(Theme.green)
+                    .font(.system(size: 10))
                 Text(session.name)
-                    .font(.headline)
+                    .font(.system(size: 17, weight: .semibold))
                     .foregroundColor(Theme.text)
-                Spacer()
-                Text("\(session.windowCount) window\(session.windowCount == 1 ? "" : "s")")
-                    .font(.caption)
+                Text("\(session.windowCount) \(tabsLabel)")
+                    .font(.system(size: 12))
                     .foregroundColor(Theme.textSecondary)
-                Button {
-                    showKillSessionDialog = true
-                } label: {
-                    Text("Kill")
-                        .font(.caption)
-                        .foregroundColor(Theme.red)
-                }
+                Spacer()
             }
-            .padding()
+            .padding(.horizontal, 16)
+            .padding(.top, 16)
+            .contentShape(Rectangle())
+            .onLongPressGesture {
+                showKillSessionDialog = true
+            }
 
-            Divider()
-                .background(Theme.border)
+            Spacer().frame(height: 10)
 
-            // Window list
-            ForEach(session.windows) { window in
-                Button {
-                    onSelectWindow(window)
-                } label: {
-                    HStack {
-                        Text("\(window.index)")
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(Theme.textSecondary)
-                            .frame(width: 24)
-                        Text(window.displayName)
-                            .font(.body)
-                            .foregroundColor(Theme.text)
-                        Spacer()
-                        Image(systemName: "chevron.right")
-                            .font(.caption)
-                            .foregroundColor(Theme.textSecondary)
+            // Tab list
+            if !session.windows.isEmpty {
+                ForEach(Array(session.windows.enumerated()), id: \.element.id) { idx, window in
+                    if idx > 0 {
+                        Rectangle()
+                            .fill(Theme.textSecondary.opacity(0.12))
+                            .frame(height: 0.5)
+                            .padding(.horizontal, 24)
                     }
-                    .padding(.horizontal)
-                    .padding(.vertical, 14)
-                    .contentShape(Rectangle())
-                }
-                .contextMenu {
-                    Button(role: .destructive) {
-                        windowToKill = window
-                    } label: {
-                        Label("Kill Window", systemImage: "xmark.circle")
-                    }
-                }
-
-                if window.id != session.windows.last?.id {
-                    Divider()
-                        .background(Theme.border)
-                        .padding(.leading, 48)
+                    WindowRow(
+                        window: window,
+                        onTap: { onSelectWindow(window) },
+                        onLongPress: { windowToKill = window }
+                    )
                 }
             }
 
-            // New window link
-            Divider()
-                .background(Theme.border)
+            Spacer().frame(height: 8)
 
-            Button {
-                onNewWindow()
-            } label: {
-                HStack {
-                    Image(systemName: "plus")
-                        .font(.caption)
-                    Text("new window")
-                        .font(.system(.body, design: .monospaced))
-                }
-                .foregroundColor(Theme.primary)
-                .padding(.horizontal)
-                .padding(.vertical, 14)
+            // "+ new tab" button — dashed border, distinct from list items
+            Button(action: onNewWindow) {
+                Text("+ new tab")
+                    .font(.system(size: 13, design: .monospaced))
+                    .foregroundColor(Theme.primary.opacity(0.7))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(
+                        RoundedRectangle(cornerRadius: 8)
+                            .strokeBorder(
+                                Theme.primary.opacity(0.35),
+                                style: StrokeStyle(lineWidth: 1, dash: [6, 4])
+                            )
+                    )
             }
+            .buttonStyle(.plain)
+            .padding(.horizontal, 16)
+            .padding(.bottom, 16)
         }
         .background(Theme.surface)
-        .cornerRadius(12)
+        .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(
             RoundedRectangle(cornerRadius: 12)
-                .stroke(Theme.border, lineWidth: 1)
+                .stroke(Theme.textSecondary.opacity(0.15), lineWidth: 0.5)
         )
         // Kill session confirmation
         .confirmationDialog(
-            "Kill Session",
+            "Kill session?",
             isPresented: $showKillSessionDialog,
             titleVisibility: .visible
         ) {
@@ -110,11 +94,11 @@ struct SessionCard: View {
             }
             Button("Cancel", role: .cancel) {}
         } message: {
-            Text("This will close all windows in this session. Any running processes will be terminated.")
+            Text("This will close all \(session.windowCount) \(tabsLabel) in \"\(session.name)\".")
         }
-        // Kill window confirmation
+        // Kill tab confirmation
         .confirmationDialog(
-            "Kill Window",
+            "Kill tab?",
             isPresented: Binding(
                 get: { windowToKill != nil },
                 set: { if !$0 { windowToKill = nil } }
@@ -131,7 +115,50 @@ struct SessionCard: View {
                 windowToKill = nil
             }
         } message: {
-            Text("Any running process in this window will be terminated.")
+            if let window = windowToKill {
+                Text("Close \"\(window.displayName)\" in session \"\(session.name)\"?")
+            }
+        }
+    }
+}
+
+/// Two-line row: title + dimmed cwd. Tap to open, long-press to kill.
+private struct WindowRow: View {
+    let window: TmuxWindow
+    let onTap: () -> Void
+    let onLongPress: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 6) {
+                    Text("›")
+                        .font(.system(size: 16, design: .monospaced))
+                        .foregroundColor(Theme.textSecondary)
+                    Text(window.displayName)
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(Theme.text)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if !window.cwd.isEmpty {
+                    Text("~/\(window.cwd)")
+                        .font(.system(size: 11, design: .monospaced))
+                        .foregroundColor(Theme.textSecondary.opacity(0.6))
+                        .lineLimit(1)
+                        .padding(.leading, 22)
+                }
+            }
+            .padding(.horizontal, 24)
+            .padding(.vertical, 10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .onLongPressGesture {
+            onLongPress()
         }
     }
 }

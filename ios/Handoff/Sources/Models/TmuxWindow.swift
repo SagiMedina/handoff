@@ -1,11 +1,12 @@
 import Foundation
 
-/// A window within a tmux session.
-/// Parsed from: tmux list-windows -t '$session' -F '#{window_index}|#{pane_title}|#{pane_current_command}'
+/// A window (tab) within a tmux session.
+/// Parsed from: tmux list-windows -t '$session' -F '#{window_index}|#{pane_title}|#{pane_current_command}|#{pane_current_path}'
 struct TmuxWindow: Identifiable {
     let index: Int
     let title: String
     let command: String
+    let cwd: String
 
     var id: Int { index }
 
@@ -15,5 +16,12 @@ struct TmuxWindow: Identifiable {
             return title
         }
         return command
+    }
+
+    init(index: Int, title: String, command: String, cwd: String = "") {
+        self.index = index
+        self.title = title
+        self.command = command
+        self.cwd = cwd
     }
 }

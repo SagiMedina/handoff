@@ -8,6 +8,7 @@ import UIKit
 struct TerminalView: View {
     let sessionName: String
     let windowIndex: Int
+    var tailscale: TailscaleManager
 
     @EnvironmentObject var configStore: ConfigStore
     @Environment(\.scenePhase) private var scenePhase
@@ -63,12 +64,14 @@ struct TerminalView: View {
         .navigationBarTitleDisplayMode(.inline)
         .toolbarColorScheme(.dark, for: .navigationBar)
         .onAppear {
-            // Reuse existing terminal if one is already active for this session/window
-            if let existing = TerminalSessionStore.shared.get(key) {
-                print("[Term] reusing existing terminal for \(sessionName):\(windowIndex)")
+            // Reuse existing terminal only if its SSH is still alive.
+            // Stale connections (idle timeout, brief iOS suspend) need fresh reconnect.
+            if let existing = TerminalSessionStore.shared.get(key), existing.sshManager.isConnected {
                 activeTerminal = existing
                 isConnecting = false
             } else {
+                // Drop any stale terminal in the store before connecting fresh.
+                TerminalSessionStore.shared.close(key)
                 connectAndAttach()
             }
         }
@@ -136,7 +139,16 @@ struct TerminalView: View {
         let task = Task { @MainActor in
             do {
                 let sshManager = SSHManager()
-                try await sshManager.connect(config: config)
+                guard let proxyConfig = tailscale.proxyConfig else {
+                    throw TailscaleError.notConnected
+                }
+                let proxy = SSHManager.SOCKSProxy(
+                    host: proxyConfig.host,
+                    port: proxyConfig.port,
+                    username: proxyConfig.username,
+                    password: proxyConfig.password
+                )
+                try await sshManager.connect(config: config, proxy: proxy)
                 try Task.checkCancellation()
 
                 let handler = try await sshManager.openTerminal(
