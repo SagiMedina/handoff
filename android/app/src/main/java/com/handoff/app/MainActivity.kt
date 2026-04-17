@@ -132,22 +132,10 @@ class MainActivity : FragmentActivity() {
                                     val savedConfig = config ?: configStore.load()
                                     if (savedConfig != null) config = savedConfig
                                     val pv = savedConfig?.protocolVersion ?: 1
-                                    // v2: try a quick list to see if already verified
-                                    // If list works, device is active — skip verify, go to sessions
-                                    // If list fails with pending, go to verify
-                                    var dest = if (pv >= 2) "verify" else "sessions"
-                                    if (pv >= 2 && savedConfig != null) {
-                                        try {
-                                            val proxyPort = tailscaleManager.startProxy(savedConfig.ip)
-                                            sshManager.connect(savedConfig, proxyPort)
-                                            sshManager.listSessions(savedConfig.tmuxPath)
-                                            dest = "sessions"  // already active
-                                            Log.d("Handoff", "Nav: device already active, skipping verify")
-                                        } catch (_: Exception) {
-                                            // Not active yet, need verify
-                                            sshManager.disconnect()
-                                        }
-                                    }
+                                    // v1: go straight to sessions. v2: go through verify,
+                                    // which internally checks if device is already active
+                                    // (list-first) and skips the pair code if so.
+                                    val dest = if (pv >= 2) "verify" else "sessions"
                                     Log.d("Handoff", "Nav: tailscale authenticated, config=${if (savedConfig != null) "v$pv" else "null"}, navigating to $dest")
                                     navController.navigate(dest) {
                                         popUpTo("tailscale_auth") { inclusive = true }

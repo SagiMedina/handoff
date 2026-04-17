@@ -44,8 +44,20 @@ fun VerificationScreen(
                 if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: connecting SSH")
                 sshManager.connect(config, proxyPort)
 
-                // Send pair command to gate
+                // List-first: if device is already active, skip pairing entirely.
+                // Gate returns "error:pending" for pending devices, allowing through otherwise.
                 status = "Verifying with Mac..."
+                try {
+                    sshManager.listSessions(config.tmuxPath)
+                    if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: device already active")
+                    onVerified()
+                    return@launch
+                } catch (e: GateException) {
+                    if (e.gateError != "error:pending") throw e
+                    // Pending — fall through to pair flow
+                }
+
+                // Send pair command to gate (only for pending devices)
                 if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: sending pair command")
                 val response = sshManager.sendPairCommand()
                 if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: pair response=$response")

@@ -183,8 +183,12 @@ class SshManager {
         pendingResize?.let { resizeHandler.removeCallbacks(it) }
         pendingResize = Runnable {
             val ch = shellChannel ?: return@Runnable
-            if (BuildConfig.DEBUG) Log.d("Handoff", "resizeShell: ${cols}x${rows}")
-            ch.setPtySize(cols, rows, cols * 8, rows * 16)
+            try {
+                if (BuildConfig.DEBUG) Log.d("Handoff", "resizeShell: ${cols}x${rows}")
+                ch.setPtySize(cols, rows, cols * 8, rows * 16)
+            } catch (e: Exception) {
+                if (BuildConfig.DEBUG) Log.w("Handoff", "resizeShell failed: ${e.message}")
+            }
         }
         resizeHandler.postDelayed(pendingResize!!, 150)
     }

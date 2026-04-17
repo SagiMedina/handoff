@@ -27,8 +27,10 @@ import com.handoff.app.ui.components.SessionCard
 import com.handoff.app.ui.theme.HandoffAmber
 import com.handoff.app.ui.theme.HandoffAmberDim
 import com.handoff.app.ui.theme.HandoffGreen
+import android.util.Log
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 
 @Composable
 fun SessionsScreen(
@@ -49,14 +51,29 @@ fun SessionsScreen(
     var readOnly by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
 
-    fun refresh(showLoading: Boolean = true) {
+    fun refresh(showLoading: Boolean = true, forceReconnect: Boolean = false) {
         scope.launch {
             if (showLoading) loading = true
             error = null
             try {
+                if (forceReconnect) {
+                    // Force clean state — stale connections won't recover otherwise
+                    sshManager.disconnect()
+                    tailscaleManager.stopProxy()
+                }
                 if (!sshManager.isConnected) {
-                    val proxyPort = tailscaleManager.startProxy(config.ip)
-                    sshManager.connect(config, proxyPort)
+                    try {
+                        val proxyPort = tailscaleManager.startProxy(config.ip)
+                        sshManager.connect(config, proxyPort)
+                    } catch (e: Exception) {
+                        // Tailscale tunnel may be stale after backgrounding — restart it
+                        Log.d("Handoff", "Reconnect failed, restarting Tailscale: ${e.message}")
+                        sshManager.disconnect()
+                        tailscaleManager.stop()
+                        withTimeout(15_000) { tailscaleManager.start() }
+                        val proxyPort = tailscaleManager.startProxy(config.ip)
+                        sshManager.connect(config, proxyPort)
+                    }
                 }
                 val rawSessions = sshManager.listSessions(config.tmuxPath)
 
@@ -81,9 +98,11 @@ fun SessionsScreen(
             } catch (e: GateException) {
                 error = friendlyGateError(e.gateError)
                 sshManager.disconnect()
+                tailscaleManager.stopProxy()
             } catch (e: Exception) {
                 error = friendlyConnectionError(e)
                 sshManager.disconnect()
+                tailscaleManager.stopProxy()
             } finally {
                 if (showLoading) loading = false
             }
@@ -92,10 +111,10 @@ fun SessionsScreen(
 
     LaunchedEffect(Unit) {
         refresh()
-        // Auto-refresh every 5 seconds while screen is visible
+        // Auto-refresh every 5 seconds while screen is visible and connected
         while (true) {
             delay(5000)
-            if (!loading) refresh(showLoading = false)
+            if (!loading && error == null) refresh(showLoading = false)
         }
     }
 
@@ -162,7 +181,7 @@ fun SessionsScreen(
             }
 
             Row(horizontalArrangement = Arrangement.spacedBy(4.dp)) {
-                TextButton(onClick = { refresh() }) {
+                TextButton(onClick = { refresh(forceReconnect = true) }) {
                     Text("Refresh")
                 }
                 TextButton(onClick = onSettings) {
@@ -210,7 +229,7 @@ fun SessionsScreen(
                             style = MaterialTheme.typography.bodyLarge
                         )
                         Spacer(modifier = Modifier.height(16.dp))
-                        Button(onClick = { refresh() }) {
+                        Button(onClick = { refresh(forceReconnect = true) }) {
                             Text("Retry")
                         }
                     }

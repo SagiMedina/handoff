@@ -263,6 +263,18 @@ fun TerminalScreen(
                     isFocusable = true
                     isFocusableInTouchMode = true
                     keepScreenOn = true
+
+                    // Compose's imePadding() changes this view's bounds when the
+                    // keyboard shows/hides, but onSizeChanged may not fire reliably
+                    // through AndroidView. Explicitly trigger terminal resize.
+                    addOnLayoutChangeListener { v, left, top, right, bottom,
+                                                oldLeft, oldTop, oldRight, oldBottom ->
+                        if ((right - left) != (oldRight - oldLeft) ||
+                            (bottom - top) != (oldBottom - oldTop)) {
+                            v.post { (v as TerminalView).updateSize() }
+                        }
+                    }
+
                     termView = this
                 }
             },
