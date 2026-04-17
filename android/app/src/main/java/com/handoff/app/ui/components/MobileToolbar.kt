@@ -49,7 +49,7 @@ data class ToolbarKey(
     override fun hashCode(): Int = 31 * label.hashCode() + bytes.contentHashCode()
 }
 
-// Row 1: ESC  /    -    HOME  UP   END   PGUP
+// Row 1: ESC  /    -    HOME  UP   END   ENTER
 // Row 2: TAB  CTRL ALT  LEFT  DOWN RIGHT SHIFT
 private val ROW1 = listOf(
     ToolbarKey("ESC", byteArrayOf(27)),
@@ -58,7 +58,7 @@ private val ROW1 = listOf(
     ToolbarKey("HOME", byteArrayOf(27, 91, 72)),           // ESC [ H
     ToolbarKey("\u2191", byteArrayOf(27, 91, 65)),          // UP
     ToolbarKey("END", byteArrayOf(27, 91, 70)),             // ESC [ F
-    ToolbarKey("PGUP", byteArrayOf(27, 91, 53, 126)),      // ESC [ 5 ~
+    ToolbarKey("\u21B5", byteArrayOf(13)),                  // ENTER (CR)
 )
 
 private val ROW2 = listOf(
