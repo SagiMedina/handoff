@@ -16,6 +16,26 @@ import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 
+/**
+ * Sticky-key modifier state shared between the toolbar and TerminalView. Tapping a
+ * modifier on the toolbar flips the flag; the next keystroke (from the toolbar OR the
+ * soft/hardware keyboard) reads and clears the flag, so e.g. tapping SHIFT then pressing
+ * Enter on the soft keyboard produces Shift+Enter as far as the terminal is concerned.
+ *
+ * TerminalView already consults read{Shift,Control,Alt,Fn}Key() on every input path
+ * (commitText, sendKeyEvent, inputCodePoint, onKeyDown), so wiring the client to consume
+ * from this state is enough to make modifiers chain across both input sources.
+ */
+class ModifierState {
+    var ctrl by mutableStateOf(false)
+    var alt by mutableStateOf(false)
+    var shift by mutableStateOf(false)
+
+    fun consumeCtrl(): Boolean = ctrl.also { if (it) ctrl = false }
+    fun consumeAlt(): Boolean = alt.also { if (it) alt = false }
+    fun consumeShift(): Boolean = shift.also { if (it) shift = false }
+}
+
 data class ToolbarKey(
     val label: String,
     val bytes: ByteArray,
@@ -29,9 +49,8 @@ data class ToolbarKey(
     override fun hashCode(): Int = 31 * label.hashCode() + bytes.contentHashCode()
 }
 
-// Matches Termux default extra keys layout:
-// Row 1: ESC  /  -  HOME  UP    END  PGUP
-// Row 2: TAB  CTRL ALT LEFT DOWN RIGHT PGDN
+// Row 1: ESC  /    -    HOME  UP   END   PGUP
+// Row 2: TAB  CTRL ALT  LEFT  DOWN RIGHT SHIFT
 private val ROW1 = listOf(
     ToolbarKey("ESC", byteArrayOf(27)),
     ToolbarKey("/", "/".toByteArray()),
@@ -49,37 +68,50 @@ private val ROW2 = listOf(
     ToolbarKey("\u2190", byteArrayOf(27, 91, 68)),          // LEFT
     ToolbarKey("\u2193", byteArrayOf(27, 91, 66)),          // DOWN
     ToolbarKey("\u2192", byteArrayOf(27, 91, 67)),          // RIGHT
-    ToolbarKey("PGDN", byteArrayOf(27, 91, 54, 126)),      // ESC [ 6 ~
+    ToolbarKey("SHIFT", byteArrayOf()),  // modifier toggle
 )
+
+/**
+ * Apply SHIFT modifier to bytes emitted from the toolbar's own keys.
+ *   - Shift+Tab (9)               -> ESC [ Z  (backtab)
+ *   - Shift+Arrow (ESC [ A-D)     -> ESC [ 1 ; 2 <letter>  (text selection)
+ */
+private fun applyShift(bytes: ByteArray): ByteArray {
+    if (bytes.size == 1 && bytes[0] == 9.toByte()) {
+        return byteArrayOf(27, 91, 90)
+    }
+    if (bytes.size == 3 && bytes[0] == 27.toByte() && bytes[1] == 91.toByte()) {
+        val letter = bytes[2]
+        if (letter in byteArrayOf(65, 66, 67, 68)) {
+            return byteArrayOf(27, 91, 49, 59, 50, letter)
+        }
+    }
+    return bytes
+}
 
 @Composable
 fun MobileToolbar(
+    modifiers: ModifierState,
     onKey: (ByteArray) -> Unit,
     modifier: Modifier = Modifier
 ) {
-    var ctrlActive by remember { mutableStateOf(false) }
-    var altActive by remember { mutableStateOf(false) }
-
     Column(
         modifier = modifier
             .fillMaxWidth()
             .background(MaterialTheme.colorScheme.surfaceVariant)
             .padding(horizontal = 2.dp, vertical = 4.dp)
     ) {
-        ToolbarRow(ROW1, ctrlActive, altActive, onKey, { ctrlActive = it }, { altActive = it })
+        ToolbarRow(ROW1, modifiers, onKey)
         Spacer(modifier = Modifier.height(2.dp))
-        ToolbarRow(ROW2, ctrlActive, altActive, onKey, { ctrlActive = it }, { altActive = it })
+        ToolbarRow(ROW2, modifiers, onKey)
     }
 }
 
 @Composable
 private fun ToolbarRow(
     keys: List<ToolbarKey>,
-    ctrlActive: Boolean,
-    altActive: Boolean,
+    modifiers: ModifierState,
     onKey: (ByteArray) -> Unit,
-    setCtrl: (Boolean) -> Unit,
-    setAlt: (Boolean) -> Unit,
 ) {
     Row(
         modifier = Modifier.fillMaxWidth(),
@@ -89,11 +121,8 @@ private fun ToolbarRow(
         keys.forEach { key ->
             ToolbarButton(
                 key = key,
-                ctrlActive = ctrlActive,
-                altActive = altActive,
+                modifiers = modifiers,
                 onKey = onKey,
-                setCtrl = setCtrl,
-                setAlt = setAlt,
                 modifier = Modifier.weight(1f)
             )
         }
@@ -104,16 +133,16 @@ private fun ToolbarRow(
 @Composable
 private fun ToolbarButton(
     key: ToolbarKey,
-    ctrlActive: Boolean,
-    altActive: Boolean,
+    modifiers: ModifierState,
     onKey: (ByteArray) -> Unit,
-    setCtrl: (Boolean) -> Unit,
-    setAlt: (Boolean) -> Unit,
     modifier: Modifier = Modifier
 ) {
     val isCtrl = key.label == "CTRL"
     val isAlt = key.label == "ALT"
-    val isActive = (isCtrl && ctrlActive) || (isAlt && altActive)
+    val isShift = key.label == "SHIFT"
+    val isActive = (isCtrl && modifiers.ctrl) ||
+                   (isAlt && modifiers.alt) ||
+                   (isShift && modifiers.shift)
 
     val bgColor = if (isActive) MaterialTheme.colorScheme.primary
                   else MaterialTheme.colorScheme.surface
@@ -128,18 +157,20 @@ private fun ToolbarButton(
             .combinedClickable(
                 onClick = {
                     when {
-                        isCtrl -> setCtrl(!ctrlActive)
-                        isAlt -> setAlt(!altActive)
+                        isCtrl -> modifiers.ctrl = !modifiers.ctrl
+                        isAlt -> modifiers.alt = !modifiers.alt
+                        isShift -> modifiers.shift = !modifiers.shift
                         else -> {
                             var bytes = key.bytes
-                            if (ctrlActive && bytes.size == 1) {
+                            if (modifiers.consumeCtrl() && bytes.size == 1) {
                                 bytes = byteArrayOf((bytes[0].toInt() and 0x1F).toByte())
-                                setCtrl(false)
                             }
-                            if (altActive) {
+                            if (modifiers.consumeShift()) {
+                                bytes = applyShift(bytes)
+                            }
+                            if (modifiers.consumeAlt()) {
                                 // Alt sends ESC prefix
                                 onKey(byteArrayOf(27))
-                                setAlt(false)
                             }
                             onKey(bytes)
                         }

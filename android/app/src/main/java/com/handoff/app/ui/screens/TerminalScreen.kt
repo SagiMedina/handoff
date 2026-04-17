@@ -33,6 +33,7 @@ import com.handoff.app.data.TailscaleManager
 import com.handoff.app.ui.theme.HandoffAmber
 import com.handoff.app.ui.theme.HandoffAmberDim
 import com.handoff.app.ui.components.MobileToolbar
+import com.handoff.app.ui.components.ModifierState
 import com.termux.terminal.TerminalSession
 import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
@@ -56,6 +57,7 @@ fun TerminalScreen(
     var outputStream by remember { mutableStateOf<OutputStream?>(null) }
     var termView by remember { mutableStateOf<TerminalView?>(null) }
     val terminalSsh = remember { SshManager() }
+    val modifiers = remember { ModifierState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
 
@@ -117,9 +119,12 @@ fun TerminalScreen(
             override fun onKeyDown(keyCode: Int, e: KeyEvent?, session: TerminalSession?): Boolean = false
             override fun onKeyUp(keyCode: Int, e: KeyEvent?): Boolean = false
             override fun onLongPress(event: MotionEvent?): Boolean = false
-            override fun readControlKey(): Boolean = false
-            override fun readAltKey(): Boolean = false
-            override fun readShiftKey(): Boolean = false
+            // Sticky modifiers from the toolbar are consumed here so the next
+            // input from the soft/hardware keyboard picks them up (Shift+Enter,
+            // Ctrl+C via CTRL-then-C on keyboard, Alt+letter for word-jump, etc.).
+            override fun readControlKey(): Boolean = modifiers.consumeCtrl()
+            override fun readAltKey(): Boolean = modifiers.consumeAlt()
+            override fun readShiftKey(): Boolean = modifiers.consumeShift()
             override fun readFnKey(): Boolean = false
             override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession?): Boolean = false
             override fun onEmulatorSet() {
@@ -266,6 +271,7 @@ fun TerminalScreen(
         )
 
         MobileToolbar(
+            modifiers = modifiers,
             onKey = { bytes ->
                 scope.launch(Dispatchers.IO) {
                     val os = outputStream ?: return@launch
