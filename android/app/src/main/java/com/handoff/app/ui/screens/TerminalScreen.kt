@@ -2,7 +2,6 @@ package com.handoff.app.ui.screens
 
 import com.handoff.app.BuildConfig
 
-import android.content.ClipboardManager
 import android.content.Context
 import android.graphics.Typeface
 import android.util.Log
@@ -23,83 +22,39 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.background
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
+import com.handoff.app.data.TerminalSessionHolder
 import com.handoff.app.ui.theme.HandoffAmber
 import com.handoff.app.ui.theme.HandoffAmberDim
 import com.handoff.app.ui.components.MobileToolbar
 import com.handoff.app.ui.components.ModifierState
 import com.termux.terminal.TerminalSession
-import com.termux.terminal.TerminalSessionClient
 import com.termux.view.TerminalView
 import com.termux.view.TerminalViewClient
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
-import java.io.OutputStream
 
 @Composable
 fun TerminalScreen(
     config: ConnectionConfig,
     sshManager: SshManager,
     tailscaleManager: TailscaleManager,
+    terminalHolder: TerminalSessionHolder,
     sessionName: String,
     windowIndex: Int,
     onDisconnect: () -> Unit
 ) {
-    var sshReady by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
-    var outputStream by remember { mutableStateOf<OutputStream?>(null) }
     var termView by remember { mutableStateOf<TerminalView?>(null) }
-    val terminalSsh = remember { SshManager() }
     val modifiers = remember { ModifierState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
-
-    val sessionClient = remember {
-        object : TerminalSessionClient {
-            override fun onTextChanged(changedSession: TerminalSession) {
-                val view = termView
-                if (view != null) {
-                    view.onScreenUpdated()
-                } else {
-                    if (BuildConfig.DEBUG) Log.w("Handoff", "onTextChanged but termView is null!")
-                }
-            }
-            override fun onTitleChanged(changedSession: TerminalSession) {}
-            override fun onSessionFinished(finishedSession: TerminalSession) {}
-            override fun onBell(session: TerminalSession) {}
-            override fun onColorsChanged(session: TerminalSession) {
-                termView?.invalidate()
-            }
-            override fun onCopyTextToClipboard(session: TerminalSession, text: String?) {
-                if (text != null) {
-                    val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                    clip.setPrimaryClip(android.content.ClipData.newPlainText("terminal", text))
-                }
-            }
-            override fun onPasteTextFromClipboard(session: TerminalSession?) {
-                val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
-                val text = clip.primaryClip?.getItemAt(0)?.text?.toString()
-                if (text != null) session?.getEmulator()?.paste(text)
-            }
-            override fun onTerminalCursorStateChange(state: Boolean) {}
-            override fun setTerminalShellPid(session: TerminalSession, pid: Int) {}
-            override fun getTerminalCursorStyle(): Int = 0
-            override fun logError(tag: String?, message: String?) { if (BuildConfig.DEBUG) Log.e(tag ?: "Handoff", message ?: "") }
-            override fun logWarn(tag: String?, message: String?) {}
-            override fun logInfo(tag: String?, message: String?) {}
-            override fun logDebug(tag: String?, message: String?) {}
-            override fun logVerbose(tag: String?, message: String?) {}
-            override fun logStackTraceWithMessage(tag: String?, message: String?, e: Exception?) {}
-            override fun logStackTrace(tag: String?, e: Exception?) {}
-        }
-    }
 
     val viewClient = remember {
         object : TerminalViewClient {
@@ -118,11 +73,10 @@ fun TerminalScreen(
             override fun copyModeChanged(copyMode: Boolean) {}
             override fun onKeyDown(keyCode: Int, e: KeyEvent?, session: TerminalSession?): Boolean {
                 // Shift+Enter from the soft/hardware keyboard: emit LF instead of CR so
-                // Claude Code treats it as newline-without-submit. We intercept here
-                // BEFORE TerminalView consumes the shift flag in its own handling.
+                // Claude Code treats it as newline-without-submit.
                 if (keyCode == KeyEvent.KEYCODE_ENTER && modifiers.shift) {
                     modifiers.shift = false
-                    val os = outputStream ?: return true
+                    val os = terminalHolder.outputStream ?: return true
                     scope.launch(Dispatchers.IO) {
                         try { os.write(10); os.flush() } catch (_: Exception) {}
                     }
@@ -132,9 +86,6 @@ fun TerminalScreen(
             }
             override fun onKeyUp(keyCode: Int, e: KeyEvent?): Boolean = false
             override fun onLongPress(event: MotionEvent?): Boolean = false
-            // Sticky modifiers from the toolbar are consumed here so the next
-            // input from the soft/hardware keyboard picks them up (Shift+Enter,
-            // Ctrl+C via CTRL-then-C on keyboard, Alt+letter for word-jump, etc.).
             override fun readControlKey(): Boolean = modifiers.consumeCtrl()
             override fun readAltKey(): Boolean = modifiers.consumeAlt()
             override fun readShiftKey(): Boolean = modifiers.consumeShift()
@@ -142,9 +93,8 @@ fun TerminalScreen(
             override fun onCodePoint(codePoint: Int, ctrlDown: Boolean, session: TerminalSession?): Boolean = false
             override fun onEmulatorSet() {
                 termView?.let { view ->
-                    // Notify SSH of the terminal size once emulator is ready
                     val emulator = view.mEmulator ?: return
-                    terminalSsh.resizeShell(emulator.mColumns, emulator.mRows)
+                    terminalHolder.sshManager.resizeShell(emulator.mColumns, emulator.mRows)
                 }
             }
             override fun logError(tag: String?, message: String?) {}
@@ -157,52 +107,29 @@ fun TerminalScreen(
         }
     }
 
-    // Clean up terminal SSH on leave
+    // On leaving the screen, just detach the view — the holder keeps the SSH channel,
+    // emulator, and reader thread alive so re-entry is instant and scrollback survives.
     DisposableEffect(Unit) {
-        onDispose { terminalSsh.disconnect() }
+        onDispose {
+            if (terminalHolder.currentView === termView) {
+                terminalHolder.currentView = null
+            }
+        }
     }
 
-    // Connect SSH at full (keyboard-down) size, THEN show the keyboard.
-    // The PTY stays fixed for the life of the channel — post-connect setPtySize
-    // kills the SSH connection (see SshManager.resizeShell).
-    LaunchedEffect(Unit) {
+    LaunchedEffect(sessionName, windowIndex) {
         while (termView == null) { delay(50) }
         val view = termView!!
-
-        // Wait for the view to have its full (no-keyboard) dimensions.
         while (view.width == 0 || view.height == 0) { delay(50) }
 
-        val session = TerminalSession(sessionClient)
-        val renderer = view.mRenderer
-        val cols = (view.width / renderer.fontWidth).toInt().coerceAtLeast(4)
-        val rows = (view.height / renderer.fontLineSpacing).coerceAtLeast(4)
-        session.initializeEmulator(cols, rows, renderer.fontWidth.toInt(), renderer.fontLineSpacing)
-        view.attachSession(session)
-        // Lock the emulator size — the remote PTY is fixed at these dims for the life of
-        // the channel, so letting the local emulator shrink on keyboard-show would
-        // desync the grid with tmux's output and produce garbled rendering.
-        view.sizeLocked = true
-
-        val emulator = view.mEmulator
-        val actualCols = emulator?.mColumns ?: cols
-        val actualRows = emulator?.mRows ?: rows
-        if (BuildConfig.DEBUG) Log.d("Handoff", "Terminal: ${actualCols}x${actualRows} (full size)")
-
         try {
-            val proxyPort = tailscaleManager.getProxyPort().let { port ->
-                if (port > 0) port else tailscaleManager.startProxy(config.ip)
-            }
-            terminalSsh.connect(config, proxyPort)
-            val (input, output) = terminalSsh.openShell(
-                config.tmuxPath, sessionName, windowIndex, actualCols, actualRows
+            val (cols, rows) = terminalHolder.connectAndAttach(
+                config, sessionName, windowIndex, view, tailscaleManager
             )
-            outputStream = output
-            session.setOutputStream(output)
-            session.startReading(input)
-            sshReady = true
-            if (BuildConfig.DEBUG) Log.d("Handoff", "SSH ready")
+            terminalHolder.currentView = view
+            if (BuildConfig.DEBUG) Log.d("Handoff", "Terminal attached: ${cols}x${rows}")
 
-            // Show the keyboard only AFTER SSH is up and the PTY size is locked in.
+            // Show the keyboard after we're attached.
             view.post {
                 view.requestFocus()
                 val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
@@ -239,7 +166,6 @@ fun TerminalScreen(
         .windowInsetsPadding(WindowInsets.statusBars)
         .imePadding()
     ) {
-        // Read-only indicator bar
         if (isReadOnly) {
             Row(
                 modifier = Modifier
@@ -269,14 +195,11 @@ fun TerminalScreen(
                 TerminalView(ctx, null).apply {
                     setTerminalViewClient(viewClient)
                     setTextSize(24)
-                    // JetBrains Mono for broad Unicode coverage (❯, ●, box drawing, etc.)
-                    // Android's font fallback handles remaining chars (braille, dingbats).
                     val font = Typeface.createFromAsset(ctx.assets, "JetBrainsMono-Regular.ttf")
                     setTypeface(font)
                     isFocusable = true
                     isFocusableInTouchMode = true
                     keepScreenOn = true
-
                     termView = this
                 }
             },
@@ -287,7 +210,7 @@ fun TerminalScreen(
             modifiers = modifiers,
             onKey = { bytes ->
                 scope.launch(Dispatchers.IO) {
-                    val os = outputStream ?: return@launch
+                    val os = terminalHolder.outputStream ?: return@launch
                     try {
                         os.write(bytes)
                         os.flush()

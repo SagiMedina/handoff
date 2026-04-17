@@ -13,11 +13,13 @@ import androidx.compose.ui.Modifier
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
+import com.handoff.app.data.TmuxSession
 import com.handoff.app.data.BiometricKeyStore
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
+import com.handoff.app.data.TerminalSessionHolder
 import com.handoff.app.ui.screens.*
 import com.handoff.app.ui.theme.HandoffTheme
 import kotlinx.coroutines.launch
@@ -28,6 +30,12 @@ class MainActivity : FragmentActivity() {
     private val tailscaleManager by lazy {
         TailscaleManager(HandoffApp.appFilesDir)
     }
+    private val terminalHolder by lazy {
+        TerminalSessionHolder(applicationContext)
+    }
+    // Sessions list cache that survives navigating in/out of the terminal screen —
+    // avoids flashing a loading spinner on every return to the sessions list.
+    private val sessionsCache = mutableStateOf<List<TmuxSession>>(emptyList())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -155,6 +163,7 @@ class MainActivity : FragmentActivity() {
                                 config = currentConfig,
                                 sshManager = sshManager,
                                 tailscaleManager = tailscaleManager,
+                                cachedSessions = sessionsCache,
                                 onWindowSelected = { sessionName, window ->
                                     navController.navigate(
                                         "terminal/$sessionName/${window.index}"
@@ -169,6 +178,7 @@ class MainActivity : FragmentActivity() {
                                 onUnpair = {
                                     scope.launch {
                                         sshManager.disconnect()
+                                        terminalHolder.disconnect()
                                         tailscaleManager.resetState()
                                         configStore.clear()
                                         config = null
@@ -232,6 +242,7 @@ class MainActivity : FragmentActivity() {
                                 config = currentConfig,
                                 sshManager = sshManager,
                                 tailscaleManager = tailscaleManager,
+                                terminalHolder = terminalHolder,
                                 sessionName = sessionName,
                                 windowIndex = windowIndex,
                                 onDisconnect = {
@@ -249,6 +260,7 @@ class MainActivity : FragmentActivity() {
     override fun onDestroy() {
         super.onDestroy()
         sshManager.disconnect()
+        terminalHolder.disconnect()
         tailscaleManager.stopProxy()
         tailscaleManager.stop()
     }

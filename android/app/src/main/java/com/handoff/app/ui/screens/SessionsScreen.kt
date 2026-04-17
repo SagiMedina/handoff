@@ -37,13 +37,17 @@ fun SessionsScreen(
     config: ConnectionConfig,
     sshManager: SshManager,
     tailscaleManager: TailscaleManager,
+    cachedSessions: MutableState<List<TmuxSession>>,
     onWindowSelected: (String, TmuxWindow) -> Unit,
     onUnpair: () -> Unit,
     onLicenses: () -> Unit = {},
     onSettings: () -> Unit = {}
 ) {
-    var sessions by remember { mutableStateOf<List<TmuxSession>>(emptyList()) }
-    var loading by remember { mutableStateOf(true) }
+    // Sessions are cached at the activity level so returning from the terminal screen
+    // shows the previous list immediately and the loading spinner only appears on a
+    // genuine first-time load.
+    var sessions by cachedSessions
+    var loading by remember { mutableStateOf(sessions.isEmpty()) }
     var error by remember { mutableStateOf<String?>(null) }
     var showNewSessionDialog by remember { mutableStateOf(false) }
     var newSessionName by remember { mutableStateOf("") }
@@ -110,7 +114,9 @@ fun SessionsScreen(
     }
 
     LaunchedEffect(Unit) {
-        refresh()
+        // Re-entering the screen with cached data: refresh silently in the background
+        // so the list stays responsive without a spinner flash.
+        refresh(showLoading = sessions.isEmpty())
         // Auto-refresh every 5 seconds while screen is visible and connected
         while (true) {
             delay(5000)
