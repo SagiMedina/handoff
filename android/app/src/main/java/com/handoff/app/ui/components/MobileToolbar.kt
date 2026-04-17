@@ -74,11 +74,15 @@ private val ROW2 = listOf(
 /**
  * Apply SHIFT modifier to bytes emitted from the toolbar's own keys.
  *   - Shift+Tab (9)               -> ESC [ Z  (backtab)
+ *   - Shift+Enter (CR 13)         -> LF (10)  (newline without submit; Claude Code treats this as shift+enter)
  *   - Shift+Arrow (ESC [ A-D)     -> ESC [ 1 ; 2 <letter>  (text selection)
  */
 private fun applyShift(bytes: ByteArray): ByteArray {
     if (bytes.size == 1 && bytes[0] == 9.toByte()) {
         return byteArrayOf(27, 91, 90)
+    }
+    if (bytes.size == 1 && bytes[0] == 13.toByte()) {
+        return byteArrayOf(10)
     }
     if (bytes.size == 3 && bytes[0] == 27.toByte() && bytes[1] == 91.toByte()) {
         val letter = bytes[2]
