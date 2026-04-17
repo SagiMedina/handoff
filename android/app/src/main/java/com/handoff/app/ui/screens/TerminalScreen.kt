@@ -144,43 +144,31 @@ fun TerminalScreen(
         onDispose { terminalSsh.disconnect() }
     }
 
-    // Connect SSH once after TerminalView is created, keyboard shown, and view stabilized
+    // Connect SSH at full (keyboard-down) size, THEN show the keyboard.
+    // The PTY stays fixed for the life of the channel — post-connect setPtySize
+    // kills the SSH connection (see SshManager.resizeShell).
     LaunchedEffect(Unit) {
-        // Wait for termView to be set by AndroidView factory
         while (termView == null) { delay(50) }
         val view = termView!!
 
-        // Wait for view to have real dimensions
+        // Wait for the view to have its full (no-keyboard) dimensions.
         while (view.width == 0 || view.height == 0) { delay(50) }
 
-        // Show keyboard FIRST — so the view resizes before we calculate terminal dimensions
-        view.post {
-            view.requestFocus()
-            val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
-            imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
-        }
-
-        // Wait for keyboard animation to settle (view height stabilizes)
-        var lastHeight = view.height
-        delay(400)
-        while (true) {
-            delay(100)
-            if (view.height == lastHeight) break
-            lastHeight = view.height
-        }
-
-        // Now calculate terminal size with keyboard visible
         val session = TerminalSession(sessionClient)
         val renderer = view.mRenderer
         val cols = (view.width / renderer.fontWidth).toInt().coerceAtLeast(4)
         val rows = (view.height / renderer.fontLineSpacing).coerceAtLeast(4)
         session.initializeEmulator(cols, rows, renderer.fontWidth.toInt(), renderer.fontLineSpacing)
         view.attachSession(session)
+        // Lock the emulator size — the remote PTY is fixed at these dims for the life of
+        // the channel, so letting the local emulator shrink on keyboard-show would
+        // desync the grid with tmux's output and produce garbled rendering.
+        view.sizeLocked = true
 
         val emulator = view.mEmulator
         val actualCols = emulator?.mColumns ?: cols
         val actualRows = emulator?.mRows ?: rows
-        if (BuildConfig.DEBUG) Log.d("Handoff", "Terminal: ${actualCols}x${actualRows} (after keyboard)")
+        if (BuildConfig.DEBUG) Log.d("Handoff", "Terminal: ${actualCols}x${actualRows} (full size)")
 
         try {
             val proxyPort = tailscaleManager.getProxyPort().let { port ->
@@ -195,6 +183,13 @@ fun TerminalScreen(
             session.startReading(input)
             sshReady = true
             if (BuildConfig.DEBUG) Log.d("Handoff", "SSH ready")
+
+            // Show the keyboard only AFTER SSH is up and the PTY size is locked in.
+            view.post {
+                view.requestFocus()
+                val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
+                imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
+            }
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) Log.e("Handoff", "SSH failed", e)
             error = friendlyConnectionError(e)
@@ -264,17 +259,6 @@ fun TerminalScreen(
                     isFocusableInTouchMode = true
                     keepScreenOn = true
 
-                    // Compose's imePadding() changes this view's bounds when the
-                    // keyboard shows/hides, but onSizeChanged may not fire reliably
-                    // through AndroidView. Explicitly trigger terminal resize.
-                    addOnLayoutChangeListener { v, left, top, right, bottom,
-                                                oldLeft, oldTop, oldRight, oldBottom ->
-                        if ((right - left) != (oldRight - oldLeft) ||
-                            (bottom - top) != (oldBottom - oldTop)) {
-                            v.post { (v as TerminalView).updateSize() }
-                        }
-                    }
-
                     termView = this
                 }
             },
@@ -284,10 +268,13 @@ fun TerminalScreen(
         MobileToolbar(
             onKey = { bytes ->
                 scope.launch(Dispatchers.IO) {
+                    val os = outputStream ?: return@launch
                     try {
-                        outputStream?.write(bytes)
-                        outputStream?.flush()
-                    } catch (_: Exception) {}
+                        os.write(bytes)
+                        os.flush()
+                    } catch (e: Exception) {
+                        Log.e("Handoff", "Toolbar write failed: ${e.javaClass.simpleName}: ${e.message}")
+                    }
                 }
             }
         )

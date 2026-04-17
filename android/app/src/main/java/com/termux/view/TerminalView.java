@@ -545,7 +545,10 @@ public final class TerminalView extends View {
      */
     public int[] getColumnAndRow(MotionEvent event, boolean relativeToScroll) {
         int column = (int) (event.getX() / mRenderer.mFontWidth);
-        int row = (int) ((event.getY() - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
+        // Compensate for the bottom-alignment shift applied in onDraw when the view
+        // is shorter than the emulator's natural height.
+        float y = event.getY() + getContentTopShiftPx();
+        int row = (int) ((y - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
         if (relativeToScroll) {
             row += mTopRow;
         }
@@ -980,6 +983,14 @@ public final class TerminalView extends View {
         updateSize();
     }
 
+    /**
+     * When true, {@link #updateSize()} no longer propagates view dimension changes to the
+     * emulator. The initial emulator creation still runs. Used to keep the local emulator
+     * in sync with a remote PTY whose size cannot be changed after connect (see Handoff
+     * SshManager.resizeShell).
+     */
+    public boolean sizeLocked = false;
+
     /** Check if the terminal size in rows and columns should be updated. */
     public void updateSize() {
         int viewWidth = getWidth();
@@ -991,6 +1002,11 @@ public final class TerminalView extends View {
         int newRows = Math.max(4, (viewHeight - mRenderer.mFontLineSpacingAndAscent) / mRenderer.mFontLineSpacing);
 
         if (mEmulator == null || (newColumns != mEmulator.mColumns || newRows != mEmulator.mRows)) {
+            if (sizeLocked && mEmulator != null) {
+                // Emulator dimensions are frozen; just redraw in case view pixels changed.
+                invalidate();
+                return;
+            }
             mTermSession.updateSize(newColumns, newRows, (int) mRenderer.getFontWidth(), mRenderer.getFontLineSpacing());
             mEmulator = mTermSession.getEmulator();
             mClient.onEmulatorSet();
@@ -1005,6 +1021,19 @@ public final class TerminalView extends View {
         }
     }
 
+    /**
+     * When the view is shorter than the emulator's natural height (e.g. the keyboard is
+     * covering the bottom of the screen but the emulator's PTY size is fixed), return
+     * a positive pixel offset that should be subtracted from the canvas Y so the bottom
+     * rows of the emulator render in the visible area instead of the top rows.
+     */
+    public float getContentTopShiftPx() {
+        if (mEmulator == null) return 0f;
+        float emulatorHeight = mEmulator.mRows * mRenderer.mFontLineSpacing;
+        float viewHeight = getHeight();
+        return Math.max(0f, emulatorHeight - viewHeight);
+    }
+
     @Override
     protected void onDraw(Canvas canvas) {
         if (mEmulator == null) {
@@ -1016,7 +1045,15 @@ public final class TerminalView extends View {
                 mTextSelectionCursorController.getSelectors(sel);
             }
 
+            float shift = getContentTopShiftPx();
+            if (shift > 0f) {
+                canvas.save();
+                canvas.translate(0f, -shift);
+            }
             mRenderer.render(mEmulator, canvas, mTopRow, sel[0], sel[1], sel[2], sel[3]);
+            if (shift > 0f) {
+                canvas.restore();
+            }
 
             // render the text selection handles
             renderTextSelection();
@@ -1036,7 +1073,7 @@ public final class TerminalView extends View {
     }
 
     public int getCursorY(float y) {
-        return (int) (((y - 40) / mRenderer.mFontLineSpacing) + mTopRow);
+        return (int) (((y + getContentTopShiftPx() - 40) / mRenderer.mFontLineSpacing) + mTopRow);
     }
 
     public int getPointX(int cx) {
