@@ -323,6 +323,23 @@ Acceptance criteria
 Estimated branch name: `ios-terminal-keyboard-parity`
 Depends on: `Route terminal attach through the gate`
 
+#### Rework the Sessions "● Connected" indicator
+Why it matters: the indicator is tautological — Sessions is only reachable when Tailscale is `.connected`, so the green dot always reads the same. It also lies during a post-background zombied channel (says "Connected" while gate commands are timing out). Its only real job today is to anchor the tap-to-open menu for Copy IP, Sign out of Tailscale, and Reset trusted host key.
+Scope
+- Replace the inline "● Connected" label with a conventional iOS toolbar overflow button (three-dot) that owns Copy IP, Sign out of Tailscale, and Reset trusted host key.
+- Keep the READ-ONLY state visible — promote it to a nav subtitle or a dedicated badge rather than colocating it with the removed indicator.
+- If a genuine health pulse is useful later (e.g., during reconnect storms), reflect actual gate health, not the static routing state. v1 can simply drop the indicator without a replacement.
+References
+- `ios/Handoff/Sources/Views/SessionsView.swift` (`connectedHeader`)
+- `android/app/src/main/java/com/handoff/app/ui/screens/SessionsScreen.kt`
+Acceptance criteria
+- The Sessions header no longer shows a status indicator that always reads green.
+- Tailscale-scoped menu actions remain accessible via the overflow button or equivalent.
+- READ-ONLY state is still visible at a glance without depending on the old indicator.
+- No behavior depends on the presence of the indicator in code.
+Estimated branch name: `ios-sessions-header-cleanup`
+Depends on: none
+
 #### Align platform copy and state naming after functional parity lands
 Why it matters: copy cleanup is low value until the actual lifecycle and permission model match.
 Scope
