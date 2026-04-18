@@ -37,25 +37,59 @@ private val DarkColorScheme = darkColorScheme(
     error = Error,
 )
 
+// Handoff commits to a single terminal-style monospace type family across the whole UI.
+// This isn't a design affectation: the app IS a terminal front-end, and the mono grid
+// aligns directly with the content (tmux session/window names, cwd paths, SSH output).
+// Sans-serif here would read as Material-default and make the app look like "just another"
+// mobile app. Mono makes it look like a handcrafted dev tool — which is what it is.
 private val HandoffTypography = Typography(
     bodyLarge = TextStyle(
-        fontFamily = FontFamily.Default,
+        fontFamily = FontFamily.Monospace,
         fontWeight = FontWeight.Normal,
-        fontSize = 16.sp,
-        lineHeight = 24.sp,
+        fontSize = 15.sp,
+        lineHeight = 22.sp,
         color = OnBackground
     ),
+    bodyMedium = TextStyle(
+        fontFamily = FontFamily.Monospace,
+        fontWeight = FontWeight.Normal,
+        fontSize = 13.sp,
+        lineHeight = 18.sp,
+        color = OnSurfaceVariant
+    ),
+    bodySmall = TextStyle(
+        fontFamily = FontFamily.Monospace,
+        fontWeight = FontWeight.Normal,
+        fontSize = 11.sp,
+        lineHeight = 14.sp,
+        color = OnSurfaceVariant
+    ),
     titleLarge = TextStyle(
-        fontFamily = FontFamily.Default,
+        fontFamily = FontFamily.Monospace,
         fontWeight = FontWeight.Bold,
-        fontSize = 24.sp,
-        lineHeight = 32.sp,
+        fontSize = 20.sp,
+        lineHeight = 26.sp,
+        letterSpacing = (-0.5).sp,
+        color = OnBackground
+    ),
+    titleMedium = TextStyle(
+        fontFamily = FontFamily.Monospace,
+        fontWeight = FontWeight.SemiBold,
+        fontSize = 15.sp,
+        lineHeight = 20.sp,
         color = OnBackground
     ),
     labelMedium = TextStyle(
         fontFamily = FontFamily.Monospace,
         fontWeight = FontWeight.Normal,
-        fontSize = 14.sp,
+        fontSize = 13.sp,
+        color = OnSurfaceVariant
+    ),
+    labelSmall = TextStyle(
+        fontFamily = FontFamily.Monospace,
+        fontWeight = FontWeight.Normal,
+        fontSize = 10.sp,
+        letterSpacing = 1.sp,
         color = OnSurfaceVariant
     ),
 )

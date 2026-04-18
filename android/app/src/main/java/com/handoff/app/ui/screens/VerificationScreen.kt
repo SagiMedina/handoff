@@ -91,8 +91,18 @@ fun VerificationScreen(
                                 onError("Pairing was rejected on the Mac.")
                                 return@launch
                             }
-                        } catch (_: Exception) {
-                            // Connection error during poll, retry
+                        } catch (e: Exception) {
+                            // If SSH auth failed, the Mac deleted the device — either the
+                            // user rejected this pairing or an admin revoked it. Don't keep
+                            // polling for a minute; tell the user to re-pair and bail.
+                            val m = (e.message ?: "").lowercase()
+                            if ("auth fail" in m || "auth cancel" in m || "publickey" in m) {
+                                onError(
+                                    "Pairing was rejected. Run `handoff pair` on your Mac again."
+                                )
+                                return@launch
+                            }
+                            // Otherwise assume a transient connection error and retry.
                         }
                     }
                     onError("Pairing timed out. Try again from your Mac.")

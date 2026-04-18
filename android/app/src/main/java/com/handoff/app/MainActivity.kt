@@ -13,6 +13,8 @@ import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.padding
 import androidx.compose.material3.Scaffold
+import androidx.compose.material3.SnackbarHost
+import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.navigation.compose.NavHost
@@ -63,6 +65,7 @@ class MainActivity : FragmentActivity() {
                 var config by remember { mutableStateOf<ConnectionConfig?>(null) }
                 var configLoaded by remember { mutableStateOf(false) }
                 val scope = rememberCoroutineScope()
+                val snackbarHostState = remember { SnackbarHostState() }
 
                 // Load saved config on startup
                 LaunchedEffect(Unit) {
@@ -70,7 +73,9 @@ class MainActivity : FragmentActivity() {
                     configLoaded = true
                 }
 
-                Scaffold { innerPadding ->
+                Scaffold(
+                    snackbarHost = { SnackbarHost(snackbarHostState) },
+                ) { innerPadding ->
                 // innerPadding applied per-screen; terminal goes edge-to-edge
                 val scaffoldPadding = innerPadding
 
@@ -112,7 +117,9 @@ class MainActivity : FragmentActivity() {
                                     }
                                 }
                             },
-                            onError = { /* TODO: show snackbar */ }
+                            onError = { msg ->
+                                scope.launch { snackbarHostState.showSnackbar(msg) }
+                            }
                         )
                         }
                     }
@@ -131,8 +138,16 @@ class MainActivity : FragmentActivity() {
                                         }
                                     },
                                     onError = { errorMsg ->
-                                        // Pairing failed — go back to welcome
+                                        // Pairing failed — surface the error before we
+                                        // drop the user back at welcome; otherwise they
+                                        // just see the scan screen reopen and assume the
+                                        // app is looping.
                                         scope.launch {
+                                            snackbarHostState.showSnackbar(errorMsg)
+                                        }
+                                        scope.launch {
+                                            sshManager.disconnect()
+                                            tailscaleManager.stopProxy()
                                             configStore.clear()
                                             config = null
                                             navController.navigate("welcome") {

@@ -11,7 +11,9 @@ import android.util.Log
 import androidx.compose.ui.unit.dp
 import com.handoff.app.BuildConfig
 import com.handoff.app.data.BiometricKeyStore
+import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
+import kotlinx.coroutines.launch
 
 @Composable
 fun SettingsScreen(
@@ -21,6 +23,10 @@ fun SettingsScreen(
     onLicenses: () -> Unit = {}
 ) {
     val context = LocalContext.current
+    val scope = rememberCoroutineScope()
+    val configStore = remember { ConfigStore(context.applicationContext) }
+    val fontSize by configStore.terminalFontSize
+        .collectAsState(initial = ConfigStore.DEFAULT_TERMINAL_FONT_SIZE)
     var biometricEnabled by remember { mutableStateOf(biometricKeyStore.isBiometricEnabled) }
     var biometricAvailable by remember { mutableStateOf(false) }
 
@@ -100,6 +106,39 @@ fun SettingsScreen(
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
         }
+
+        Spacer(modifier = Modifier.height(32.dp))
+
+        // Terminal appearance
+        Text(
+            text = "Terminal",
+            style = MaterialTheme.typography.titleMedium,
+            color = MaterialTheme.colorScheme.primary,
+        )
+        Spacer(modifier = Modifier.height(12.dp))
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+        ) {
+            Text(
+                text = "Text size",
+                style = MaterialTheme.typography.bodyLarge,
+            )
+            Text(
+                text = "${fontSize}px",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+        }
+        Slider(
+            value = fontSize.toFloat(),
+            onValueChange = { v ->
+                scope.launch { configStore.setTerminalFontSize(v.toInt()) }
+            },
+            valueRange = ConfigStore.MIN_TERMINAL_FONT_SIZE.toFloat()..
+                ConfigStore.MAX_TERMINAL_FONT_SIZE.toFloat(),
+            steps = ConfigStore.MAX_TERMINAL_FONT_SIZE - ConfigStore.MIN_TERMINAL_FONT_SIZE - 1,
+        )
 
         Spacer(modifier = Modifier.height(32.dp))
 

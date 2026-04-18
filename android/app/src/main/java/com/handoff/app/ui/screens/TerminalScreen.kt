@@ -24,11 +24,13 @@ import androidx.compose.ui.viewinterop.AndroidView
 import androidx.compose.foundation.background
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
+import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
 import com.handoff.app.data.TerminalSessionHolder
+import androidx.compose.runtime.collectAsState
 import com.handoff.app.ui.theme.HandoffAmber
 import com.handoff.app.ui.theme.HandoffAmberDim
 import com.handoff.app.ui.components.MobileToolbar
@@ -55,6 +57,10 @@ fun TerminalScreen(
     val modifiers = remember { ModifierState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+    val configStore = remember { ConfigStore(context.applicationContext) }
+    val fontSize by configStore.terminalFontSize
+        .collectAsState(initial = ConfigStore.DEFAULT_TERMINAL_FONT_SIZE)
+    var appliedFontSize by remember { mutableStateOf(-1) }
 
     val viewClient = remember {
         object : TerminalViewClient {
@@ -194,13 +200,23 @@ fun TerminalScreen(
             factory = { ctx ->
                 TerminalView(ctx, null).apply {
                     setTerminalViewClient(viewClient)
-                    setTextSize(24)
+                    setTextSize(fontSize)
+                    appliedFontSize = fontSize
                     val font = Typeface.createFromAsset(ctx.assets, "JetBrainsMono-Regular.ttf")
                     setTypeface(font)
                     isFocusable = true
                     isFocusableInTouchMode = true
                     keepScreenOn = true
                     termView = this
+                }
+            },
+            update = { view ->
+                // Re-apply text size when the user drags the Settings slider. Changing the
+                // size re-locks the PTY rows/cols to the new grid; TerminalView triggers
+                // the underlying resize via its onSizeChanged path.
+                if (appliedFontSize != fontSize) {
+                    view.setTextSize(fontSize)
+                    appliedFontSize = fontSize
                 }
             },
             modifier = Modifier.fillMaxWidth().weight(1f)
