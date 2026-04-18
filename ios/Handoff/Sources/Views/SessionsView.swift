@@ -9,8 +9,20 @@ struct SessionsView: View {
 
     @StateObject private var sshManager = SSHManager()
     @State private var sessions: [TmuxSession] = []
+    @State private var softExpiredPrompt: GateError?
+
+    /// Read-only from the gate's `#permissions:` header. v1 pairings and any
+    /// pre-first-list state resolve to `false`, which is the safe default
+    /// because the gate server-side is still authoritative.
+    private var readOnly: Bool {
+        sshManager.devicePermissions?.readOnly ?? false
+    }
     @State private var isLoading = true
     @State private var errorMessage: String?
+    /// Separate surface for successful/neutral messages. errorMessage only
+    /// renders when sessions is empty, so it's the wrong place for, e.g., a
+    /// "renewal requested" confirmation that lands after the list has loaded.
+    @State private var noticeMessage: String?
     @State private var hasAutoConnected = false
     @State private var showSignOutConfirmation = false
 
@@ -105,6 +117,56 @@ struct SessionsView: View {
         } message: {
             Text("You'll need to sign in again on next launch. Your Mac pairing stays intact.")
         }
+        // Gate reports the device's soft expiry has passed. The only
+        // permitted gate command in this state is `renew`; we let the user
+        // send it and surface the Mac's confirmation.
+        .alert(
+            "Access expired",
+            isPresented: Binding(
+                get: { softExpiredPrompt != nil },
+                set: { if !$0 { softExpiredPrompt = nil } }
+            ),
+            presenting: softExpiredPrompt
+        ) { _ in
+            Button("Request renewal") { requestRenewal() }
+            Button("Cancel", role: .cancel) { softExpiredPrompt = nil }
+        } message: { gate in
+            Text(ErrorMessages.friendlyGate(gate))
+        }
+        // Neutral/success notices (e.g. "Renewal requested") — shown as an
+        // alert so they're visible regardless of whether the session list is
+        // loaded. errorMessage can't serve here because errorView only renders
+        // when sessions is empty.
+        .alert(
+            "Handoff",
+            isPresented: Binding(
+                get: { noticeMessage != nil },
+                set: { if !$0 { noticeMessage = nil } }
+            ),
+            presenting: noticeMessage
+        ) { _ in
+            Button("OK", role: .cancel) { noticeMessage = nil }
+        } message: { text in
+            Text(text)
+        }
+    }
+
+    private func requestRenewal() {
+        softExpiredPrompt = nil
+        Task {
+            do {
+                _ = try await sshManager.requestRenewal()
+                await MainActor.run {
+                    // Matches the canonical command the Mac prints — see
+                    // bin/handoff's top-level alias list.
+                    noticeMessage = "Renewal requested. Ask the Mac owner to approve with `handoff renew <name>`."
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = ErrorMessages.friendlyAction("request renewal", error)
+                }
+            }
+        }
     }
 
     private func signOutOfTailscale() {
@@ -153,6 +215,15 @@ struct SessionsView: View {
                 Text("Connected")
                     .foregroundColor(Theme.green)
                     .font(.system(size: 12))
+                if readOnly {
+                    Text("READ-ONLY")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .foregroundColor(Theme.textSecondary)
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Theme.textSecondary.opacity(0.15))
+                        .clipShape(Capsule())
+                }
                 Spacer()
             }
             .padding(.horizontal, 16)
@@ -168,6 +239,7 @@ struct SessionsView: View {
                 ForEach(sessions) { session in
                     SessionCard(
                         session: session,
+                        readOnly: readOnly,
                         onSelectWindow: { window in
                             path.append(ContentView.Route.terminal(
                                 session: session.name,
@@ -186,18 +258,22 @@ struct SessionsView: View {
                     )
                 }
 
-                // Subtle "+ new session" link at the bottom of the list
-                Button {
-                    newSessionName = ""
-                    showNewSessionDialog = true
-                } label: {
-                    Text("+ new session")
-                        .font(.system(size: 12))
-                        .foregroundColor(Theme.textSecondary.opacity(0.5))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
+                // Subtle "+ new session" — suppressed in read-only mode so
+                // the user doesn't see a visible mutation affordance the gate
+                // would reject server-side.
+                if !readOnly {
+                    Button {
+                        newSessionName = ""
+                        showNewSessionDialog = true
+                    } label: {
+                        Text("+ new session")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary.opacity(0.5))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.plain)
                 }
-                .buttonStyle(.plain)
             }
             .padding()
         }
@@ -212,15 +288,17 @@ struct SessionsView: View {
             Text("No tmux sessions on your Mac.")
                 .foregroundColor(Theme.textSecondary)
                 .multilineTextAlignment(.center)
-            Button {
-                newSessionName = ""
-                showNewSessionDialog = true
-            } label: {
-                Text("+ new session")
-                    .font(.system(size: 14, design: .monospaced))
-                    .foregroundColor(Theme.primary)
+            if !readOnly {
+                Button {
+                    newSessionName = ""
+                    showNewSessionDialog = true
+                } label: {
+                    Text("+ new session")
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(Theme.primary)
+                }
+                .padding(.top, 8)
             }
-            .padding(.top, 8)
             Spacer()
         }
         .padding()
@@ -295,9 +373,26 @@ struct SessionsView: View {
                         ))
                     }
                 }
+            } catch let gate as GateError {
+                // Lifecycle errors get dedicated recovery surfaces. For
+                // everything else we show the friendly copy inline.
+                await MainActor.run {
+                    isLoading = false
+                    switch gate.code {
+                    case .softExpired:
+                        softExpiredPrompt = gate
+                        errorMessage = nil
+                    case .notFound:
+                        // Mac has no record of this device — strongest hint
+                        // is to unpair so the user can re-scan.
+                        errorMessage = ErrorMessages.friendlyGate(gate)
+                    default:
+                        errorMessage = ErrorMessages.friendlyGate(gate)
+                    }
+                }
             } catch {
                 await MainActor.run {
-                    errorMessage = error.localizedDescription
+                    errorMessage = ErrorMessages.friendlyConnection(error)
                     isLoading = false
                 }
             }
@@ -342,7 +437,7 @@ struct SessionsView: View {
                 try await sshManager.createSession(tmuxPath: config.tmuxPath, name: name)
                 loadSessions()
             } catch {
-                errorMessage = error.localizedDescription
+                errorMessage = ErrorMessages.friendlyAction("create session", error)
             }
         }
     }
@@ -363,7 +458,7 @@ struct SessionsView: View {
                     ))
                 }
             } catch {
-                errorMessage = "Failed to create tab: \(error.localizedDescription)"
+                errorMessage = ErrorMessages.friendlyAction("create tab", error)
             }
         }
     }
@@ -381,7 +476,7 @@ struct SessionsView: View {
                 try await sshManager.killSession(tmuxPath: config.tmuxPath, name: session.name)
                 loadSessions()
             } catch {
-                errorMessage = error.localizedDescription
+                errorMessage = ErrorMessages.friendlyAction("kill session", error)
             }
         }
     }
@@ -401,7 +496,7 @@ struct SessionsView: View {
                 )
                 loadSessions()
             } catch {
-                errorMessage = "Failed to kill tab: \(error.localizedDescription)"
+                errorMessage = ErrorMessages.friendlyAction("kill tab", error)
             }
         }
     }

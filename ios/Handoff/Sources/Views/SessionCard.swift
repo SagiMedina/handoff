@@ -5,6 +5,7 @@ import SwiftUI
 /// to kill session, dashed-border "+ new tab", wrapped titles, thin card border.
 struct SessionCard: View {
     let session: TmuxSession
+    var readOnly: Bool = false
     let onSelectWindow: (TmuxWindow) -> Void
     let onNewWindow: () -> Void
     let onKillSession: () -> Void
@@ -34,7 +35,9 @@ struct SessionCard: View {
             .padding(.top, 16)
             .contentShape(Rectangle())
             .onLongPressGesture {
-                showKillSessionDialog = true
+                // Long-press-to-kill is suppressed in read-only mode so users
+                // don't hit a gate error on what looks like a real affordance.
+                if !readOnly { showKillSessionDialog = true }
             }
 
             Spacer().frame(height: 10)
@@ -50,32 +53,38 @@ struct SessionCard: View {
                     }
                     WindowRow(
                         window: window,
+                        readOnly: readOnly,
                         onTap: { onSelectWindow(window) },
-                        onLongPress: { windowToKill = window }
+                        onLongPress: { if !readOnly { windowToKill = window } }
                     )
                 }
             }
 
             Spacer().frame(height: 8)
 
-            // "+ new tab" button — dashed border, distinct from list items
-            Button(action: onNewWindow) {
-                Text("+ new tab")
-                    .font(.system(size: 13, design: .monospaced))
-                    .foregroundColor(Theme.primary.opacity(0.7))
-                    .frame(maxWidth: .infinity)
-                    .padding(.vertical, 10)
-                    .background(
-                        RoundedRectangle(cornerRadius: 8)
-                            .strokeBorder(
-                                Theme.primary.opacity(0.35),
-                                style: StrokeStyle(lineWidth: 1, dash: [6, 4])
-                            )
-                    )
+            // "+ new tab" is a mutation — hide it in read-only mode instead of
+            // showing a disabled button the user will tap once before noticing.
+            if !readOnly {
+                Button(action: onNewWindow) {
+                    Text("+ new tab")
+                        .font(.system(size: 13, design: .monospaced))
+                        .foregroundColor(Theme.primary.opacity(0.7))
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(
+                            RoundedRectangle(cornerRadius: 8)
+                                .strokeBorder(
+                                    Theme.primary.opacity(0.35),
+                                    style: StrokeStyle(lineWidth: 1, dash: [6, 4])
+                                )
+                        )
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 16)
+            } else {
+                Spacer().frame(height: 16)
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 16)
-            .padding(.bottom, 16)
         }
         .background(Theme.surface)
         .clipShape(RoundedRectangle(cornerRadius: 12))
@@ -122,9 +131,11 @@ struct SessionCard: View {
     }
 }
 
-/// Two-line row: title + dimmed cwd. Tap to open, long-press to kill.
+/// Two-line row: title + dimmed cwd. Tap to open, long-press to kill
+/// (long-press is inert in read-only mode).
 private struct WindowRow: View {
     let window: TmuxWindow
+    var readOnly: Bool = false
     let onTap: () -> Void
     let onLongPress: () -> Void
 
