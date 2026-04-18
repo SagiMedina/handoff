@@ -49,6 +49,8 @@ fun ScanScreen(
         )
     }
     var scanned by remember { mutableStateOf(false) }
+    // Avoid spamming the snackbar with the same error on every camera frame.
+    var lastErrorRaw by remember { mutableStateOf<String?>(null) }
 
     val permissionLauncher = rememberLauncherForActivityResult(
         ActivityResultContracts.RequestPermission()
@@ -106,6 +108,9 @@ fun ScanScreen(
                                                             scanned = true
                                                             onConfigScanned(config)
                                                             return@addOnSuccessListener
+                                                        } else if (config == null && lastErrorRaw != raw) {
+                                                            lastErrorRaw = raw
+                                                            onError("Not a Handoff QR code. Run `handoff pair` on your Mac.")
                                                         }
                                                     }
                                                 }

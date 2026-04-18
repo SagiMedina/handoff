@@ -179,18 +179,12 @@ class SshManager {
         output  // "requested"
     }
 
+    // Post-connect setPtySize on a JSch exec channel kills the SSH connection
+    // (reproducibly: the Mac closes the channel ~900ms after the window-change packet).
+    // Instead, we fix the PTY to the full keyboard-down size at connect time and let
+    // the local emulator shrink/grow independently of the remote PTY.
     fun resizeShell(cols: Int, rows: Int) {
-        pendingResize?.let { resizeHandler.removeCallbacks(it) }
-        pendingResize = Runnable {
-            val ch = shellChannel ?: return@Runnable
-            try {
-                if (BuildConfig.DEBUG) Log.d("Handoff", "resizeShell: ${cols}x${rows}")
-                ch.setPtySize(cols, rows, cols * 8, rows * 16)
-            } catch (e: Exception) {
-                if (BuildConfig.DEBUG) Log.w("Handoff", "resizeShell failed: ${e.message}")
-            }
-        }
-        resizeHandler.postDelayed(pendingResize!!, 150)
+        if (BuildConfig.DEBUG) Log.d("Handoff", "resizeShell skipped (PTY fixed at connect): ${cols}x${rows}")
     }
 
     private fun parsePermissionsHeader(header: String): DevicePermissions {

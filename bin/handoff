@@ -21,10 +21,10 @@ ${BOLD}Usage:${RESET}
   handoff status         Check if everything is ready
   handoff unpair         Remove all paired devices
   handoff devices        List paired devices
-  handoff devices rm <n>    Revoke a device
+  handoff devices rm <n>    Revoke a device  (alias: handoff revoke <n>)
   handoff devices edit <n>  Change device permissions
-  handoff devices renew <n> Approve access renewal
-  handoff devices log [n]   Show access log
+  handoff devices renew <n> Approve access renewal  (alias: handoff renew <n>)
+  handoff devices log [n]   Show access log  (alias: handoff logs [n])
   handoff version        Show version
   handoff help           Show this help
 
@@ -481,7 +481,7 @@ cmd_unpair() {
 
     # v2: remove all device keys from authorized_keys
     if [[ "$has_v2" == "true" ]]; then
-        while IFS='|' read -r fp name _ _ _ _ _; do
+        while IFS='|' read -r fp name _ _ _ _ _ _; do
             [[ -z "$fp" ]] && continue
             remove_device_from_authorized_keys "$fp"
         done <<< "$(devices_json_list 2>/dev/null)"
@@ -836,19 +836,32 @@ cmd_devices_list() {
         return
     fi
 
-    printf "  ${BOLD}%-18s %-14s %-12s %-10s %-22s${RESET}\n" "NAME" "SESSIONS" "MODE" "STATUS" "LAST SEEN"
-    echo "  ────────────────────────────────────────────────────────────────────────────"
+    printf "  ${BOLD}%-18s %-14s %-12s %-10s %-14s %-22s${RESET}\n" \
+        "NAME" "SESSIONS" "MODE" "STATUS" "EXPIRES" "LAST SEEN"
+    echo "  ──────────────────────────────────────────────────────────────────────────────────────────"
 
-    while IFS='|' read -r fp name status sessions mode expiry last_seen; do
+    while IFS='|' read -r fp name status sessions mode expiry last_seen renewal; do
         local status_color="$GREEN"
         case "$status" in
             pending)      status_color="$YELLOW" ;;
             soft_expired) status_color="$RED"; status="expired" ;;
             revoked)      status_color="$RED" ;;
         esac
-        printf "  %-18s %-14s %-12s ${status_color}%-10s${RESET} %-22s\n" \
-            "$name" "$sessions" "$mode" "$status" "$last_seen"
+        # Renewal requested marker — prepend a bell/arrow glyph to the name so it's obvious
+        local name_display="$name"
+        if [[ "$renewal" == "true" ]]; then
+            name_display="${YELLOW}↻${RESET} $name"
+        fi
+        local expires_display
+        expires_display=$(format_relative_time "$expiry")
+        printf "  %-26s %-14s %-12s ${status_color}%-10s${RESET} %-14s %-22s\n" \
+            "$name_display" "$sessions" "$mode" "$status" "$expires_display" "$last_seen"
     done <<< "$devices"
+
+    if grep -q '|true$' <<< "$devices"; then
+        echo ""
+        printf "  ${YELLOW}↻${RESET} renewal requested — run ${BOLD}handoff renew <name>${RESET} to approve.\n"
+    fi
     echo ""
 }
 
@@ -861,7 +874,7 @@ cmd_devices_rm() {
 
     # Find device by name
     local found_fp="" found_keyfile=""
-    while IFS='|' read -r fp name _ _ _ _ _; do
+    while IFS='|' read -r fp name _ _ _ _ _ _; do
         if [[ "$name" == "$target_name" ]]; then
             found_fp="$fp"
             found_keyfile=$(devices_json_get_field "$fp" "key_file")
@@ -897,7 +910,7 @@ cmd_devices_renew() {
 
     # Find device by name
     local found_fp=""
-    while IFS='|' read -r fp name _ _ _ _ _; do
+    while IFS='|' read -r fp name _ _ _ _ _ _; do
         if [[ "$name" == "$target_name" ]]; then
             found_fp="$fp"
             break
@@ -978,7 +991,7 @@ cmd_devices_edit() {
 
     # Find device by name
     local found_fp=""
-    while IFS='|' read -r fp name _ _ _ _ _; do
+    while IFS='|' read -r fp name _ _ _ _ _ _; do
         if [[ "$name" == "$target_name" ]]; then
             found_fp="$fp"
             break
@@ -1044,7 +1057,7 @@ cmd_devices_log() {
     local target_fp=""
 
     if [[ -n "$target_name" ]]; then
-        while IFS='|' read -r fp name _ _ _ _ _; do
+        while IFS='|' read -r fp name _ _ _ _ _ _; do
             if [[ "$name" == "$target_name" ]]; then
                 target_fp="$fp"
                 break
@@ -1108,6 +1121,9 @@ case "${1:-}" in
     status)  cmd_status ;;
     gate)    shift; cmd_gate "$@" ;;
     devices) shift; cmd_devices "$@" ;;
+    revoke)  shift; cmd_devices_rm "$@" ;;
+    renew)   shift; cmd_devices_renew "$@" ;;
+    logs)    shift; cmd_devices_log "$@" ;;
     version) echo "handoff $VERSION" ;;
     help|-h|--help) usage ;;
     "")      cmd_default ;;
