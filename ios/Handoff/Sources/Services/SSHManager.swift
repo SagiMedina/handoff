@@ -126,7 +126,21 @@ final class SSHManager: ObservableObject {
         // directly; once the handler is added to the pipeline, it's the same object.
         self.sshHandler = nioSSHHandler
 
-        // Wait for SSH auth complete
+        // Cap the SSH handshake + auth wait. After iOS backgrounds the app,
+        // tsnet's SOCKS5 listener stays bound but WireGuard routing goes
+        // silent: TCP connect completes, SOCKS handshake may succeed, yet no
+        // SSH packets cross the tunnel. Without this timeout the caller
+        // would block indefinitely — we want it to surface as an error that
+        // triggers a reconnect. The scheduled task runs on the SSH event
+        // loop, same rationale as executeCommand's timeout.
+        let authTimeout = channel.eventLoop.scheduleTask(in: .seconds(15)) {
+            authSuccessPromise.fail(SSHError.commandFailed("SSH authentication timed out"))
+        }
+        authSuccessPromise.futureResult.whenComplete { _ in
+            authTimeout.cancel()
+        }
+
+        // Wait for SSH auth complete (or the scheduled timeout).
         try await authSuccessPromise.futureResult.get()
     }
 
@@ -166,7 +180,7 @@ final class SSHManager: ObservableObject {
             throw err
         }
 
-        return lines.compactMap { line -> TmuxSession? in
+        let parsed: [TmuxSession] = lines.compactMap { line -> TmuxSession? in
             guard !line.isEmpty else { return nil }
             let parts = line.split(separator: ":", maxSplits: 1)
             guard parts.count == 2, let windowCount = Int(parts[1]) else { return nil }
@@ -176,6 +190,22 @@ final class SSHManager: ObservableObject {
                 windows: []
             )
         }
+
+        // Distinguish a genuine empty session list from a lossy/truncated
+        // post-resume response that failed to parse. Without this, a bad
+        // `list` output silently returns [] — the UI replaces the cached
+        // session list with nothing, and a later transport failure then
+        // combines with errorMessage to render the full-screen error banner
+        // instead of keeping the cached sessionList. (Diagnosis via codex.)
+        let hasNonEmptyContent = lines.contains { !$0.isEmpty }
+        if hasNonEmptyContent && parsed.isEmpty {
+            #if DEBUG
+            print("[SSHManager] listSessions: non-empty output failed to parse — treating as transport failure. Raw: \(trimmedJoined)")
+            #endif
+            throw SSHError.commandFailed("Unrecognized session list response")
+        }
+
+        return parsed
     }
 
     /// List windows (tabs) in a tmux session. v2 goes through `windows <sess>`;
@@ -187,12 +217,13 @@ final class SSHManager: ObservableObject {
             : "\(tmuxPath) list-windows -t '\(escaped)' -F '#{window_index}|#{pane_title}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null"
         let output = try await executeCommand(command)
 
+        let trimmedOutput = output.trimmingCharacters(in: .whitespacesAndNewlines)
         if protocolVersion >= 2,
-           let err = GateError.from(line: output.trimmingCharacters(in: .whitespacesAndNewlines)) {
+           let err = GateError.from(line: trimmedOutput) {
             throw err
         }
 
-        return output
+        let parsedWindows: [TmuxWindow] = output
             .split(separator: "\n", omittingEmptySubsequences: true)
             .compactMap { line -> TmuxWindow? in
                 let parts = line.split(separator: "|", maxSplits: 3, omittingEmptySubsequences: false)
@@ -220,6 +251,20 @@ final class SSHManager: ObservableObject {
                     cwd: cwd
                 )
             }
+
+        // Same reasoning as listSessions: a malformed/truncated output that
+        // doesn't look like an error but also doesn't parse into any windows
+        // is almost certainly a transport hiccup (tsnet wake-up race), not a
+        // session with zero windows. Treat it as a failure so the caller can
+        // retry instead of caching an empty window list.
+        if !trimmedOutput.isEmpty && parsedWindows.isEmpty {
+            #if DEBUG
+            print("[SSHManager] listWindows: non-empty output failed to parse. Raw: \(trimmedOutput)")
+            #endif
+            throw SSHError.commandFailed("Unrecognized window list response")
+        }
+
+        return parsedWindows
     }
 
     /// Strips leading characters that are not letters or numbers.
@@ -333,9 +378,27 @@ final class SSHManager: ObservableObject {
             throw SSHError.notConnected
         }
 
+        // iOS tears down the Tailscale SOCKS5 proxy while the app is
+        // backgrounded. When the user returns, `parentChannel.isActive` can
+        // still read as true even though the underlying socket is zombied —
+        // `createChannel` then never fulfills the promise and we hang
+        // forever. Cap the per-command wait by scheduling the timeout on the
+        // event loop itself (so it fails the promise rather than trying to
+        // cancel an `EventLoopFuture.get()` that, by NIO's docs, doesn't
+        // honor Task cancellation).
         return try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<String> in
             let resultPromise = parentChannel.eventLoop.makePromise(of: String.self)
             let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
+
+            // Fail the promise if the command hasn't completed in 10s. The
+            // scheduled task runs on the same event loop, so it can touch
+            // `resultPromise` safely.
+            let timeoutTask = parentChannel.eventLoop.scheduleTask(in: .seconds(10)) {
+                resultPromise.fail(SSHError.commandFailed("The request timed out"))
+            }
+            resultPromise.futureResult.whenComplete { _ in
+                timeoutTask.cancel()
+            }
 
             sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
                 guard channelType == .session else {
