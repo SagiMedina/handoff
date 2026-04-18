@@ -1,9 +1,14 @@
 package com.handoff.app
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import android.os.Bundle
 import android.util.Log
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
+import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.padding
@@ -17,29 +22,38 @@ import com.handoff.app.data.TmuxSession
 import com.handoff.app.data.BiometricKeyStore
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
-import com.handoff.app.data.SshManager
-import com.handoff.app.data.TailscaleManager
-import com.handoff.app.data.TerminalSessionHolder
+import com.handoff.app.service.HandoffConnectionService
 import com.handoff.app.ui.screens.*
 import com.handoff.app.ui.theme.HandoffTheme
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
 
-    private val sshManager = SshManager()
-    private val tailscaleManager by lazy {
-        TailscaleManager(HandoffApp.appFilesDir)
-    }
-    private val terminalHolder by lazy {
-        TerminalSessionHolder(applicationContext)
-    }
+    // Holders live in HandoffApp so their state — SSH channel, tmux scrollback, tsnet
+    // tunnel — survives the Activity. HandoffConnectionService keeps the process alive
+    // so they're not just leaked: killed when the user explicitly disconnects.
+    private val sshManager get() = HandoffApp.instance.sshManager
+    private val tailscaleManager get() = HandoffApp.instance.tailscaleManager
+    private val terminalHolder get() = HandoffApp.instance.terminalHolder
     // Sessions list cache that survives navigating in/out of the terminal screen —
     // avoids flashing a loading spinner on every return to the sessions list.
     private val sessionsCache = mutableStateOf<List<TmuxSession>>(emptyList())
 
+    private val requestNotificationPermission = registerForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { /* best-effort: if denied, service still runs but notification won't be visible */ }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+
+        // Android 13+ requires an explicit runtime grant for the foreground-service notification.
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            val granted = ContextCompat.checkSelfPermission(
+                this, Manifest.permission.POST_NOTIFICATIONS,
+            ) == PackageManager.PERMISSION_GRANTED
+            if (!granted) requestNotificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+        }
 
         val configStore = ConfigStore(applicationContext)
         val biometricKeyStore = BiometricKeyStore(applicationContext)
@@ -139,6 +153,11 @@ class MainActivity : FragmentActivity() {
                                 scope.launch {
                                     val savedConfig = config ?: configStore.load()
                                     if (savedConfig != null) config = savedConfig
+                                    // Claim foreground priority the moment we have a live
+                                    // Tailscale tunnel — from here on, the process needs
+                                    // to survive backgrounding or every SSH channel dies
+                                    // when the user switches apps.
+                                    HandoffConnectionService.start(applicationContext)
                                     val pv = savedConfig?.protocolVersion ?: 1
                                     // v1: go straight to sessions. v2: go through verify,
                                     // which internally checks if device is already active
@@ -177,6 +196,7 @@ class MainActivity : FragmentActivity() {
                                 },
                                 onUnpair = {
                                     scope.launch {
+                                        HandoffConnectionService.disconnect(applicationContext)
                                         sshManager.disconnect()
                                         terminalHolder.disconnect()
                                         tailscaleManager.resetState()
@@ -257,11 +277,7 @@ class MainActivity : FragmentActivity() {
         }
     }
 
-    override fun onDestroy() {
-        super.onDestroy()
-        sshManager.disconnect()
-        terminalHolder.disconnect()
-        tailscaleManager.stopProxy()
-        tailscaleManager.stop()
-    }
+    // No teardown in onDestroy: the Activity may be recreated while the user still
+    // wants the connection up. Disconnect happens via HandoffConnectionService — either
+    // the notification's Disconnect action, a swipe dismissal, or Unpair.
 }
