@@ -69,9 +69,14 @@ final class TerminalChannelHandler: ChannelDuplexHandler {
         )
         context.triggerUserOutboundEvent(envRequest, promise: nil)
 
-        // 3. Execute tmux attach command
+        // 3. Execute the attach command as constructed. We do NOT prepend a
+        //    shell `export LANG=…` here — v2 gate commands are parsed as a
+        //    whole by the Mac's `handoff gate` forced-command and anything
+        //    other than a bare `attach …` would be rejected as
+        //    error:unknown_command. v1 callers that need LANG include it
+        //    themselves in `command`.
         let execRequest = SSHChannelRequestEvent.ExecRequest(
-            command: "export LANG=en_US.UTF-8; \(command)",
+            command: command,
             wantReply: true
         )
         context.triggerUserOutboundEvent(execRequest, promise: nil)
@@ -177,7 +182,16 @@ extension SSHManager {
         }
 
         let escaped = session.replacingOccurrences(of: "'", with: "'\\''")
-        let command = "\(tmuxPath) attach -t '\(escaped):\(window)'"
+        // v2: gate handles LANG and tmux attach. The SSH forced-command
+        // rejects anything that isn't a bare `attach …`.
+        // v1: we still shell raw tmux, with LANG prefix for UTF-8 glyphs
+        // (tmux doesn't always inherit it from the non-login SSH env).
+        let command: String
+        if protocolVersion >= 2 {
+            command = "attach \(session) \(window)"
+        } else {
+            command = "export LANG=en_US.UTF-8; \(tmuxPath) attach -t '\(escaped):\(window)'"
+        }
 
         let handler = try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<TerminalChannelHandler> in
             let readyPromise = parentChannel.eventLoop.makePromise(of: Void.self)
