@@ -27,6 +27,11 @@ struct ContentView: View {
                     WelcomeView(path: $path)
                 } else if !tailscaleReady {
                     TailscaleAuthView(tailscale: tailscale)
+                } else if configStore.pendingVerification {
+                    // v2-only: run the gate pairing handshake before anything
+                    // else. VerificationView flips pendingVerification off on
+                    // success, re-routing here to SessionsView.
+                    VerificationView(tailscale: tailscale)
                 } else {
                     SessionsView(path: $path, tailscale: tailscale)
                 }

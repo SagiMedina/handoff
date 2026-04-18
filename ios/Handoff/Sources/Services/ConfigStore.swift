@@ -17,12 +17,20 @@ final class ConfigStore: ObservableObject {
         static let tmuxPath = "handoff.tmuxPath"
         static let protocolVersion = "handoff.protocolVersion"
         static let nonce = "handoff.nonce"
+        static let pendingVerification = "handoff.pendingVerification"
     }
 
     @Published private(set) var config: ConnectionConfig?
 
+    /// True immediately after a v2 QR is scanned and false once the device has
+    /// completed the verification handshake with the Mac (or for any v1
+    /// pairing, which has no verification step). Persisted so a mid-pair
+    /// force-quit still routes back to the verification screen on relaunch.
+    @Published private(set) var pendingVerification: Bool = false
+
     init() {
         self.config = load()
+        self.pendingVerification = defaults.bool(forKey: Keys.pendingVerification)
     }
 
     var isPaired: Bool { config != nil }
@@ -40,7 +48,20 @@ final class ConfigStore: ObservableObject {
         defaults.set(config.protocolVersion, forKey: Keys.protocolVersion)
         defaults.set(config.nonce, forKey: Keys.nonce)
 
+        // v2 pairings enter the verification handshake next; v1 has no such
+        // step and is considered ready for Sessions immediately.
+        let needsVerification = config.protocolVersion >= 2
+        defaults.set(needsVerification, forKey: Keys.pendingVerification)
+
         self.config = config
+        self.pendingVerification = needsVerification
+    }
+
+    /// Marks the device as verified after a successful gate handshake. Safe to
+    /// call repeatedly.
+    func markVerified() {
+        defaults.set(false, forKey: Keys.pendingVerification)
+        pendingVerification = false
     }
 
     // MARK: - Load
@@ -79,7 +100,9 @@ final class ConfigStore: ObservableObject {
         defaults.removeObject(forKey: Keys.tmuxPath)
         defaults.removeObject(forKey: Keys.protocolVersion)
         defaults.removeObject(forKey: Keys.nonce)
+        defaults.removeObject(forKey: Keys.pendingVerification)
         config = nil
+        pendingVerification = false
     }
 
     // MARK: - Keychain
