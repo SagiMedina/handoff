@@ -20,6 +20,18 @@ final class SSHManager: ObservableObject {
     /// The active SSH connection's channel, if connected.
     var isConnected: Bool { parentChannel?.isActive ?? false }
 
+    // MARK: - Gate protocol state
+    //
+    // `protocolVersion` is lifted from the active ConnectionConfig at connect()
+    // time. v1 = raw tmux commands over SSH; v2 = `handoff gate` forced-command
+    // with per-device permissions and typed errors. Branching lives in each
+    // high-level method so call sites are unchanged.
+    private(set) var protocolVersion: Int = 1
+
+    /// Permissions reported by the gate's `list` header (`#permissions:…`).
+    /// Nil while disconnected or on v1 pairings. Updated on each `list` call.
+    @Published var devicePermissions: DevicePermissions?
+
     // MARK: - Connect
 
     /// SOCKS5 proxy info for routing SSH through (e.g., Tailscale's loopback).
@@ -38,6 +50,12 @@ final class SSHManager: ObservableObject {
     func connect(config: ConnectionConfig, proxy: SOCKSProxy? = nil) async throws {
         // Tear down any existing connection to prevent resource leaks on retry
         disconnect()
+
+        // Capture the negotiated protocol version for the duration of this
+        // connection so every downstream command branches consistently. v1 =
+        // raw tmux over SSH; v2 = `handoff gate` forced-command with typed
+        // errors and permission headers.
+        self.protocolVersion = config.protocolVersion
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
@@ -103,30 +121,60 @@ final class SSHManager: ObservableObject {
 
     // MARK: - Discovery (one-shot exec)
 
-    /// List tmux sessions on the remote Mac.
+    /// List tmux sessions on the remote Mac. On v2 this goes through the
+    /// gate's `list` command (which also emits a `#permissions:` header we
+    /// stash on `devicePermissions`). On v1 we still shell raw tmux.
     func listSessions(tmuxPath: String) async throws -> [TmuxSession] {
-        let output = try await executeCommand("\(tmuxPath) list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null")
+        let command = protocolVersion >= 2
+            ? "list"
+            : "\(tmuxPath) list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null"
+        let output = try await executeCommand(command)
 
-        return output
-            .split(separator: "\n")
-            .compactMap { line -> TmuxSession? in
-                let parts = line.split(separator: ":", maxSplits: 1)
-                guard parts.count == 2,
-                      let windowCount = Int(parts[1]) else { return nil }
-                return TmuxSession(
-                    name: String(parts[0]),
-                    windowCount: windowCount,
-                    windows: []
-                )
+        var lines = output
+            .split(separator: "\n", omittingEmptySubsequences: false)
+            .map(String.init)
+
+        // v2: consume the permissions header if present. We publish the parsed
+        // value so UI can update its read-only / session-scope surfaces.
+        if protocolVersion >= 2, let first = lines.first, first.hasPrefix("#permissions:") {
+            let parsed = DevicePermissions.parse(header: first)
+            Task { @MainActor [weak self] in
+                self?.devicePermissions = parsed
             }
+            lines.removeFirst()
+        }
+
+        // v2: a lone `error:*` line is a gate-level refusal, not an empty list.
+        let trimmedJoined = lines.joined(separator: "\n").trimmingCharacters(in: .whitespacesAndNewlines)
+        if protocolVersion >= 2, let err = GateError.from(line: trimmedJoined) {
+            throw err
+        }
+
+        return lines.compactMap { line -> TmuxSession? in
+            guard !line.isEmpty else { return nil }
+            let parts = line.split(separator: ":", maxSplits: 1)
+            guard parts.count == 2, let windowCount = Int(parts[1]) else { return nil }
+            return TmuxSession(
+                name: String(parts[0]),
+                windowCount: windowCount,
+                windows: []
+            )
+        }
     }
 
-    /// List windows (tabs) in a tmux session.
+    /// List windows (tabs) in a tmux session. v2 goes through `windows <sess>`;
+    /// v1 shells raw tmux. The per-line wire format is identical for both paths.
     func listWindows(tmuxPath: String, session: String) async throws -> [TmuxWindow] {
         let escaped = session.replacingOccurrences(of: "'", with: "'\\''")
-        let output = try await executeCommand(
-            "\(tmuxPath) list-windows -t '\(escaped)' -F '#{window_index}|#{pane_title}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null"
-        )
+        let command = protocolVersion >= 2
+            ? "windows \(session)"
+            : "\(tmuxPath) list-windows -t '\(escaped)' -F '#{window_index}|#{pane_title}|#{pane_current_command}|#{pane_current_path}' 2>/dev/null"
+        let output = try await executeCommand(command)
+
+        if protocolVersion >= 2,
+           let err = GateError.from(line: output.trimmingCharacters(in: .whitespacesAndNewlines)) {
+            throw err
+        }
 
         return output
             .split(separator: "\n", omittingEmptySubsequences: true)
@@ -175,29 +223,84 @@ final class SSHManager: ObservableObject {
     /// Create a new tmux session.
     func createSession(tmuxPath: String, name: String) async throws {
         let escaped = name.replacingOccurrences(of: "'", with: "'\\''")
-        _ = try await executeCommand("\(tmuxPath) new-session -d -s '\(escaped)'")
+        let command = protocolVersion >= 2
+            ? "create-session \(name)"
+            : "\(tmuxPath) new-session -d -s '\(escaped)'"
+        let output = try await executeCommand(command)
+        try throwIfGateError(output)
     }
 
     /// Kill an entire tmux session.
     func killSession(tmuxPath: String, name: String) async throws {
         let escaped = name.replacingOccurrences(of: "'", with: "'\\''")
-        _ = try await executeCommand("\(tmuxPath) kill-session -t '\(escaped)'")
+        let command = protocolVersion >= 2
+            ? "kill-session \(name)"
+            : "\(tmuxPath) kill-session -t '\(escaped)'"
+        let output = try await executeCommand(command)
+        try throwIfGateError(output)
     }
 
     /// Kill a single window within a tmux session.
     func killWindow(tmuxPath: String, session: String, windowIndex: Int) async throws {
         let escaped = session.replacingOccurrences(of: "'", with: "'\\''")
-        _ = try await executeCommand("\(tmuxPath) kill-window -t '\(escaped):\(windowIndex)'")
+        let command = protocolVersion >= 2
+            ? "kill-window \(session) \(windowIndex)"
+            : "\(tmuxPath) kill-window -t '\(escaped):\(windowIndex)'"
+        let output = try await executeCommand(command)
+        try throwIfGateError(output)
     }
 
     /// Create a new window in a tmux session. Returns the new window's index.
     func createWindow(tmuxPath: String, session: String) async throws -> Int {
         let escaped = session.replacingOccurrences(of: "'", with: "'\\''")
-        let output = try await executeCommand("\(tmuxPath) new-window -t '\(escaped)' -P -F '#{window_index}'")
+        let command = protocolVersion >= 2
+            ? "create-window \(session)"
+            : "\(tmuxPath) new-window -t '\(escaped)' -P -F '#{window_index}'"
+        let output = try await executeCommand(command)
+        try throwIfGateError(output)
         guard let index = Int(output.trimmingCharacters(in: .whitespacesAndNewlines)) else {
             throw SSHError.commandFailed("Could not parse window index from: \(output)")
         }
         return index
+    }
+
+    // MARK: - Gate-only commands
+
+    /// Send `pair <deviceName>` to the gate during verification. The Mac
+    /// responds with `verify:<6-digit code>`; callers display the code to the
+    /// user who confirms it matches what `handoff pair` is showing on the Mac.
+    /// Only meaningful on v2. Returns the raw wire string (including the
+    /// `verify:` prefix) so tests can pin on the exact shape.
+    func sendPairCommand(deviceName: String) async throws -> String {
+        guard protocolVersion >= 2 else {
+            throw SSHError.commandFailed("pair is only available on v2 pairings")
+        }
+        let output = try await executeCommand("pair \(deviceName)")
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        try throwIfGateError(trimmed)
+        return trimmed
+    }
+
+    /// Request renewal when the device is soft-expired. Mac responds with
+    /// `requested` on success. Only meaningful on v2.
+    @discardableResult
+    func requestRenewal() async throws -> String {
+        guard protocolVersion >= 2 else {
+            throw SSHError.commandFailed("renew is only available on v2 pairings")
+        }
+        let output = try await executeCommand("renew")
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        try throwIfGateError(trimmed)
+        return trimmed
+    }
+
+    /// Throws `GateError` if `output` starts with `error:` (only meaningful on
+    /// v2 — a v1 tmux command never emits that prefix). Kept as a tiny helper
+    /// so every gate-aware call site reads uniformly.
+    private func throwIfGateError(_ output: String) throws {
+        guard protocolVersion >= 2 else { return }
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let err = GateError.from(line: trimmed) { throw err }
     }
 
     // MARK: - Execute Command
@@ -243,6 +346,12 @@ final class SSHManager: ObservableObject {
         sshHandler = nil
         try? group?.syncShutdownGracefully()
         group = nil
+        // Reset gate state so a subsequent v1 pairing doesn't inherit stale v2
+        // permissions from the prior session.
+        protocolVersion = 1
+        Task { @MainActor [weak self] in
+            self?.devicePermissions = nil
+        }
     }
 
     // MARK: - Key Parsing
