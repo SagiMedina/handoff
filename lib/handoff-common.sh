@@ -237,7 +237,41 @@ with open('$HANDOFF_DEVICES', 'w') as f:
 "
 }
 
-# List all devices as "fingerprint|name|status" lines
+# Render an ISO-8601-ish timestamp as a short relative duration.
+# "never" or empty → "never"; past → "expired"; future → "3d 4h" / "12h" / "45m".
+format_relative_time() {
+    local ts="${1:-}"
+    if [[ -z "$ts" || "$ts" == "never" ]]; then
+        echo "never"
+        return
+    fi
+    python3 -c "
+import sys
+from datetime import datetime, timezone
+raw = '$ts'
+try:
+    t = datetime.fromisoformat(raw.replace('Z', '+00:00'))
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+except Exception:
+    print(raw[:19])
+    sys.exit(0)
+now = datetime.now(timezone.utc)
+delta = t - now
+secs = int(delta.total_seconds())
+if secs <= 0:
+    print('expired')
+    sys.exit(0)
+days, rem = divmod(secs, 86400)
+hours, rem = divmod(rem, 3600)
+mins = rem // 60
+if days > 0: print(f'{days}d {hours}h')
+elif hours > 0: print(f'{hours}h {mins}m')
+else: print(f'{mins}m')
+"
+}
+
+# List all devices as "fingerprint|name|status|sessions|mode|expiry|last_seen|renewal_requested"
 devices_json_list() {
     python3 -c "
 import json
@@ -248,7 +282,8 @@ for d in data['devices']:
     ro = 'read-only' if d.get('read_only') else 'read/write'
     exp = d.get('soft_expiry', 'never')
     last = d.get('last_seen') or 'never'
-    print(f\"{d['fingerprint']}|{d['name']}|{d['status']}|{sessions}|{ro}|{exp}|{last}\")
+    renewal = 'true' if d.get('renewal_requested') else 'false'
+    print(f\"{d['fingerprint']}|{d['name']}|{d['status']}|{sessions}|{ro}|{exp}|{last}|{renewal}\")
 "
 }
 
