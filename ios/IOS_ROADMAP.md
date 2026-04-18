@@ -22,13 +22,17 @@ iOS is still effectively a v1 client: it parses only QR `v=1`, talks raw tmux ov
 ### Android reference implementation
 - `android/app/src/main/java/com/handoff/app/data/SshManager.kt`
 - `android/app/src/main/java/com/handoff/app/data/ConnectionConfig.kt`
+- `android/app/src/main/java/com/handoff/app/data/TerminalSessionHolder.kt`
 - `android/app/src/main/java/com/handoff/app/data/ErrorMessages.kt`
+- `android/app/src/main/java/com/handoff/app/service/HandoffConnectionService.kt`
 - `android/app/src/main/java/com/handoff/app/ui/screens/ScanScreen.kt`
 - `android/app/src/main/java/com/handoff/app/ui/screens/VerificationScreen.kt`
 - `android/app/src/main/java/com/handoff/app/ui/screens/SessionsScreen.kt`
 - `android/app/src/main/java/com/handoff/app/ui/screens/TerminalScreen.kt`
 - `android/app/src/main/java/com/handoff/app/ui/screens/SettingsScreen.kt`
 - `android/app/src/main/java/com/handoff/app/ui/screens/BiometricGateScreen.kt`
+- `android/app/src/main/java/com/handoff/app/ui/components/SessionCard.kt`
+- `android/app/src/main/java/com/handoff/app/ui/components/MobileToolbar.kt`
 - `android/app/src/main/java/com/handoff/app/MainActivity.kt`
 
 ### iOS current state
@@ -71,13 +75,18 @@ Scope
 - Change window listing from raw `tmux list-windows` to `windows <session>`.
 - Change session/window mutations from raw tmux calls to `create-session`, `create-window`, `kill-session`, and `kill-window`.
 - Add a gate-aware command execution layer in `SSHManager` instead of embedding raw tmux strings throughout views.
+- Mirror the functional behavior and information architecture of the redesigned Android sessions flow in `ceaf9fb`, but do not block this branch on pixel-perfect visual parity.
+- Defer exact visual matching of the new `SessionsScreen.kt` and `SessionCard.kt` styling until the gate path is stable; functional parity comes first because the current blocker is protocol coverage, not surface polish.
 References
 - `android/app/src/main/java/com/handoff/app/data/SshManager.kt`
+- `android/app/src/main/java/com/handoff/app/ui/screens/SessionsScreen.kt`
+- `android/app/src/main/java/com/handoff/app/ui/components/SessionCard.kt`
 - `bin/handoff` `cmd_gate`
 Acceptance criteria
 - iOS no longer shells raw tmux for session discovery or create/kill operations in the v2 path.
 - Session visibility matches gate filtering from the Mac.
 - Attempts to mutate state on a read-only device fail through gate errors, not raw tmux behavior.
+- The iOS sessions flow exposes the same core actions and state as the redesigned Android screen even if the final styling is deferred.
 Estimated branch name: `ios-v2-pairing-gate`
 Depends on: `Adopt QR v2 parsing and config modeling`
 
@@ -162,6 +171,29 @@ Acceptance criteria
 Estimated branch name: `ios-settings-security`
 Depends on: `Parse gate permissions and surface gate-specific errors`
 
+#### Define and implement iOS background connection survival
+Why it matters: Android now keeps the SSH/tunnel stack alive in the background via a foreground service; iOS needs a platform-idiomatic equivalent or an explicit fast-resume story to meet parity expectations.
+Scope
+- Decide the iOS strategy for brief backgrounding: true background survival where platform rules allow it, or explicit teardown plus deterministic foreground resume.
+- Treat this as an iOS-native design problem, not a direct port of Android's foreground service model.
+- Integrate the chosen strategy with `TailscaleManager`, `TerminalSessionStore`, and terminal/session restoration.
+- Mark any OS-level primitive choice beyond this analysis as `TBD — not yet analyzed` until implementation work starts.
+References
+- `android/app/src/main/java/com/handoff/app/service/HandoffConnectionService.kt`
+- `android/app/src/main/java/com/handoff/app/MainActivity.kt`
+- `android/app/src/main/java/com/handoff/app/data/TerminalSessionHolder.kt`
+- `ios/Handoff/Sources/Services/TailscaleManager.swift`
+- `ios/Handoff/Sources/Services/TerminalSessionStore.swift`
+- `ios/Handoff/Sources/Views/TerminalView.swift`
+Acceptance criteria
+- Briefly backgrounding the iOS app does not strand the user in a dead terminal state.
+- The chosen behavior is documented and testable: either the live connection survives within iOS limits, or foregrounding performs deterministic restore without losing tmux continuity.
+- The implementation does not rely on Android-specific foreground-service assumptions.
+Estimated branch name: `ios-background-survival`
+Depends on
+- `Route terminal attach through the gate`
+- `Tighten sessions-level reconnect behavior`
+
 #### Add a biometric app lock on iOS
 Why it matters: Android already gates entry behind a biometric/PIN app lock path; iOS needs the same release-facing control.
 Scope
@@ -219,15 +251,20 @@ Depends on: `Parse gate permissions and surface gate-specific errors`
 Why it matters: Android's sessions screen is currently more aggressive about recovering stale tunnel and SSH state than iOS.
 Scope
 - Harden `SessionsView.swift` reconnect behavior after backgrounding or stale proxy state.
+- Align iOS sessions-list persistence with Android's `TerminalSessionHolder.kt` and cached sessions flow, while keeping iOS's existing `TerminalSessionStore.swift` terminal persistence model.
 - Reuse the current iOS `TailscaleManager` state machine rather than rewriting networking.
-- Align sessions-level recovery with the more robust reconnect expectations already present in `TerminalView.swift`.
+- Align sessions-level recovery with the redesigned Android `SessionsScreen.kt`, which now refreshes silently from cache and reconnects more deliberately.
 References
 - `android/app/src/main/java/com/handoff/app/ui/screens/SessionsScreen.kt`
+- `android/app/src/main/java/com/handoff/app/data/TerminalSessionHolder.kt`
+- `android/app/src/main/java/com/handoff/app/service/HandoffConnectionService.kt`
 - `android/app/src/main/java/com/handoff/app/data/TailscaleManager.kt`
 - `ios/Handoff/Sources/Services/TailscaleManager.swift`
+- `ios/Handoff/Sources/Services/TerminalSessionStore.swift`
 - `ios/Handoff/Sources/Views/SessionsView.swift`
 - `ios/Handoff/Sources/Views/TerminalView.swift`
 Acceptance criteria
+- Returning from terminal navigation reuses cached list/terminal state where iOS already has it, without unnecessary loading churn.
 - Returning to the sessions screen after stale tunnel/SSH state triggers a deterministic reconnect path.
 - Users are not stranded on generic connection errors when a clean Tailscale restart would recover the session.
 - Networking behavior remains compatible with embedded TailscaleKit and SOCKS5 auth.
@@ -268,6 +305,24 @@ Acceptance criteria
 Estimated branch name: `ios-unpair-alignment`
 Depends on: none
 
+#### Bring terminal keyboard and toolbar behavior to parity
+Why it matters: Android picked up concrete terminal-input fixes in the last 24 hours that materially affect daily terminal use.
+Scope
+- Audit iOS terminal input against the Android fixes for Shift+Enter, sticky modifier chaining, toolbar key layout, and keyboard show/hide resilience.
+- Port only the behavior-level fixes that make sense on iOS; do not cargo-cult Android key layout choices without validating iOS ergonomics.
+- Treat any exact visual/layout match beyond behavior parity as secondary.
+References
+- `android/app/src/main/java/com/handoff/app/ui/components/MobileToolbar.kt`
+- `android/app/src/main/java/com/handoff/app/ui/screens/TerminalScreen.kt`
+- commits `afa13b4`, `093def6`, `158776a`, `f2cfaf3`, `45cc7d2`
+- `ios/Handoff/Sources/Views/MobileToolbar.swift`
+- `ios/Handoff/Sources/Views/TerminalView.swift`
+Acceptance criteria
+- iOS terminal input supports the same high-value behaviors Android now does where platform semantics permit: Shift+Enter-style newline behavior, modifier chaining, and stable keyboard show/hide handling.
+- The roadmap item remains behavior-focused; any iOS-specific deviations are intentional and documented.
+Estimated branch name: `ios-terminal-keyboard-parity`
+Depends on: `Route terminal attach through the gate`
+
 #### Align platform copy and state naming after functional parity lands
 Why it matters: copy cleanup is low value until the actual lifecycle and permission model match.
 Scope
@@ -298,6 +353,7 @@ Depends on
 - Android's biometric implementation is an app-entry UI gate, not hardware-bound SSH key protection. See `android/app/src/main/java/com/handoff/app/data/BiometricKeyStore.kt`.
 - There is no in-app access-log surface on Android main.
 - Android has a protocol hook for renewal requests, but a polished in-app renewal UX was not found in the analyzed Android UI paths.
+- Android now persists the sessions list and terminal session across navigation via `android/app/src/main/java/com/handoff/app/data/TerminalSessionHolder.kt`; iOS already had the same broad terminal-persistence idea in `ios/Handoff/Sources/Services/TerminalSessionStore.swift`, so that specific gap is smaller than it looked before the upstream update.
 
 ## Suggested Branch Sequence
 - `ios-v2-pairing-gate`
@@ -306,3 +362,7 @@ Depends on
   - Next make the new gate path legible by parsing permissions, honoring read-only mode, and turning gate failures into specific recovery UI.
 - `ios-settings-security`
   - Then add the release-facing security and settings surfaces: biometric app lock, acknowledgements, reset entry points, and the final home for TOFU controls.
+- `ios-background-survival`
+  - Then solve the iOS-specific background story once the gate path and reconnect model are stable; this is a platform design problem, not an Android service port.
+- `ios-terminal-keyboard-parity`
+  - Finish with terminal input polish after the connection and lifecycle layers are stable, so keyboard behavior is tuned against the final terminal stack instead of a moving target.
