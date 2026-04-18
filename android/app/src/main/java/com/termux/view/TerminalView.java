@@ -1031,14 +1031,30 @@ public final class TerminalView extends View {
     /**
      * When the view is shorter than the emulator's natural height (e.g. the keyboard is
      * covering the bottom of the screen but the emulator's PTY size is fixed), return
-     * a positive pixel offset that should be subtracted from the canvas Y so the bottom
-     * rows of the emulator render in the visible area instead of the top rows.
+     * a positive pixel offset that should be subtracted from the canvas Y so the
+     * cursor row stays inside the visible area.
+     *
+     * For a full screen (cursor near the bottom) this bottom-aligns the emulator; for
+     * a fresh/empty session (cursor near the top) it returns 0 so the prompt and top
+     * rows don't get clipped off the top.
      */
     public float getContentTopShiftPx() {
         if (mEmulator == null) return 0f;
-        float emulatorHeight = mEmulator.mRows * mRenderer.mFontLineSpacing;
+        float lineHeight = mRenderer.mFontLineSpacing;
+        // Match TerminalView.updateSize()'s row-fitting formula: the emulator's natural
+        // render height is mRows*lineSpacing + the top ascent offset, not just rows *
+        // lineSpacing. Without the ascent term we under-shift by ~one ascent worth of
+        // pixels and clip the last visible row behind the toolbar.
+        float emulatorHeight = mEmulator.mRows * lineHeight + mRenderer.mFontLineSpacingAndAscent;
         float viewHeight = getHeight();
-        return Math.max(0f, emulatorHeight - viewHeight);
+        float overflow = emulatorHeight - viewHeight;
+        if (overflow <= 0f) return 0f;
+
+        // Bottom-align by default so content after the cursor (status bar, Claude UI,
+        // etc.) stays visible. Only reduce the shift if it would push the cursor line
+        // above the top of the viewport.
+        float cursorLineTop = mEmulator.getCursorRow() * lineHeight;
+        return Math.min(overflow, cursorLineTop);
     }
 
     @Override
