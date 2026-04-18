@@ -32,6 +32,13 @@ final class SSHManager: ObservableObject {
     /// Nil while disconnected or on v1 pairings. Updated on each `list` call.
     @Published var devicePermissions: DevicePermissions?
 
+    /// A fresh UUID per successful `connect()`. Published updates from
+    /// in-flight commands compare their captured ID against this one and drop
+    /// the write if the connection was torn down or rotated in the meantime —
+    /// otherwise a slow `list` response could publish stale permissions over
+    /// a later pairing.
+    private var connectionID: UUID?
+
     // MARK: - Connect
 
     /// SOCKS5 proxy info for routing SSH through (e.g., Tailscale's loopback).
@@ -56,6 +63,10 @@ final class SSHManager: ObservableObject {
         // raw tmux over SSH; v2 = `handoff gate` forced-command with typed
         // errors and permission headers.
         self.protocolVersion = config.protocolVersion
+
+        // Stamp this attempt so any in-flight @Published updates that land
+        // after a later disconnect/reconnect are dropped on the floor.
+        self.connectionID = UUID()
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
@@ -136,10 +147,15 @@ final class SSHManager: ObservableObject {
 
         // v2: consume the permissions header if present. We publish the parsed
         // value so UI can update its read-only / session-scope surfaces.
+        // Guard against stale writes: capture the connection ID now and only
+        // apply the update if we're still the active connection. Awaiting the
+        // MainActor hop is fine — the calling Task is already async.
         if protocolVersion >= 2, let first = lines.first, first.hasPrefix("#permissions:") {
             let parsed = DevicePermissions.parse(header: first)
-            Task { @MainActor [weak self] in
-                self?.devicePermissions = parsed
+            let capturedID = self.connectionID
+            await MainActor.run { [weak self] in
+                guard let self, self.connectionID == capturedID else { return }
+                self.devicePermissions = parsed
             }
             lines.removeFirst()
         }
@@ -347,8 +363,11 @@ final class SSHManager: ObservableObject {
         try? group?.syncShutdownGracefully()
         group = nil
         // Reset gate state so a subsequent v1 pairing doesn't inherit stale v2
-        // permissions from the prior session.
+        // permissions from the prior session. Invalidating the connection ID
+        // up-front means any still-in-flight @Published update from the last
+        // connection will fail its guard check and be dropped.
         protocolVersion = 1
+        connectionID = nil
         Task { @MainActor [weak self] in
             self?.devicePermissions = nil
         }

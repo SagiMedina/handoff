@@ -26,6 +26,7 @@ struct VerificationView: View {
     @State private var status: String = "Connecting to Mac…"
     @State private var verificationCode: String?
     @State private var errorMessage: String?
+    @State private var flowTask: Task<Void, Never>?
 
     private enum Phase: Equatable {
         case connecting
@@ -57,6 +58,11 @@ struct VerificationView: View {
             runFlow()
         }
         .onDisappear {
+            // Cancelling the flow task *and* disconnecting ensures a mid-poll
+            // unpair or route change can't keep reconnecting or call
+            // markVerified() against the now-cleared config.
+            flowTask?.cancel()
+            flowTask = nil
             sshManager.disconnect()
         }
     }
@@ -127,10 +133,17 @@ struct VerificationView: View {
 
     private func runFlow() {
         guard let config = configStore.config else { return }
-        Task {
+        // Cancel any prior flow before starting a new one (defensive: onAppear
+        // can fire more than once across view-identity boundaries).
+        flowTask?.cancel()
+        flowTask = Task {
             do {
                 try await verify(config: config)
+            } catch is CancellationError {
+                // User left the screen or unpaired. Nothing to surface.
+                return
             } catch {
+                if Task.isCancelled { return }
                 await MainActor.run {
                     errorMessage = (error as? LocalizedError)?.errorDescription
                         ?? error.localizedDescription
@@ -159,6 +172,7 @@ struct VerificationView: View {
         // List-first: if the device is already active, skip pairing entirely.
         do {
             _ = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
+            try Task.checkCancellation()
             await finish()
             return
         } catch let err as GateError where err.code == .pending {
@@ -167,6 +181,7 @@ struct VerificationView: View {
             throw error
         }
 
+        try Task.checkCancellation()
         let deviceName = UIDevice.current.name.isEmpty ? "iPhone" : UIDevice.current.name
         let response = try await sshManager.sendPairCommand(deviceName: deviceName)
         guard response.hasPrefix("verify:") else {
@@ -182,14 +197,21 @@ struct VerificationView: View {
         // Poll up to 60s (30 × 2s) for the Mac operator to accept pairing.
         // Each iteration reconnects because the gate closes the channel after
         // it emits `verify:` — a fresh `list` is how we learn the new status.
+        // Cancellation checks bracket every step so an unpair / view-leave
+        // aborts the loop instead of mutating state against a dead config.
         for _ in 0..<30 {
             try await Task.sleep(nanoseconds: 2_000_000_000)
-            if Task.isCancelled { return }
+            try Task.checkCancellation()
             sshManager.disconnect()
+            try Task.checkCancellation()
             do {
                 try await sshManager.connect(config: config, proxy: proxy)
+                try Task.checkCancellation()
                 _ = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
+                try Task.checkCancellation()
                 await finish()
+                return
+            } catch is CancellationError {
                 return
             } catch let err as GateError {
                 switch err.code {
@@ -216,6 +238,10 @@ struct VerificationView: View {
 
     @MainActor
     private func finish() {
+        // Final guard: if the task was cancelled between the last check and
+        // here, don't flip pendingVerification — the user may have already
+        // unpaired or been routed away.
+        if Task.isCancelled { return }
         configStore.markVerified()
     }
 
