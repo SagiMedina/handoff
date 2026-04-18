@@ -15,6 +15,8 @@ final class ConfigStore: ObservableObject {
         static let ip = "handoff.ip"
         static let user = "handoff.user"
         static let tmuxPath = "handoff.tmuxPath"
+        static let protocolVersion = "handoff.protocolVersion"
+        static let nonce = "handoff.nonce"
     }
 
     @Published private(set) var config: ConnectionConfig?
@@ -35,6 +37,8 @@ final class ConfigStore: ObservableObject {
         defaults.set(config.ip, forKey: Keys.ip)
         defaults.set(config.user, forKey: Keys.user)
         defaults.set(config.tmuxPath, forKey: Keys.tmuxPath)
+        defaults.set(config.protocolVersion, forKey: Keys.protocolVersion)
+        defaults.set(config.nonce, forKey: Keys.nonce)
 
         self.config = config
     }
@@ -49,7 +53,21 @@ final class ConfigStore: ObservableObject {
             return nil
         }
 
-        return ConnectionConfig(ip: ip, user: user, privateKey: privateKey, tmuxPath: tmuxPath)
+        // protocolVersion defaults to 1 for pre-v2 installs: a missing key reads
+        // back as 0, which we treat as v1 so old pairings keep working after the
+        // app is upgraded.
+        let storedVersion = defaults.integer(forKey: Keys.protocolVersion)
+        let protocolVersion = storedVersion == 0 ? 1 : storedVersion
+        let nonce = defaults.string(forKey: Keys.nonce) ?? ""
+
+        return ConnectionConfig(
+            ip: ip,
+            user: user,
+            privateKey: privateKey,
+            tmuxPath: tmuxPath,
+            protocolVersion: protocolVersion,
+            nonce: nonce
+        )
     }
 
     // MARK: - Unpair
@@ -59,6 +77,8 @@ final class ConfigStore: ObservableObject {
         defaults.removeObject(forKey: Keys.ip)
         defaults.removeObject(forKey: Keys.user)
         defaults.removeObject(forKey: Keys.tmuxPath)
+        defaults.removeObject(forKey: Keys.protocolVersion)
+        defaults.removeObject(forKey: Keys.nonce)
         config = nil
     }
 
