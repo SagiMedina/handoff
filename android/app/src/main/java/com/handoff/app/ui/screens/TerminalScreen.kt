@@ -26,6 +26,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
+import com.handoff.app.data.HostKeyMismatchException
+import com.handoff.app.data.HostKeyUnknownException
+import com.handoff.app.data.PendingTrustRequest
 import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
@@ -53,7 +56,10 @@ fun TerminalScreen(
     onDisconnect: () -> Unit
 ) {
     var error by remember { mutableStateOf<String?>(null) }
+    var pendingTrust by remember { mutableStateOf<PendingTrustRequest?>(null) }
+    var hostKeyMismatch by remember { mutableStateOf<HostKeyMismatchException?>(null) }
     var termView by remember { mutableStateOf<TerminalView?>(null) }
+    var retryToken by remember { mutableIntStateOf(0) }
     val modifiers = remember { ModifierState() }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
@@ -123,7 +129,40 @@ fun TerminalScreen(
         }
     }
 
-    LaunchedEffect(sessionName, windowIndex) {
+    pendingTrust?.let { request ->
+        HostKeyTrustDialog(
+            request = request,
+            onTrust = {
+                terminalHolder.sshManager.approveTrust(request)
+                pendingTrust = null
+                error = null
+                retryToken++
+            },
+            onReject = {
+                pendingTrust = null
+                error = "SSH key trust was cancelled."
+            }
+        )
+    }
+
+    hostKeyMismatch?.let { mismatch ->
+        HostKeyMismatchDialog(
+            error = mismatch,
+            onResetTrust = {
+                terminalHolder.sshManager.resetTrust(mismatch.host)
+                hostKeyMismatch = null
+                error = null
+                retryToken++
+            },
+            onCancel = {
+                hostKeyMismatch = null
+                error = "SSH key verification was cancelled."
+            }
+        )
+    }
+
+    LaunchedEffect(sessionName, windowIndex, retryToken) {
+        error = null
         while (termView == null) { delay(50) }
         val view = termView!!
         while (view.width == 0 || view.height == 0) { delay(50) }
@@ -141,6 +180,14 @@ fun TerminalScreen(
                 val imm = context.getSystemService(Context.INPUT_METHOD_SERVICE) as InputMethodManager
                 imm.showSoftInput(view, InputMethodManager.SHOW_IMPLICIT)
             }
+        } catch (e: HostKeyUnknownException) {
+            terminalHolder.disconnect()
+            tailscaleManager.stopProxy()
+            pendingTrust = e.request
+        } catch (e: HostKeyMismatchException) {
+            terminalHolder.disconnect()
+            tailscaleManager.stopProxy()
+            hostKeyMismatch = e
         } catch (e: Exception) {
             if (BuildConfig.DEBUG) Log.e("Handoff", "SSH failed", e)
             error = friendlyConnectionError(e)

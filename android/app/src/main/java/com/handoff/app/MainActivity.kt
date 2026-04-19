@@ -146,6 +146,7 @@ class MainActivity : FragmentActivity() {
                                             snackbarHostState.showSnackbar(errorMsg)
                                         }
                                         scope.launch {
+                                            HandoffConnectionService.disconnect(applicationContext)
                                             sshManager.disconnect()
                                             tailscaleManager.stopProxy()
                                             configStore.clear()
@@ -214,6 +215,7 @@ class MainActivity : FragmentActivity() {
                                         HandoffConnectionService.disconnect(applicationContext)
                                         sshManager.disconnect()
                                         terminalHolder.disconnect()
+                                        sshManager.resetTrust(currentConfig.ip)
                                         tailscaleManager.resetState()
                                         configStore.clear()
                                         config = null

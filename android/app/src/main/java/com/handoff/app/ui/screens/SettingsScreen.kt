@@ -13,6 +13,7 @@ import com.handoff.app.BuildConfig
 import com.handoff.app.data.BiometricKeyStore
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
+import com.handoff.app.data.HostKeyStore
 import kotlinx.coroutines.launch
 
 @Composable
@@ -29,6 +30,7 @@ fun SettingsScreen(
         .collectAsState(initial = ConfigStore.DEFAULT_TERMINAL_FONT_SIZE)
     var biometricEnabled by remember { mutableStateOf(biometricKeyStore.isBiometricEnabled) }
     var biometricAvailable by remember { mutableStateOf(false) }
+    var hasTrustedHostKey by remember { mutableStateOf(HostKeyStore(context.applicationContext).hasTrust(config.ip)) }
 
     LaunchedEffect(Unit) {
         val canAuth = BiometricManager.from(context)
@@ -141,6 +143,28 @@ fun SettingsScreen(
         )
 
         Spacer(modifier = Modifier.height(32.dp))
+
+        if (hasTrustedHostKey) {
+            Text(
+                text = "SSH Trust",
+                style = MaterialTheme.typography.titleMedium,
+                color = MaterialTheme.colorScheme.primary
+            )
+
+            Spacer(modifier = Modifier.height(12.dp))
+
+            TextButton(
+                onClick = {
+                    HostKeyStore(context.applicationContext).forget(config.ip)
+                    hasTrustedHostKey = false
+                },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text("Reset trusted SSH key")
+            }
+
+            Spacer(modifier = Modifier.height(32.dp))
+        }
 
         // Device info section
         Text(

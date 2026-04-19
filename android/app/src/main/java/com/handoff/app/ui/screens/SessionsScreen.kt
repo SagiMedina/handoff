@@ -23,6 +23,8 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.SolidColor
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
@@ -31,6 +33,9 @@ import androidx.compose.ui.unit.sp
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.GateException
+import com.handoff.app.data.HostKeyMismatchException
+import com.handoff.app.data.HostKeyUnknownException
+import com.handoff.app.data.PendingTrustRequest
 import com.handoff.app.data.friendlyActionError
 import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.friendlyGateError
@@ -70,10 +75,13 @@ fun SessionsScreen(
     var showIp by remember { mutableStateOf(false) }
     var readOnly by remember { mutableStateOf(false) }
     var filter by remember { mutableStateOf("") }
+    var pendingTrust by remember { mutableStateOf<PendingTrustRequest?>(null) }
+    var hostKeyMismatch by remember { mutableStateOf<HostKeyMismatchException?>(null) }
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
     val configStore = remember { ConfigStore(context.applicationContext) }
     val pinnedWindows by configStore.pinnedWindows.collectAsState(initial = emptySet())
+    val filterFocusRequester = remember { FocusRequester() }
 
     fun copyToClipboard(label: String, value: String) {
         val clip = context.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
@@ -132,6 +140,14 @@ fun SessionsScreen(
                 error = friendlyGateError(e.gateError)
                 sshManager.disconnect()
                 tailscaleManager.stopProxy()
+            } catch (e: HostKeyUnknownException) {
+                pendingTrust = e.request
+                sshManager.disconnect()
+                tailscaleManager.stopProxy()
+            } catch (e: HostKeyMismatchException) {
+                hostKeyMismatch = e
+                sshManager.disconnect()
+                tailscaleManager.stopProxy()
             } catch (e: Exception) {
                 error = friendlyConnectionError(e)
                 sshManager.disconnect()
@@ -149,8 +165,40 @@ fun SessionsScreen(
         // Auto-refresh every 5 seconds while screen is visible and connected
         while (true) {
             delay(5000)
-            if (!loading && error == null) refresh(showLoading = false)
+            if (!loading && error == null && pendingTrust == null && hostKeyMismatch == null) {
+                refresh(showLoading = false)
+            }
         }
+    }
+
+    pendingTrust?.let { request ->
+        HostKeyTrustDialog(
+            request = request,
+            onTrust = {
+                sshManager.approveTrust(request)
+                pendingTrust = null
+                refresh(forceReconnect = true)
+            },
+            onReject = {
+                pendingTrust = null
+                error = "SSH key trust was cancelled."
+            }
+        )
+    }
+
+    hostKeyMismatch?.let { mismatch ->
+        HostKeyMismatchDialog(
+            error = mismatch,
+            onResetTrust = {
+                sshManager.resetTrust(mismatch.host)
+                hostKeyMismatch = null
+                refresh(forceReconnect = true)
+            },
+            onCancel = {
+                hostKeyMismatch = null
+                error = "SSH key verification was cancelled."
+            }
+        )
     }
 
     if (showNewSessionDialog) {
@@ -273,6 +321,7 @@ fun SessionsScreen(
                     onValueChange = { filter = it },
                     matchCount = matchCount,
                     total = totalWindows,
+                    focusRequester = filterFocusRequester,
                     onClear = {
                         filter = ""
                         focusManager.clearFocus()
@@ -470,6 +519,9 @@ fun SessionsScreen(
             totalWindows = totalWindows,
             readOnly = readOnly,
             onCopyIp = { copyToClipboard("Tailscale IP", config.ip) },
+            onFocusFilter = if (totalWindows >= 6) ({
+                filterFocusRequester.requestFocus()
+            }) else null,
         )
     }
 }
@@ -480,6 +532,7 @@ private fun FilterRow(
     onValueChange: (String) -> Unit,
     matchCount: Int,
     total: Int,
+    focusRequester: FocusRequester,
     onClear: () -> Unit,
 ) {
     val scheme = MaterialTheme.colorScheme
@@ -522,7 +575,9 @@ private fun FilterRow(
                 singleLine = true,
                 cursorBrush = SolidColor(scheme.primary),
                 textStyle = MaterialTheme.typography.bodyLarge.copy(color = scheme.onBackground),
-                modifier = Modifier.fillMaxWidth(),
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .focusRequester(focusRequester),
             )
         }
         if (value.isNotEmpty()) {
@@ -556,6 +611,7 @@ private fun StatusBar(
     totalWindows: Int,
     readOnly: Boolean,
     onCopyIp: () -> Unit,
+    onFocusFilter: (() -> Unit)? = null,
 ) {
     val scheme = MaterialTheme.colorScheme
     val statusColor = if (readOnly) HandoffAmber else HandoffGreen
@@ -606,6 +662,13 @@ private fun StatusBar(
             text = "$totalWindows ${if (totalWindows == 1) "tab" else "tabs"}",
             style = MaterialTheme.typography.bodySmall,
             color = scheme.onSurfaceVariant,
+            modifier = Modifier
+                .then(
+                    if (onFocusFilter != null) {
+                        Modifier.clickable(onClick = onFocusFilter)
+                    } else Modifier
+                )
+                .padding(vertical = 2.dp),
         )
     }
 }

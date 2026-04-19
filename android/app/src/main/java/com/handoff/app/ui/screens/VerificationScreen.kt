@@ -14,12 +14,14 @@ import android.util.Log
 import com.handoff.app.BuildConfig
 import com.handoff.app.data.ConnectionConfig
 import com.handoff.app.data.GateException
+import com.handoff.app.data.HostKeyMismatchException
+import com.handoff.app.data.HostKeyUnknownException
+import com.handoff.app.data.PendingTrustRequest
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
 import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.friendlyGateError
 import kotlinx.coroutines.delay
-import kotlinx.coroutines.launch
 
 @Composable
 fun VerificationScreen(
@@ -32,90 +34,132 @@ fun VerificationScreen(
     var verificationCode by remember { mutableStateOf<String?>(null) }
     var status by remember { mutableStateOf("Connecting to Mac...") }
     var connecting by remember { mutableStateOf(true) }
-    val scope = rememberCoroutineScope()
+    var pendingTrust by remember { mutableStateOf<PendingTrustRequest?>(null) }
+    var hostKeyMismatch by remember { mutableStateOf<HostKeyMismatchException?>(null) }
+    var retryToken by remember { mutableIntStateOf(0) }
 
-    LaunchedEffect(Unit) {
-        scope.launch {
-            try {
-                // Connect via Tailscale + SSH
-                status = "Starting secure connection..."
-                if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: starting proxy")
-                val proxyPort = tailscaleManager.startProxy(config.ip)
-                if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: connecting SSH")
-                sshManager.connect(config, proxyPort)
-
-                // List-first: if device is already active, skip pairing entirely.
-                // Gate returns "error:pending" for pending devices, allowing through otherwise.
-                status = "Verifying with Mac..."
-                try {
-                    sshManager.listSessions(config.tmuxPath)
-                    if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: device already active")
-                    onVerified()
-                    return@launch
-                } catch (e: GateException) {
-                    if (e.gateError != "error:pending") throw e
-                    // Pending — fall through to pair flow
-                }
-
-                // Send pair command to gate (only for pending devices)
-                if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: sending pair command")
-                val response = sshManager.sendPairCommand()
-                if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: pair response=$response")
-
-                if (response.startsWith("verify:")) {
-                    val code = response.removePrefix("verify:")
-                    verificationCode = code
-                    connecting = false
-                    status = "Confirm this code on your Mac"
-
-                    // Poll: wait for Mac to confirm (device becomes active)
-                    // The gate will accept "list" once status is active
-                    var attempts = 0
-                    while (attempts < 30) {  // 60 seconds max
-                        delay(2000)
-                        attempts++
-                        try {
-                            sshManager.disconnect()
-                            val newPort = tailscaleManager.startProxy(config.ip)
-                            sshManager.connect(config, newPort)
-                            sshManager.listSessions(config.tmuxPath)
-                            // If list succeeds, device is active
-                            onVerified()
-                            return@launch
-                        } catch (e: GateException) {
-                            if (e.gateError == "error:pending") {
-                                // Still pending, keep waiting
-                                continue
-                            } else if (e.gateError == "error:not_found") {
-                                // Pairing was rejected or timed out
-                                onError("Pairing was rejected on the Mac.")
-                                return@launch
-                            }
-                        } catch (e: Exception) {
-                            // If SSH auth failed, the Mac deleted the device — either the
-                            // user rejected this pairing or an admin revoked it. Don't keep
-                            // polling for a minute; tell the user to re-pair and bail.
-                            val m = (e.message ?: "").lowercase()
-                            if ("auth fail" in m || "auth cancel" in m || "publickey" in m) {
-                                onError(
-                                    "Pairing was rejected. Run `handoff pair` on your Mac again."
-                                )
-                                return@launch
-                            }
-                            // Otherwise assume a transient connection error and retry.
-                        }
-                    }
-                    onError("Pairing timed out. Try again from your Mac.")
-                } else {
-                    onError("Unexpected response from Mac.")
-                }
-            } catch (e: GateException) {
-                if (BuildConfig.DEBUG) Log.e("Handoff", "VerificationScreen: gate error=${e.gateError}")
-                onError(friendlyGateError(e.gateError))
-            } catch (e: Exception) {
-                if (BuildConfig.DEBUG) Log.e("Handoff", "VerificationScreen: error", e)
-                onError(friendlyConnectionError(e))
+    pendingTrust?.let { request ->
+        HostKeyTrustDialog(
+            request = request,
+            onTrust = {
+                sshManager.approveTrust(request)
+                pendingTrust = null
+                connecting = true
+                retryToken++
+            },
+            onReject = {
+                pendingTrust = null
+                onError("SSH key trust was cancelled.")
             }
+        )
+    }
+
+    hostKeyMismatch?.let { mismatch ->
+        HostKeyMismatchDialog(
+            error = mismatch,
+            onResetTrust = {
+                sshManager.resetTrust(mismatch.host)
+                hostKeyMismatch = null
+                connecting = true
+                retryToken++
+            },
+            onCancel = {
+                hostKeyMismatch = null
+                onError("SSH key verification was cancelled.")
+            }
+        )
+    }
+
+    LaunchedEffect(retryToken) {
+        try {
+            connecting = true
+            verificationCode = null
+            // Connect via Tailscale + SSH
+            status = "Starting secure connection..."
+            if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: starting proxy")
+            val proxyPort = tailscaleManager.startProxy(config.ip)
+            if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: connecting SSH")
+            sshManager.connect(config, proxyPort)
+
+            // List-first: if device is already active, skip pairing entirely.
+            // Gate returns "error:pending" for pending devices, allowing through otherwise.
+            status = "Verifying with Mac..."
+            try {
+                sshManager.listSessions(config.tmuxPath)
+                if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: device already active")
+                onVerified()
+                return@LaunchedEffect
+            } catch (e: GateException) {
+                if (e.gateError != "error:pending") throw e
+                // Pending — fall through to pair flow
+            }
+
+            // Send pair command to gate (only for pending devices)
+            if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: sending pair command")
+            val response = sshManager.sendPairCommand()
+            if (BuildConfig.DEBUG) Log.d("Handoff", "VerificationScreen: pair response=$response")
+
+            if (response.startsWith("verify:")) {
+                val code = response.removePrefix("verify:")
+                verificationCode = code
+                connecting = false
+                status = "Confirm this code on your Mac"
+
+                // Poll: wait for Mac to confirm (device becomes active)
+                // The gate will accept "list" once status is active
+                var attempts = 0
+                while (attempts < 30) {  // 60 seconds max
+                    delay(2000)
+                    attempts++
+                    try {
+                        sshManager.disconnect()
+                        val newPort = tailscaleManager.startProxy(config.ip)
+                        sshManager.connect(config, newPort)
+                        sshManager.listSessions(config.tmuxPath)
+                        // If list succeeds, device is active
+                        onVerified()
+                        return@LaunchedEffect
+                    } catch (e: GateException) {
+                        if (e.gateError == "error:pending") {
+                            // Still pending, keep waiting
+                            continue
+                        } else if (e.gateError == "error:not_found") {
+                            // Pairing was rejected or timed out
+                            onError("Pairing was rejected on the Mac.")
+                            return@LaunchedEffect
+                        }
+                    } catch (e: Exception) {
+                        // If SSH auth failed, the Mac deleted the device — either the
+                        // user rejected this pairing or an admin revoked it. Don't keep
+                        // polling for a minute; tell the user to re-pair and bail.
+                        val m = (e.message ?: "").lowercase()
+                        if ("auth fail" in m || "auth cancel" in m || "publickey" in m) {
+                            onError(
+                                "Pairing was rejected. Run `handoff pair` on your Mac again."
+                            )
+                            return@LaunchedEffect
+                        }
+                        // Otherwise assume a transient connection error and retry.
+                    }
+                }
+                onError("Pairing timed out. Try again from your Mac.")
+            } else {
+                onError("Unexpected response from Mac.")
+            }
+        } catch (e: GateException) {
+            if (BuildConfig.DEBUG) Log.e("Handoff", "VerificationScreen: gate error=${e.gateError}")
+            onError(friendlyGateError(e.gateError))
+        } catch (e: HostKeyUnknownException) {
+            connecting = false
+            tailscaleManager.stopProxy()
+            pendingTrust = e.request
+        } catch (e: HostKeyMismatchException) {
+            connecting = false
+            tailscaleManager.stopProxy()
+            hostKeyMismatch = e
+        } catch (e: Exception) {
+            if (BuildConfig.DEBUG) Log.e("Handoff", "VerificationScreen: error", e)
+            onError(friendlyConnectionError(e))
         }
     }
 

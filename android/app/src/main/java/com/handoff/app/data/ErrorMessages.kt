@@ -4,6 +4,12 @@ package com.handoff.app.data
  * Maps raw exceptions to user-friendly error messages with actionable hints.
  */
 fun friendlyConnectionError(e: Exception): String {
+    if (e is HostKeyMismatchException) {
+        return "The Mac's SSH identity changed.\nReview the fingerprint before trusting it again."
+    }
+    if (e is HostKeyUnknownException) {
+        return "Review the Mac's SSH fingerprint before connecting."
+    }
     val msg = (e.message ?: "").lowercase()
     val cause = (e.cause?.message ?: "").lowercase()
 

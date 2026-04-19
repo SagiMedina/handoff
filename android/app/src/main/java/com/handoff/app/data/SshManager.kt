@@ -1,12 +1,16 @@
 package com.handoff.app.data
 
 import com.handoff.app.BuildConfig
+import com.handoff.app.HandoffApp
 
 import android.os.Handler
 import android.os.Looper
 import android.util.Log
 import com.jcraft.jsch.ChannelExec
+import com.jcraft.jsch.HostKey
+import com.jcraft.jsch.HostKeyRepository
 import com.jcraft.jsch.JSch
+import com.jcraft.jsch.UserInfo
 import com.jcraft.jsch.Session
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -18,6 +22,67 @@ import java.util.Base64
 import java.util.Properties
 
 class SshManager {
+    private data class HostKeyCheck(
+        val status: Int,
+        val keyBytes: ByteArray,
+        val type: String,
+    )
+
+    private class AndroidHostKeyRepository(
+        private val expectedHost: String,
+        private val store: HostKeyStore,
+    ) : HostKeyRepository {
+        var lastCheck: HostKeyCheck? = null
+            private set
+
+        override fun check(host: String?, key: ByteArray?): Int {
+            if (key == null) return HostKeyRepository.NOT_INCLUDED
+            val candidate = HostKey(expectedHost, key)
+            val trusted = store.get(expectedHost)
+            val status = when {
+                trusted == null -> HostKeyRepository.NOT_INCLUDED
+                trusted.keyBytes.contentEquals(key) -> HostKeyRepository.OK
+                else -> HostKeyRepository.CHANGED
+            }
+            lastCheck = HostKeyCheck(
+                status = status,
+                keyBytes = key.copyOf(),
+                type = trusted?.type ?: candidate.type,
+            )
+            return status
+        }
+
+        override fun add(hostkey: HostKey?, ui: UserInfo?) {
+            if (hostkey == null) return
+            val rawKey = try {
+                Base64.getDecoder().decode(hostkey.key)
+            } catch (_: IllegalArgumentException) {
+                return
+            }
+            store.trust(expectedHost, hostkey.type, rawKey)
+        }
+
+        override fun remove(host: String?, type: String?) {
+            store.forget(expectedHost)
+        }
+
+        override fun remove(host: String?, type: String?, key: ByteArray?) {
+            store.forget(expectedHost)
+        }
+
+        override fun getKnownHostsRepositoryID(): String = "handoff"
+
+        override fun getHostKey(): Array<HostKey> {
+            val trusted = store.get(expectedHost) ?: return emptyArray()
+            return arrayOf(HostKey(expectedHost, trusted.keyBytes))
+        }
+
+        override fun getHostKey(host: String?, type: String?): Array<HostKey> {
+            val trusted = store.get(expectedHost) ?: return emptyArray()
+            if (type != null && trusted.type != type) return emptyArray()
+            return arrayOf(HostKey(expectedHost, trusted.keyBytes))
+        }
+    }
 
     private var session: Session? = null
     private var shellChannel: ChannelExec? = null
@@ -37,6 +102,9 @@ class SshManager {
         }
 
         val jsch = JSch()
+        val hostKeyStore = HostKeyStore(HandoffApp.instance.applicationContext)
+        val hostKeyRepository = AndroidHostKeyRepository(config.ip, hostKeyStore)
+        jsch.setHostKeyRepository(hostKeyRepository)
         val keyBytes = Base64.getDecoder().decode(config.privateKey)
         if (BuildConfig.DEBUG) Log.d("Handoff", "Key bytes length: ${keyBytes.size}, starts with: ${String(keyBytes.take(30).toByteArray())}")
         jsch.addIdentity("handoff", keyBytes, null, null)
@@ -45,11 +113,39 @@ class SshManager {
         val port = if (proxyPort > 0) proxyPort else 22
         val sess = jsch.getSession(config.user, host, port)
         val props = Properties()
-        props["StrictHostKeyChecking"] = "no"
+        props["StrictHostKeyChecking"] = "yes"
         sess.setConfig(props)
         sess.setServerAliveInterval(15_000)
         sess.setServerAliveCountMax(3)
-        sess.connect(10_000)
+        try {
+            sess.connect(10_000)
+        } catch (e: Exception) {
+            when (val hostCheck = hostKeyRepository.lastCheck) {
+                null -> throw e
+                else -> when (hostCheck.status) {
+                    HostKeyRepository.NOT_INCLUDED -> {
+                        throw HostKeyUnknownException(
+                            PendingTrustRequest(
+                                host = config.ip,
+                                type = hostCheck.type,
+                                fingerprint = HostKeyFingerprint.sha256(hostCheck.keyBytes),
+                                keyBytes = hostCheck.keyBytes,
+                            )
+                        )
+                    }
+                    HostKeyRepository.CHANGED -> {
+                        val trusted = hostKeyStore.get(config.ip)
+                        throw HostKeyMismatchException(
+                            host = config.ip,
+                            type = trusted?.type ?: hostCheck.type,
+                            expectedFingerprint = trusted?.fingerprint ?: "unknown",
+                            actualFingerprint = HostKeyFingerprint.sha256(hostCheck.keyBytes),
+                        )
+                    }
+                    else -> throw e
+                }
+            }
+        }
         session = sess
         if (BuildConfig.DEBUG) Log.d("Handoff", "SSH connected via JSch (protocol v$protocolVersion)")
     }
@@ -224,6 +320,19 @@ class SshManager {
 
     val isConnected: Boolean
         get() = session?.isConnected == true
+
+    fun approveTrust(request: PendingTrustRequest) {
+        val store = HostKeyStore(HandoffApp.instance.applicationContext)
+        store.trust(request.host, request.type, request.keyBytes)
+    }
+
+    fun resetTrust(host: String) {
+        HostKeyStore(HandoffApp.instance.applicationContext).forget(host)
+    }
+
+    fun hasTrustedHostKey(host: String): Boolean {
+        return HostKeyStore(HandoffApp.instance.applicationContext).hasTrust(host)
+    }
 }
 
 class GateException(val gateError: String) : Exception(gateError)
