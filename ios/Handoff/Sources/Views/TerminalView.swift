@@ -84,9 +84,12 @@ struct TerminalView: View {
             case .active:
                 if wasBackgrounded {
                     wasBackgrounded = false
-                    // iOS kills SSH when backgrounded; tmux keeps the session alive
-                    // so we reconnect fresh on foreground.
-                    if let terminal = activeTerminal, !terminal.sshManager.isConnected {
+                    // iOS can leave us with a zombie SSH channel after
+                    // backgrounding: `isConnected` may still read true even
+                    // though the SOCKS5 proxy underneath was torn down.
+                    // Terminal continuity comes from tmux, not the old socket,
+                    // so always drop the stored terminal and reconnect fresh.
+                    if activeTerminal != nil {
                         TerminalSessionStore.shared.close(key)
                         activeTerminal = nil
                         connectAndAttach()

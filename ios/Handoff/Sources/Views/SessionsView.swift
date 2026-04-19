@@ -35,6 +35,11 @@ struct SessionsView: View {
     /// on resume and rewrites `errorMessage` right after the scenePhase
     /// handler cleared it, leaving the banner stuck.
     @State private var loadTask: Task<Void, Never>?
+    /// Silent refresh runs outside the explicit reload path, so it needs its
+    /// own handle. Otherwise a stale pre-background refresh can finish after
+    /// foreground recovery starts and either overwrite the fresh list or
+    /// disconnect the newly re-established SSH session from its catch block.
+    @State private var refreshTask: Task<Void, Never>?
 
     /// Explicit state machine for post-background recovery. tsnet needs a
     /// beat to rebuild routing after iOS unfreezes the app; without both a
@@ -90,6 +95,8 @@ struct SessionsView: View {
                     resumeState = .inactive
                     loadTask?.cancel()
                     loadTask = nil
+                    refreshTask?.cancel()
+                    refreshTask = nil
                     sshManager.disconnect()
                     TerminalSessionStore.shared.closeAll()
                     configStore.unpair()
@@ -249,6 +256,8 @@ struct SessionsView: View {
         resumeState = .inactive
         loadTask?.cancel()
         loadTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
         TerminalSessionStore.shared.closeAll()
         sshManager.disconnect()
         // resetState() closes the Tailscale node and deletes the persisted state dir,
@@ -417,6 +426,8 @@ struct SessionsView: View {
         }
         loadTask?.cancel()
         loadTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
         sshManager.disconnect()
         loadSessions()
     }
@@ -428,6 +439,8 @@ struct SessionsView: View {
         // can't race with this one and rewrite `errorMessage` on a dead
         // connection.
         loadTask?.cancel()
+        refreshTask?.cancel()
+        refreshTask = nil
 
         if forceReconnect {
             sshManager.disconnect()
@@ -566,27 +579,43 @@ struct SessionsView: View {
     }
 
     private func silentRefresh() {
-        guard let config = configStore.config, sshManager.isConnected else { return }
+        guard refreshTask == nil,
+              let config = configStore.config,
+              sshManager.isConnected else { return }
 
-        Task {
+        refreshTask = Task {
+            defer {
+                Task { @MainActor in
+                    refreshTask = nil
+                }
+            }
             do {
                 var discoveredSessions = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
+                try Task.checkCancellation()
                 for i in discoveredSessions.indices {
                     let windows = try await sshManager.listWindows(
                         tmuxPath: config.tmuxPath,
                         session: discoveredSessions[i].name
                     )
                     discoveredSessions[i].windows = windows
+                    try Task.checkCancellation()
                 }
                 await MainActor.run {
+                    if Task.isCancelled { return }
                     sessions = discoveredSessions
                 }
+            } catch is CancellationError {
+                return
             } catch {
+                if Task.isCancelled { return }
                 // Silently ignore errors during auto-refresh, but tear down
                 // the zombie channel so the next user-initiated load or
                 // scenePhase bump reconnects cleanly instead of hitting the
                 // exec timeout again.
-                await MainActor.run { sshManager.disconnect() }
+                await MainActor.run {
+                    if Task.isCancelled { return }
+                    sshManager.disconnect()
+                }
             }
         }
     }
