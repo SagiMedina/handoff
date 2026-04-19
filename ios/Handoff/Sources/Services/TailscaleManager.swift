@@ -263,6 +263,15 @@ final class TailscaleManager: ObservableObject {
         }
     }
 
+    /// Best-effort transport recovery for cases where the embedded loopback /
+    /// routing stack is stale after backgrounding, but the user should not
+    /// have to re-pair or re-auth. This intentionally preserves the existing
+    /// persisted Tailscale state dir.
+    func restart() {
+        stop()
+        start()
+    }
+
     /// Hard reset — close node and delete the state dir to force re-auth on next start.
     func resetState() {
         stop()

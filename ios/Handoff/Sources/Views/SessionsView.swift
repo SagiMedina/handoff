@@ -53,7 +53,12 @@ struct SessionsView: View {
     ///   (that's the whole point of the fix — previously the retry lost it).
     ///   Failure from here surfaces to the user; success returns to
     ///   `inactive`.
-    enum ResumeState { case inactive, foregroundAttempt, retryingForeground }
+    enum ResumeState {
+        case inactive
+        case foregroundAttempt
+        case retryingForeground
+        case restartingTransport
+    }
     @State private var resumeState: ResumeState = .inactive
 
     // New session dialog
@@ -157,22 +162,20 @@ struct SessionsView: View {
                     // spinner instead of errorView.
                     errorMessage = nil
                     isLoading = true
-                    // Enter the foreground-recovery state machine. The
-                    // first attempt gets a 500ms warmup (tsnet wake-up),
-                    // and a transport failure transitions to
-                    // `.retryingForeground` which keeps the warmup on the
-                    // retry too — the whole point of the enum is that the
-                    // retry doesn't lose warmup context the way a single
-                    // bool did.
-                    resumeState = .foregroundAttempt
-                    // iOS tore down the SOCKS5 proxy / SSH socket while we
-                    // were backgrounded. Force a fresh handshake instead of
-                    // trusting the stale `parentChannel.isActive`. Pass
-                    // resetResumeState: false so we DON'T clobber the
-                    // `.foregroundAttempt` we just set — otherwise the
-                    // recovery path would run with no warmup and no retry
-                    // budget.
-                    forceReload(resetResumeState: false)
+                    // Escalate recovery one level higher than SSH. Real-device
+                    // testing still shows cases where the embedded Tailscale
+                    // loopback itself is stale after backgrounding, so
+                    // reconnecting SSH on top of the old proxy just burns 10s
+                    // and surfaces "The request timed out". Restarting the
+                    // transport re-routes through ContentView's Tailscale gate,
+                    // then SessionsView is recreated and loads fresh.
+                    resumeState = .inactive
+                    loadTask?.cancel()
+                    loadTask = nil
+                    refreshTask?.cancel()
+                    refreshTask = nil
+                    sshManager.disconnect()
+                    tailscale.restart()
                 }
             default:
                 break
@@ -552,6 +555,9 @@ struct SessionsView: View {
                 // the inner Task apply warmup on this attempt too — which
                 // the old single-bool couldn't do because the retry
                 // consumed the flag before the inner read.
+                let stateAfterFailure = await MainActor.run { () -> ResumeState in
+                    resumeState
+                }
                 let shouldRetry = await MainActor.run { () -> Bool in
                     if resumeState == .foregroundAttempt {
                         resumeState = .retryingForeground
@@ -566,6 +572,21 @@ struct SessionsView: View {
                     try? await Task.sleep(nanoseconds: 800_000_000)
                     if Task.isCancelled { return }
                     await MainActor.run { loadSessions(forceReconnect: true) }
+                    return
+                }
+                // If even the foreground retry failed, the problem is likely
+                // lower than SSH: the embedded Tailscale loopback / routing
+                // stack may still be stale after resume. Escalate from "retry
+                // SSH" to "restart transport" automatically instead of
+                // surfacing a timeout banner that manual Retry then fixes a few
+                // seconds later.
+                if stateAfterFailure == .retryingForeground {
+                    await MainActor.run {
+                        if Task.isCancelled { return }
+                        resumeState = .restartingTransport
+                        sshManager.disconnect()
+                        tailscale.restart()
+                    }
                     return
                 }
                 await MainActor.run {
