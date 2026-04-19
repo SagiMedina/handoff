@@ -20,11 +20,13 @@ final class ConfigStore: ObservableObject {
         static let pendingVerification = "handoff.pendingVerification"
         static let appLockEnabled = "handoff.appLockEnabled"
         static let terminalFontSize = "handoff.terminalFontSize"
+        static let pinnedWindows = "handoff.pinnedWindows"
     }
 
     static let defaultTerminalFontSize = 14
     static let minTerminalFontSize = 11
     static let maxTerminalFontSize = 24
+    static let pinnedWindowSeparator = "\u{0000}"
 
     @Published private(set) var config: ConnectionConfig?
     @Published private(set) var appLockEnabled: Bool
@@ -35,12 +37,14 @@ final class ConfigStore: ObservableObject {
     /// force-quit still routes back to the verification screen on relaunch.
     @Published private(set) var pendingVerification: Bool = false
     @Published private(set) var terminalFontSize: Int
+    @Published private(set) var pinnedWindows: Set<String>
 
     init() {
         let storedFontSize = defaults.integer(forKey: Keys.terminalFontSize)
         self.terminalFontSize = Self.clampedTerminalFontSize(
             storedFontSize == 0 ? Self.defaultTerminalFontSize : storedFontSize
         )
+        self.pinnedWindows = Set(defaults.stringArray(forKey: Keys.pinnedWindows) ?? [])
         self.config = nil
         self.appLockEnabled = defaults.bool(forKey: Keys.appLockEnabled)
         self.pendingVerification = defaults.bool(forKey: Keys.pendingVerification)
@@ -89,6 +93,22 @@ final class ConfigStore: ObservableObject {
         terminalFontSize = clamped
     }
 
+    func isWindowPinned(session: String, title: String) -> Bool {
+        pinnedWindows.contains(Self.pinnedWindowKey(session: session, title: title))
+    }
+
+    func togglePinnedWindow(session: String, title: String) {
+        let key = Self.pinnedWindowKey(session: session, title: title)
+        var next = pinnedWindows
+        if next.contains(key) {
+            next.remove(key)
+        } else {
+            next.insert(key)
+        }
+        defaults.set(Array(next).sorted(), forKey: Keys.pinnedWindows)
+        pinnedWindows = next
+    }
+
     // MARK: - Load
 
     func load() -> ConnectionConfig? {
@@ -130,9 +150,11 @@ final class ConfigStore: ObservableObject {
         defaults.removeObject(forKey: Keys.nonce)
         defaults.removeObject(forKey: Keys.pendingVerification)
         defaults.removeObject(forKey: Keys.appLockEnabled)
+        defaults.removeObject(forKey: Keys.pinnedWindows)
         config = nil
         appLockEnabled = false
         pendingVerification = false
+        pinnedWindows = []
     }
 
     // MARK: - Keychain
@@ -185,5 +207,9 @@ final class ConfigStore: ObservableObject {
 
     private static func clampedTerminalFontSize(_ size: Int) -> Int {
         min(max(size, minTerminalFontSize), maxTerminalFontSize)
+    }
+
+    private static func pinnedWindowKey(session: String, title: String) -> String {
+        "\(session)\(pinnedWindowSeparator)\(title)"
     }
 }
