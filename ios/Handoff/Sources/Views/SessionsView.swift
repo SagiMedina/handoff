@@ -122,12 +122,8 @@ struct SessionsView: View {
                 errorView(error)
             } else {
                 VStack(spacing: 0) {
-                    connectedHeader
-                    if sessions.isEmpty {
-                        emptyView
-                    } else {
-                        sessionList
-                    }
+                    mainContent
+                    statusBar
                 }
             }
         }
@@ -359,64 +355,70 @@ struct SessionsView: View {
 
     // MARK: - Subviews
 
-    /// "● Connected" indicator. Tap opens a Menu with the Tailscale IP and
-    /// Tailscale-scoped actions (Copy IP, Sign out of Tailscale).
-    /// Per designer: Tailscale-scoped actions cluster under the Tailscale status indicator,
-    /// keeping them separate from Unpair (which is SSH/pairing-scoped, top-left).
-    private var connectedHeader: some View {
+    private var mainContent: some View {
+        Group {
+            if sessions.isEmpty {
+                emptyView
+            } else {
+                sessionList
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var statusBar: some View {
         let macIP = configStore.config?.ip ?? ""
-        return Menu {
-            Section {
+        let statusColor = readOnly ? Theme.primary : Theme.green
+        return HStack(spacing: 0) {
+            Text("●")
+                .foregroundColor(statusColor)
+                .font(.system(size: 9))
+                .padding(.trailing, 8)
+
+            Text(readOnly ? "read-only" : "connected")
+                .foregroundColor(statusColor)
+                .font(.system(size: 12, design: .monospaced))
+
+            separatorDot
+
+            Button {
+                UIPasteboard.general.string = macIP
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } label: {
                 Text(macIP)
-                    .font(.system(.body, design: .monospaced))
-                Button {
-                    UIPasteboard.general.string = macIP
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                } label: {
-                    Label("Copy IP", systemImage: "doc.on.doc")
-                }
+                    .foregroundColor(Theme.textSecondary)
+                    .font(.system(size: 12, design: .monospaced))
             }
-            Section {
-                Button(role: .destructive) {
-                    showSignOutConfirmation = true
-                } label: {
-                    Label("Sign out of Tailscale", systemImage: "person.crop.circle.badge.xmark")
-                }
-            }
-            if let ip = configStore.config?.ip, sshManager.hasTrustedHostKey(forHost: ip) {
-                Section {
-                    Button(role: .destructive) {
-                        sshManager.resetTrust(forHost: ip)
-                        forceReload()
-                    } label: {
-                        Label("Reset trusted SSH key", systemImage: "key.slash")
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Text("●")
-                    .foregroundColor(Theme.green)
-                    .font(.system(size: 10))
-                Text("Connected")
-                    .foregroundColor(Theme.green)
-                    .font(.system(size: 12))
-                if readOnly {
-                    Text("READ-ONLY")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .foregroundColor(Theme.textSecondary)
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 2)
-                        .background(Theme.textSecondary.opacity(0.15))
-                        .clipShape(Capsule())
-                }
+            .buttonStyle(.plain)
+            .disabled(macIP.isEmpty)
+
+            separatorDot
+
+            Text("\(totalWindows) \(totalWindows == 1 ? "tab" : "tabs")")
+                .foregroundColor(Theme.textSecondary)
+                .font(.system(size: 12, design: .monospaced))
+
+            if isLoading {
+                separatorDot
+                Text("syncing")
+                    .foregroundColor(Theme.textSecondary.opacity(0.75))
+                    .font(.system(size: 12, design: .monospaced))
                 Spacer()
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.white.opacity(0.06))
+                .frame(height: 1)
+        }
+    }
+
+    private var separatorDot: some View {
+        Text(" · ")
+            .foregroundColor(Theme.textSecondary.opacity(0.4))
+            .font(.system(size: 12, design: .monospaced))
     }
 
     private var sessionList: some View {
@@ -480,35 +482,41 @@ struct SessionsView: View {
     }
 
     private var filterRow: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            HStack(spacing: 8) {
-                Text("filter>")
-                    .font(.system(size: 12, design: .monospaced))
-                    .foregroundColor(Theme.textSecondary)
+        HStack(spacing: 0) {
+            Text("/")
+                .font(.system(size: 16, design: .monospaced))
+                .foregroundColor(Theme.primary.opacity(0.7))
+                .padding(.trailing, 10)
 
-                TextField("title or cwd", text: $filterText)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .foregroundColor(Theme.text)
+            TextField("filter tabs by name or path", text: $filterText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .foregroundColor(Theme.text)
 
-                if !filterText.isEmpty {
-                    Button("Clear") {
-                        filterText = ""
-                    }
-                    .font(.system(size: 12))
-                    .foregroundColor(Theme.primary)
-                }
-            }
-
-            HStack {
-                Text("\(matchCount) of \(totalWindows) tabs")
+            if !filterText.isEmpty {
+                Text("\(matchCount)/\(totalWindows)")
                     .font(.system(size: 11, design: .monospaced))
-                    .foregroundColor(Theme.textSecondary.opacity(0.75))
-                Spacer()
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.horizontal, 10)
+
+                Button {
+                    filterText = ""
+                } label: {
+                    Text("×")
+                        .font(.system(size: 18, design: .monospaced))
+                        .foregroundColor(Theme.textSecondary)
+                }
+                .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 4)
-        .padding(.bottom, 4)
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .padding(.vertical, 6)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+        }
     }
 
     private var emptyFilterState: some View {
