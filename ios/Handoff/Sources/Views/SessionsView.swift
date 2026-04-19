@@ -25,6 +25,7 @@ struct SessionsView: View {
     @State private var noticeMessage: String?
     @State private var hasAutoConnected = false
     @State private var showSignOutConfirmation = false
+    @State private var showSettings = false
     // Tracks a background→active transition so scenePhase can force a fresh
     // SSH + SOCKS5 handshake on foreground, matching what TerminalView does.
     @Environment(\.scenePhase) private var scenePhase
@@ -97,19 +98,18 @@ struct SessionsView: View {
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button("Unpair") {
-                    resumeState = .inactive
-                    loadTask?.cancel()
-                    loadTask = nil
-                    refreshTask?.cancel()
-                    refreshTask = nil
-                    sshManager.disconnect()
-                    TerminalSessionStore.shared.closeAll()
-                    configStore.unpair()
-                    path.removeLast(path.count)
+                    unpairDevice()
                 }
                 .foregroundColor(Theme.red)
             }
-            ToolbarItem(placement: .navigationBarTrailing) {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .foregroundColor(Theme.primary)
+
                 if isLoading {
                     // Visible feedback that refresh is in flight
                     ProgressView()
@@ -234,6 +234,22 @@ struct SessionsView: View {
         } message: { text in
             Text(text)
         }
+        .sheet(isPresented: $showSettings) {
+            SettingsView(
+                config: configStore.config ?? ConnectionConfig(ip: "", user: "", privateKey: "", tmuxPath: ""),
+                readOnly: readOnly,
+                onDone: { showSettings = false },
+                onSignOutOfTailscale: {
+                    showSettings = false
+                    signOutOfTailscale()
+                },
+                onUnpair: {
+                    showSettings = false
+                    unpairDevice()
+                }
+            )
+            .environmentObject(configStore)
+        }
     }
 
     private func requestRenewal() {
@@ -268,6 +284,18 @@ struct SessionsView: View {
         tailscale.resetState()
         // Pop back to root — ContentView will now show TailscaleAuthView since
         // tailscale.state == .stopped (Sessions screen is only reachable when .connected).
+        path.removeLast(path.count)
+    }
+
+    private func unpairDevice() {
+        resumeState = .inactive
+        loadTask?.cancel()
+        loadTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+        sshManager.disconnect()
+        TerminalSessionStore.shared.closeAll()
+        configStore.unpair()
         path.removeLast(path.count)
     }
 

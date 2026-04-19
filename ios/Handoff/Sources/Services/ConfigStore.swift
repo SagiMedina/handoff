@@ -18,7 +18,12 @@ final class ConfigStore: ObservableObject {
         static let protocolVersion = "handoff.protocolVersion"
         static let nonce = "handoff.nonce"
         static let pendingVerification = "handoff.pendingVerification"
+        static let terminalFontSize = "handoff.terminalFontSize"
     }
+
+    static let defaultTerminalFontSize = 14
+    static let minTerminalFontSize = 11
+    static let maxTerminalFontSize = 24
 
     @Published private(set) var config: ConnectionConfig?
 
@@ -27,8 +32,13 @@ final class ConfigStore: ObservableObject {
     /// pairing, which has no verification step). Persisted so a mid-pair
     /// force-quit still routes back to the verification screen on relaunch.
     @Published private(set) var pendingVerification: Bool = false
+    @Published private(set) var terminalFontSize: Int
 
     init() {
+        let storedFontSize = defaults.integer(forKey: Keys.terminalFontSize)
+        self.terminalFontSize = Self.clampedTerminalFontSize(
+            storedFontSize == 0 ? Self.defaultTerminalFontSize : storedFontSize
+        )
         self.config = load()
         self.pendingVerification = defaults.bool(forKey: Keys.pendingVerification)
     }
@@ -62,6 +72,12 @@ final class ConfigStore: ObservableObject {
     func markVerified() {
         defaults.set(false, forKey: Keys.pendingVerification)
         pendingVerification = false
+    }
+
+    func setTerminalFontSize(_ size: Int) {
+        let clamped = Self.clampedTerminalFontSize(size)
+        defaults.set(clamped, forKey: Keys.terminalFontSize)
+        terminalFontSize = clamped
     }
 
     // MARK: - Load
@@ -151,5 +167,9 @@ final class ConfigStore: ObservableObject {
         ]
 
         SecItemDelete(query as CFDictionary)
+    }
+
+    private static func clampedTerminalFontSize(_ size: Int) -> Int {
+        min(max(size, minTerminalFontSize), maxTerminalFontSize)
     }
 }
