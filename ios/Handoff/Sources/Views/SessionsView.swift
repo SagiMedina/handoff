@@ -10,6 +10,7 @@ struct SessionsView: View {
     @StateObject private var sshManager = SSHManager()
     @State private var sessions: [TmuxSession] = []
     @State private var softExpiredPrompt: GateError?
+    @State private var hostKeyMismatch: HostKeyMismatchError?
 
     /// Read-only from the gate's `#permissions:` header. v1 pairings and any
     /// pre-first-list state resolve to `false`, which is the safe default
@@ -202,6 +203,26 @@ struct SessionsView: View {
         } message: {
             Text("You'll need to sign in again on next launch. Your Mac pairing stays intact.")
         }
+        .sheet(item: $sshManager.pendingTrust) { request in
+            HostKeyTrustPromptView(
+                request: request,
+                onTrust: { sshManager.approveTrust(request) },
+                onReject: { sshManager.rejectTrust(request) }
+            )
+        }
+        .fullScreenCover(item: $hostKeyMismatch) { mismatch in
+            HostKeyMismatchView(
+                error: mismatch,
+                onCancel: {
+                    hostKeyMismatch = nil
+                },
+                onResetTrust: {
+                    sshManager.resetTrust(forHost: mismatch.host)
+                    hostKeyMismatch = nil
+                    forceReload()
+                }
+            )
+        }
         // Gate reports the device's soft expiry has passed. The only
         // permitted gate command in this state is `renew`; we let the user
         // send it and surface the Mac's confirmation.
@@ -323,6 +344,16 @@ struct SessionsView: View {
                     showSignOutConfirmation = true
                 } label: {
                     Label("Sign out of Tailscale", systemImage: "person.crop.circle.badge.xmark")
+                }
+            }
+            if let ip = configStore.config?.ip, sshManager.hasTrustedHostKey(forHost: ip) {
+                Section {
+                    Button(role: .destructive) {
+                        sshManager.resetTrust(forHost: ip)
+                        forceReload()
+                    } label: {
+                        Label("Reset trusted SSH key", systemImage: "key.slash")
+                    }
                 }
             }
         } label: {
@@ -550,6 +581,14 @@ struct SessionsView: View {
                 // Superseded by a newer reload. Don't touch UI state — the
                 // newer Task owns it now.
                 return
+            } catch let mismatch as HostKeyMismatchError {
+                await MainActor.run {
+                    if Task.isCancelled { return }
+                    resumeState = .inactive
+                    hostKeyMismatch = mismatch
+                    errorMessage = nil
+                    isLoading = false
+                }
             } catch let gate as GateError {
                 // Lifecycle errors get dedicated recovery surfaces. For
                 // everything else we show the friendly copy inline. Gate

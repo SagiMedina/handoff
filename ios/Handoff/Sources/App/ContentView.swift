@@ -5,6 +5,7 @@ struct ContentView: View {
     @EnvironmentObject var configStore: ConfigStore
     /// Owned at app root in HandoffApp; injected via environmentObject.
     @EnvironmentObject var tailscale: TailscaleManager
+    @Environment(\.scenePhase) private var scenePhase
 
     enum Route: Hashable {
         case scan
@@ -13,6 +14,8 @@ struct ContentView: View {
     }
 
     @State private var path = NavigationPath()
+    @State private var hasUnlockedAppFlow = false
+    @State private var appLockAvailability = AppLockService.availability()
 
     /// Derived from `tailscale.state` — Sessions is reachable only while connected.
     /// On `.error` / `.stopped` / `.needsAuth` the user drops back to TailscaleAuthView.
@@ -20,11 +23,19 @@ struct ContentView: View {
         tailscale.state == .connected
     }
 
+    private var appLockRequired: Bool {
+        configStore.appLockEnabled && appLockAvailability.isAvailable && !hasUnlockedAppFlow
+    }
+
     var body: some View {
         NavigationStack(path: $path) {
             Group {
                 if !configStore.isPaired {
                     WelcomeView(path: $path)
+                } else if appLockRequired {
+                    AppLockView {
+                        hasUnlockedAppFlow = true
+                    }
                 } else if !tailscaleReady {
                     TailscaleAuthView(tailscale: tailscale)
                 } else if configStore.pendingVerification {
@@ -49,16 +60,41 @@ struct ContentView: View {
         }
         .preferredColorScheme(.dark)
         .onChange(of: configStore.isPaired) { isPaired in
+            hasUnlockedAppFlow = false
             if isPaired && tailscale.state == .stopped {
                 tailscale.start()
             }
         }
+        .onChange(of: configStore.appLockEnabled) { _ in
+            hasUnlockedAppFlow = false
+        }
+        .onChange(of: scenePhase) { phase in
+            switch phase {
+            case .background:
+                hasUnlockedAppFlow = false
+            case .active:
+                refreshAppLockAvailability()
+                if configStore.isPaired, tailscale.state == .stopped {
+                    tailscale.start()
+                }
+            default:
+                break
+            }
+        }
         .onAppear {
+            refreshAppLockAvailability()
             // If already paired but Tailscale isn't running yet, start it.
             // (If it's already connected, the derived gate will route to SessionsView.)
             if configStore.isPaired, tailscale.state == .stopped {
                 tailscale.start()
             }
+        }
+    }
+
+    private func refreshAppLockAvailability() {
+        appLockAvailability = AppLockService.availability()
+        if !appLockAvailability.isAvailable {
+            hasUnlockedAppFlow = true
         }
     }
 }

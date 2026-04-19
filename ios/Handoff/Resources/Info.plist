@@ -30,6 +30,8 @@
     </array>
     <key>NSCameraUsageDescription</key>
     <string>Handoff needs camera access to scan the QR code from your Mac for pairing.</string>
+    <key>NSFaceIDUsageDescription</key>
+    <string>Handoff uses Face ID to unlock access to your paired sessions.</string>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
     <key>UIFonts provided by application</key>
