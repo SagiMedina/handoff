@@ -6,6 +6,8 @@ import SwiftUI
 struct SessionCard: View {
     let session: TmuxSession
     var readOnly: Bool = false
+    var isWindowPinned: (TmuxWindow) -> Bool = { _ in false }
+    var onToggleWindowPin: (TmuxWindow) -> Void = { _ in }
     let onSelectWindow: (TmuxWindow) -> Void
     let onNewWindow: () -> Void
     let onKillSession: () -> Void
@@ -53,9 +55,10 @@ struct SessionCard: View {
                     }
                     WindowRow(
                         window: window,
-                        readOnly: readOnly,
+                        isPinned: isWindowPinned(window),
+                        onTogglePin: { onToggleWindowPin(window) },
+                        onKill: readOnly ? nil : { windowToKill = window },
                         onTap: { onSelectWindow(window) },
-                        onLongPress: { if !readOnly { windowToKill = window } }
                     )
                 }
             }
@@ -135,17 +138,18 @@ struct SessionCard: View {
 /// (long-press is inert in read-only mode).
 private struct WindowRow: View {
     let window: TmuxWindow
-    var readOnly: Bool = false
+    let isPinned: Bool
+    let onTogglePin: () -> Void
+    let onKill: (() -> Void)?
     let onTap: () -> Void
-    let onLongPress: () -> Void
 
     var body: some View {
         Button(action: onTap) {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
-                    Text("›")
-                        .font(.system(size: 16, design: .monospaced))
-                        .foregroundColor(Theme.textSecondary)
+                    Text(isPinned ? "●" : "›")
+                        .font(.system(size: isPinned ? 10 : 16, design: .monospaced))
+                        .foregroundColor(isPinned ? Theme.primary : Theme.textSecondary)
                     Text(window.displayName)
                         .font(.system(size: 14, design: .monospaced))
                         .foregroundColor(Theme.text)
@@ -168,8 +172,15 @@ private struct WindowRow: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .onLongPressGesture {
-            onLongPress()
+        .contextMenu {
+            Button(isPinned ? "Unpin" : "Pin to top") {
+                onTogglePin()
+            }
+            if let onKill {
+                Button("Kill tab", role: .destructive) {
+                    onKill()
+                }
+            }
         }
     }
 }

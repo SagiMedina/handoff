@@ -66,9 +66,46 @@ struct SessionsView: View {
     // New session dialog
     @State private var showNewSessionDialog = false
     @State private var newSessionName = ""
+    @State private var filterText = ""
 
     // Auto-refresh timer
     let refreshTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
+    private var totalWindows: Int {
+        sessions.reduce(0) { $0 + $1.windows.count }
+    }
+
+    private var matchCount: Int {
+        visibleSessions.reduce(0) { $0 + $1.windows.count }
+    }
+
+    private var visibleSessions: [TmuxSession] {
+        sessions.compactMap { session in
+            let filteredWindows = filterText.isEmpty
+                ? session.windows
+                : session.windows.filter { window in
+                    window.displayName.localizedCaseInsensitiveContains(filterText)
+                        || window.cwd.localizedCaseInsensitiveContains(filterText)
+                }
+
+            guard !filteredWindows.isEmpty else { return nil }
+
+            let sortedWindows = filteredWindows.sorted { lhs, rhs in
+                let lhsPinned = configStore.isWindowPinned(session: session.name, title: lhs.title)
+                let rhsPinned = configStore.isWindowPinned(session: session.name, title: rhs.title)
+                if lhsPinned != rhsPinned {
+                    return lhsPinned && !rhsPinned
+                }
+                return lhs.index < rhs.index
+            }
+
+            return TmuxSession(
+                name: session.name,
+                windowCount: session.windowCount,
+                windows: sortedWindows
+            )
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -385,26 +422,40 @@ struct SessionsView: View {
     private var sessionList: some View {
         ScrollView {
             LazyVStack(spacing: 12) {
-                ForEach(sessions) { session in
-                    SessionCard(
-                        session: session,
-                        readOnly: readOnly,
-                        onSelectWindow: { window in
-                            path.append(ContentView.Route.terminal(
-                                session: session.name,
-                                window: window.index
-                            ))
-                        },
-                        onNewWindow: {
-                            createNewWindow(in: session)
-                        },
-                        onKillSession: {
-                            killSession(session)
-                        },
-                        onKillWindow: { window in
-                            killWindow(window, in: session)
-                        }
-                    )
+                if totalWindows >= 6 {
+                    filterRow
+                }
+
+                if visibleSessions.isEmpty {
+                    emptyFilterState
+                } else {
+                    ForEach(visibleSessions) { session in
+                        SessionCard(
+                            session: session,
+                            readOnly: readOnly,
+                            isWindowPinned: { window in
+                                configStore.isWindowPinned(session: session.name, title: window.title)
+                            },
+                            onToggleWindowPin: { window in
+                                configStore.togglePinnedWindow(session: session.name, title: window.title)
+                            },
+                            onSelectWindow: { window in
+                                path.append(ContentView.Route.terminal(
+                                    session: session.name,
+                                    window: window.index
+                                ))
+                            },
+                            onNewWindow: {
+                                createNewWindow(in: session)
+                            },
+                            onKillSession: {
+                                killSession(session)
+                            },
+                            onKillWindow: { window in
+                                killWindow(window, in: session)
+                            }
+                        )
+                    }
                 }
 
                 // Subtle "+ new session" — suppressed in read-only mode so
@@ -426,6 +477,57 @@ struct SessionsView: View {
             }
             .padding()
         }
+    }
+
+    private var filterRow: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Text("filter>")
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundColor(Theme.textSecondary)
+
+                TextField("title or cwd", text: $filterText)
+                    .textInputAutocapitalization(.never)
+                    .autocorrectionDisabled()
+                    .foregroundColor(Theme.text)
+
+                if !filterText.isEmpty {
+                    Button("Clear") {
+                        filterText = ""
+                    }
+                    .font(.system(size: 12))
+                    .foregroundColor(Theme.primary)
+                }
+            }
+
+            HStack {
+                Text("\(matchCount) of \(totalWindows) tabs")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(Theme.textSecondary.opacity(0.75))
+                Spacer()
+            }
+        }
+        .padding(.horizontal, 4)
+        .padding(.bottom, 4)
+    }
+
+    private var emptyFilterState: some View {
+        VStack(spacing: 10) {
+            Text("No matching tabs")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(Theme.text)
+            Text("Try a different title or working-directory filter.")
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+            Button("Clear filter") {
+                filterText = ""
+            }
+            .font(.system(size: 12))
+            .foregroundColor(Theme.primary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 32)
     }
 
     private var emptyView: some View {
