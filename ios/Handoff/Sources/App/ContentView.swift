@@ -10,7 +10,7 @@ struct ContentView: View {
     enum Route: Hashable {
         case scan
         case sessions
-        case terminal(session: String, window: Int)
+        case terminal(session: String, window: Int, readOnly: Bool)
     }
 
     @State private var path = NavigationPath()
@@ -53,8 +53,13 @@ struct ContentView: View {
                     ScanView(path: $path)
                 case .sessions:
                     SessionsView(path: $path, tailscale: tailscale)
-                case .terminal(let session, let window):
-                    TerminalView(sessionName: session, windowIndex: window, tailscale: tailscale)
+                case .terminal(let session, let window, let readOnly):
+                    TerminalView(
+                        sessionName: session,
+                        windowIndex: window,
+                        readOnly: readOnly,
+                        tailscale: tailscale
+                    )
                 }
             }
         }
