@@ -105,6 +105,9 @@ struct TerminalView: View {
                 break
             }
         }
+        .onChange(of: configStore.terminalFontSize) { _ in
+            applyConfiguredFontToActiveTerminal()
+        }
     }
 
     private func errorStateView(_ error: String) -> some View {
@@ -232,16 +235,25 @@ struct TerminalView: View {
     }
 
     private func configureTerminalView(_ termView: SwiftTerm.TerminalView) {
-        let fontSize: CGFloat = 14
+        applyConfiguredFont(to: termView)
+        termView.nativeBackgroundColor = UIColor(Theme.background)
+        termView.nativeForegroundColor = UIColor(Theme.text)
+        // Idle timer is managed centrally by TerminalSessionStore
+    }
+
+    private func applyConfiguredFontToActiveTerminal() {
+        guard let termView = activeTerminal?.terminalView else { return }
+        applyConfiguredFont(to: termView)
+        termView.setNeedsDisplay()
+    }
+
+    private func applyConfiguredFont(to termView: SwiftTerm.TerminalView) {
+        let fontSize = CGFloat(configStore.terminalFontSize)
         if let font = UIFont(name: "JetBrainsMono-Regular", size: fontSize) {
             termView.font = font
         } else {
             termView.font = UIFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
         }
-
-        termView.nativeBackgroundColor = UIColor(Theme.background)
-        termView.nativeForegroundColor = UIColor(Theme.text)
-        // Idle timer is managed centrally by TerminalSessionStore
     }
 
     private func openTailscale() {
