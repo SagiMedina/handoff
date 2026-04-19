@@ -67,6 +67,7 @@ struct SessionsView: View {
     @State private var showNewSessionDialog = false
     @State private var newSessionName = ""
     @State private var filterText = ""
+    @FocusState private var filterFieldFocused: Bool
 
     // Auto-refresh timer
     let refreshTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
@@ -397,6 +398,11 @@ struct SessionsView: View {
             Text("\(totalWindows) \(totalWindows == 1 ? "tab" : "tabs")")
                 .foregroundColor(Theme.textSecondary)
                 .font(.system(size: 12, design: .monospaced))
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard totalWindows >= 6 else { return }
+                    filterFieldFocused = true
+                }
 
             if isLoading {
                 separatorDot
@@ -493,6 +499,7 @@ struct SessionsView: View {
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
                 .foregroundColor(Theme.text)
+                .focused($filterFieldFocused)
 
             if !filterText.isEmpty {
                 Text("\(matchCount)/\(totalWindows)")
