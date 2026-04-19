@@ -10,12 +10,55 @@ struct SettingsView: View {
     @EnvironmentObject private var configStore: ConfigStore
     @State private var showSignOutConfirmation = false
     @State private var showUnpairConfirmation = false
+    @State private var showResetHostKeyConfirmation = false
+    private var appLockAvailability: AppLockAvailability {
+        AppLockService.availability()
+    }
+    private var hasTrustedHostKey: Bool {
+        HostKeyStore.shared.hasTrust(for: config.ip)
+    }
 
     var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     section("Security") {
+                        VStack(alignment: .leading, spacing: 12) {
+                            Toggle(
+                                isOn: Binding(
+                                    get: { configStore.appLockEnabled },
+                                    set: { configStore.setAppLockEnabled($0) }
+                                )
+                            ) {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Require unlock to open app")
+                                        .font(.headline)
+                                        .foregroundColor(Theme.text)
+                                    Text("Use Face ID, Touch ID, or your device passcode before opening Handoff.")
+                                        .font(.footnote)
+                                        .foregroundColor(Theme.textSecondary)
+                                        .multilineTextAlignment(.leading)
+                                }
+                            }
+                            .tint(Theme.primary)
+                            .disabled(!appLockAvailability.isAvailable)
+
+                            if let message = appLockAvailability.message {
+                                Text(message)
+                                    .font(.footnote)
+                                    .foregroundColor(Theme.textSecondary)
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
+                        }
+                        .padding(16)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Theme.surface)
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 12)
+                                .stroke(Theme.border, lineWidth: 1)
+                        )
+                        .cornerRadius(12)
+
                         settingsButton(
                             title: "Sign out of Tailscale",
                             subtitle: "Disconnect the embedded tunnel and require sign-in on next launch.",
@@ -30,6 +73,16 @@ struct SettingsView: View {
                             tint: Theme.red
                         ) {
                             showUnpairConfirmation = true
+                        }
+
+                        if hasTrustedHostKey {
+                            settingsButton(
+                                title: "Reset trusted SSH key",
+                                subtitle: "Forget the stored fingerprint and verify the Mac again on the next SSH connect.",
+                                tint: Theme.red
+                            ) {
+                                showResetHostKeyConfirmation = true
+                            }
                         }
                     }
 
@@ -133,6 +186,14 @@ struct SettingsView: View {
                 Button("Cancel", role: .cancel) {}
             } message: {
                 Text("This removes the saved pairing from the iPhone and returns you to onboarding.")
+            }
+            .alert("Reset trusted SSH key?", isPresented: $showResetHostKeyConfirmation) {
+                Button("Reset", role: .destructive) {
+                    HostKeyStore.shared.forget(host: config.ip)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("You'll be prompted to verify the Mac's SSH fingerprint again on the next connection.")
             }
         }
     }

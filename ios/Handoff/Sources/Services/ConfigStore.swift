@@ -18,6 +18,7 @@ final class ConfigStore: ObservableObject {
         static let protocolVersion = "handoff.protocolVersion"
         static let nonce = "handoff.nonce"
         static let pendingVerification = "handoff.pendingVerification"
+        static let appLockEnabled = "handoff.appLockEnabled"
         static let terminalFontSize = "handoff.terminalFontSize"
     }
 
@@ -26,6 +27,7 @@ final class ConfigStore: ObservableObject {
     static let maxTerminalFontSize = 24
 
     @Published private(set) var config: ConnectionConfig?
+    @Published private(set) var appLockEnabled: Bool
 
     /// True immediately after a v2 QR is scanned and false once the device has
     /// completed the verification handshake with the Mac (or for any v1
@@ -39,8 +41,10 @@ final class ConfigStore: ObservableObject {
         self.terminalFontSize = Self.clampedTerminalFontSize(
             storedFontSize == 0 ? Self.defaultTerminalFontSize : storedFontSize
         )
-        self.config = load()
+        self.config = nil
+        self.appLockEnabled = defaults.bool(forKey: Keys.appLockEnabled)
         self.pendingVerification = defaults.bool(forKey: Keys.pendingVerification)
+        self.config = load()
     }
 
     var isPaired: Bool { config != nil }
@@ -72,6 +76,11 @@ final class ConfigStore: ObservableObject {
     func markVerified() {
         defaults.set(false, forKey: Keys.pendingVerification)
         pendingVerification = false
+    }
+
+    func setAppLockEnabled(_ enabled: Bool) {
+        defaults.set(enabled, forKey: Keys.appLockEnabled)
+        appLockEnabled = enabled
     }
 
     func setTerminalFontSize(_ size: Int) {
@@ -110,6 +119,9 @@ final class ConfigStore: ObservableObject {
     // MARK: - Unpair
 
     func unpair() {
+        if let host = defaults.string(forKey: Keys.ip) {
+            HostKeyStore.shared.forget(host: host)
+        }
         deleteFromKeychain()
         defaults.removeObject(forKey: Keys.ip)
         defaults.removeObject(forKey: Keys.user)
@@ -117,7 +129,9 @@ final class ConfigStore: ObservableObject {
         defaults.removeObject(forKey: Keys.protocolVersion)
         defaults.removeObject(forKey: Keys.nonce)
         defaults.removeObject(forKey: Keys.pendingVerification)
+        defaults.removeObject(forKey: Keys.appLockEnabled)
         config = nil
+        appLockEnabled = false
         pendingVerification = false
     }
 

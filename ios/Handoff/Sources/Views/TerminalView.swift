@@ -13,9 +13,11 @@ struct TerminalView: View {
     @EnvironmentObject var configStore: ConfigStore
     @Environment(\.scenePhase) private var scenePhase
 
+    @StateObject private var connectSSHManager = SSHManager()
     @State private var isConnecting = true
     @State private var errorMessage: String?
     @State private var activeTerminal: TerminalSessionStore.ActiveTerminal?
+    @State private var hostKeyMismatch: HostKeyMismatchError?
     @State private var wasBackgrounded = false
     @State private var awaitingTransportRecovery = false
     @StateObject private var connectState = ConnectState()
@@ -64,6 +66,26 @@ struct TerminalView: View {
         .navigationTitle("\(sessionName):\(windowIndex)")
         .navigationBarTitleDisplayMode(.inline)
         .toolbarColorScheme(.dark, for: .navigationBar)
+        .sheet(item: $connectSSHManager.pendingTrust) { request in
+            HostKeyTrustPromptView(
+                request: request,
+                onTrust: { connectSSHManager.approveTrust(request) },
+                onReject: { connectSSHManager.rejectTrust(request) }
+            )
+        }
+        .fullScreenCover(item: $hostKeyMismatch) { mismatch in
+            HostKeyMismatchView(
+                error: mismatch,
+                onCancel: {
+                    hostKeyMismatch = nil
+                },
+                onResetTrust: {
+                    connectSSHManager.resetTrust(forHost: mismatch.host)
+                    hostKeyMismatch = nil
+                    connectAndAttach()
+                }
+            )
+        }
         .onAppear {
             // Reuse existing terminal only if its SSH is still alive.
             // Stale connections (idle timeout, brief iOS suspend) need fresh reconnect.
@@ -144,13 +166,14 @@ struct TerminalView: View {
         // Prevents duplicate SSH sessions from rapid Reconnect taps or
         // foreground/reconnect races.
         connectState.cancelInFlight()
+        connectSSHManager.disconnect()
 
         isConnecting = true
         errorMessage = nil
+        hostKeyMismatch = nil
 
         let task = Task { @MainActor in
             do {
-                let sshManager = SSHManager()
                 guard let proxyConfig = tailscale.proxyConfig else {
                     throw TailscaleError.notConnected
                 }
@@ -160,10 +183,10 @@ struct TerminalView: View {
                     username: proxyConfig.username,
                     password: proxyConfig.password
                 )
-                try await sshManager.connect(config: config, proxy: proxy)
+                try await connectSSHManager.connect(config: config, proxy: proxy)
                 try Task.checkCancellation()
 
-                let handler = try await sshManager.openTerminal(
+                let handler = try await connectSSHManager.openTerminal(
                     tmuxPath: config.tmuxPath,
                     session: sessionName,
                     window: windowIndex,
@@ -178,7 +201,7 @@ struct TerminalView: View {
 
                 let terminal = TerminalSessionStore.ActiveTerminal(
                     key: key,
-                    sshManager: sshManager,
+                    sshManager: connectSSHManager,
                     handler: handler,
                     terminalView: termView
                 )
@@ -208,6 +231,11 @@ struct TerminalView: View {
             } catch is CancellationError {
                 // Task was cancelled — superseded by another connect attempt
                 return
+            } catch let mismatch as HostKeyMismatchError {
+                hostKeyMismatch = mismatch
+                errorMessage = nil
+                isConnecting = false
+                connectState.inFlight = nil
             } catch {
                 errorMessage = error.localizedDescription
                 isConnecting = false

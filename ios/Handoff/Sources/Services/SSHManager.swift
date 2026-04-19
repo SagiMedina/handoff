@@ -20,6 +20,19 @@ final class SSHManager: ObservableObject {
     /// The active SSH connection's channel, if connected.
     var isConnected: Bool { parentChannel?.isActive ?? false }
 
+    // MARK: - Host-key TOFU state
+    //
+    // `pendingTrust` is surfaced to SwiftUI so first-trust can pause the SSH
+    // handshake and ask the user to compare the fingerprint before continuing.
+    @Published var pendingTrust: PendingTrustRequest?
+
+    private var currentAttemptID: UUID?
+    private var pendingTrustPromise: EventLoopPromise<Void>?
+    private var pendingTrustEventLoop: EventLoop?
+    private var pendingTrustTimeout: Scheduled<Void>?
+    private let hostKeyStore: HostKeyStore = .shared
+    private let trustPromptTimeoutSeconds: Int64 = 60
+
     // MARK: - Gate protocol state
     //
     // `protocolVersion` is lifted from the active ConnectionConfig at connect()
@@ -71,6 +84,13 @@ final class SSHManager: ObservableObject {
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
 
+        // Attempt-scoped ID lets us reject any stale trust tap after retry,
+        // disconnect, or route changes have abandoned the original handshake.
+        let attemptID = UUID()
+        await MainActor.run {
+            self.currentAttemptID = attemptID
+        }
+
         let privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
         let authDelegate = PublicKeyAuthDelegate(
             username: config.user,
@@ -81,11 +101,36 @@ final class SSHManager: ObservableObject {
         let authSuccessPromise = group.next().makePromise(of: Void.self)
         let authWaiter = AuthSuccessHandler(promise: authSuccessPromise)
 
+        let hostKeyValidator = TOFUHostKeyValidator(
+            host: config.ip,
+            attemptID: attemptID,
+            store: hostKeyStore,
+            onFirstTrust: { [weak self] request, promise in
+                let eventLoop = promise.futureResult.eventLoop
+                Task { @MainActor [weak self] in
+                    guard let self else {
+                        eventLoop.execute {
+                            promise.fail(HostKeyValidationError.cancelled)
+                        }
+                        return
+                    }
+                    self.presentFirstTrust(
+                        request: request,
+                        promise: promise,
+                        eventLoop: eventLoop
+                    )
+                }
+            },
+            onMismatch: { error, promise in
+                promise.fail(error)
+            }
+        )
+
         let nioSSHHandler = NIOSSHHandler(
             role: .client(
                 .init(
                     userAuthDelegate: authDelegate,
-                    serverAuthDelegate: AcceptAllHostKeysDelegate()
+                    serverAuthDelegate: hostKeyValidator
                 )
             ),
             allocator: ByteBufferAllocator(),
@@ -364,6 +409,107 @@ final class SSHManager: ObservableObject {
         if let err = GateError.from(line: trimmed) { throw err }
     }
 
+    // MARK: - Host-key trust
+
+    @MainActor
+    func approveTrust(_ request: PendingTrustRequest) {
+        guard request.id == currentAttemptID,
+              let promise = pendingTrustPromise,
+              let eventLoop = pendingTrustEventLoop else { return }
+        hostKeyStore.trust(request.fingerprint, for: request.host)
+        clearPendingTrustState()
+        eventLoop.execute {
+            promise.succeed(())
+        }
+    }
+
+    @MainActor
+    func rejectTrust(_ request: PendingTrustRequest) {
+        guard request.id == currentAttemptID,
+              let promise = pendingTrustPromise,
+              let eventLoop = pendingTrustEventLoop else { return }
+        clearPendingTrustState()
+        eventLoop.execute {
+            promise.fail(HostKeyValidationError.userRejected)
+        }
+    }
+
+    @MainActor
+    func resetTrust(forHost host: String) {
+        hostKeyStore.forget(host: host)
+    }
+
+    @MainActor
+    func hasTrustedHostKey(forHost host: String) -> Bool {
+        hostKeyStore.hasTrust(for: host)
+    }
+
+    @MainActor
+    private func presentFirstTrust(
+        request: PendingTrustRequest,
+        promise: EventLoopPromise<Void>,
+        eventLoop: EventLoop
+    ) {
+        guard request.id == currentAttemptID else {
+            eventLoop.execute {
+                promise.fail(HostKeyValidationError.cancelled)
+            }
+            return
+        }
+
+        if let previousPromise = pendingTrustPromise, let previousEventLoop = pendingTrustEventLoop {
+            previousEventLoop.execute {
+                previousPromise.fail(HostKeyValidationError.cancelled)
+            }
+        }
+
+        pendingTrustPromise = promise
+        pendingTrustEventLoop = eventLoop
+        pendingTrust = request
+
+        pendingTrustTimeout?.cancel()
+        pendingTrustTimeout = eventLoop.scheduleTask(in: .seconds(trustPromptTimeoutSeconds)) { [weak self] in
+            promise.fail(HostKeyValidationError.timedOut)
+            Task { @MainActor [weak self] in
+                guard let self, self.pendingTrust?.id == request.id else { return }
+                self.clearPendingTrustState()
+            }
+        }
+    }
+
+    @MainActor
+    private func clearPendingTrustState() {
+        pendingTrust = nil
+        pendingTrustPromise = nil
+        pendingTrustEventLoop = nil
+        pendingTrustTimeout?.cancel()
+        pendingTrustTimeout = nil
+    }
+
+    private func invalidatePendingTrust(reason: HostKeyValidationError = .cancelled) {
+        let pendingID = pendingTrust?.id
+        let promise = pendingTrustPromise
+        let eventLoop = pendingTrustEventLoop
+
+        currentAttemptID = nil
+        pendingTrustPromise = nil
+        pendingTrustEventLoop = nil
+        pendingTrustTimeout?.cancel()
+        pendingTrustTimeout = nil
+
+        if let promise, let eventLoop {
+            eventLoop.execute {
+                promise.fail(reason)
+            }
+        }
+
+        guard let pendingID else { return }
+        Task { @MainActor [weak self] in
+            guard let self, self.pendingTrust?.id == pendingID else { return }
+            self.pendingTrust = nil
+        }
+    }
+
     // MARK: - Execute Command
 
     /// Execute a one-shot command over SSH and return stdout as a string.
@@ -420,6 +566,7 @@ final class SSHManager: ObservableObject {
     // MARK: - Disconnect
 
     func disconnect() {
+        invalidatePendingTrust()
         try? parentChannel?.close().wait()
         parentChannel = nil
         sshHandler = nil

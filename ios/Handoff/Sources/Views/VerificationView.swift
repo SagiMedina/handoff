@@ -27,6 +27,7 @@ struct VerificationView: View {
     @State private var verificationCode: String?
     @State private var errorMessage: String?
     @State private var flowTask: Task<Void, Never>?
+    @State private var hostKeyMismatch: HostKeyMismatchError?
 
     private enum Phase: Equatable {
         case connecting
@@ -54,6 +55,27 @@ struct VerificationView: View {
             .padding(32)
         }
         .navigationBarBackButtonHidden(true)
+        .sheet(item: $sshManager.pendingTrust) { request in
+            HostKeyTrustPromptView(
+                request: request,
+                onTrust: { sshManager.approveTrust(request) },
+                onReject: { sshManager.rejectTrust(request) }
+            )
+        }
+        .fullScreenCover(item: $hostKeyMismatch) { mismatch in
+            HostKeyMismatchView(
+                error: mismatch,
+                onCancel: {
+                    hostKeyMismatch = nil
+                    configStore.unpair()
+                },
+                onResetTrust: {
+                    sshManager.resetTrust(forHost: mismatch.host)
+                    hostKeyMismatch = nil
+                    runFlow()
+                }
+            )
+        }
         .onAppear {
             runFlow()
         }
@@ -136,12 +158,21 @@ struct VerificationView: View {
         // Cancel any prior flow before starting a new one (defensive: onAppear
         // can fire more than once across view-identity boundaries).
         flowTask?.cancel()
+        phase = .connecting
+        status = "Connecting to Mac…"
+        verificationCode = nil
+        errorMessage = nil
         flowTask = Task {
             do {
                 try await verify(config: config)
             } catch is CancellationError {
                 // User left the screen or unpaired. Nothing to surface.
                 return
+            } catch let mismatch as HostKeyMismatchError {
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    hostKeyMismatch = mismatch
+                }
             } catch {
                 if Task.isCancelled { return }
                 await MainActor.run {
