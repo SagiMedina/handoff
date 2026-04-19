@@ -1,13 +1,79 @@
 import SwiftUI
 
+final class ModifierState: ObservableObject {
+    @Published var ctrl = false
+    @Published var alt = false
+    @Published var shift = false
+
+    func consumeCtrl() -> Bool {
+        let active = ctrl
+        if active { ctrl = false }
+        return active
+    }
+
+    func consumeAlt() -> Bool {
+        let active = alt
+        if active { alt = false }
+        return active
+    }
+
+    func consumeShift() -> Bool {
+        let active = shift
+        if active { shift = false }
+        return active
+    }
+}
+
+enum TerminalModifierCodec {
+    static func applyCtrl(to bytes: [UInt8]) -> [UInt8] {
+        if bytes.count == 1, bytes[0] >= 0x40, bytes[0] <= 0x7F {
+            return [bytes[0] & 0x1F]
+        }
+        return bytes
+    }
+
+    static func applyShift(to bytes: [UInt8]) -> [UInt8] {
+        if bytes == KeyData.tab.bytes {
+            return [0x1B, 0x5B, 0x5A]
+        }
+        if bytes == KeyData.enter.bytes {
+            return [0x0A]
+        }
+        if bytes.count == 3, bytes[0] == 0x1B, bytes[1] == 0x5B {
+            let arrow = bytes[2]
+            if [0x41, 0x42, 0x43, 0x44].contains(arrow) {
+                return [0x1B, 0x5B, 0x31, 0x3B, 0x32, arrow]
+            }
+        }
+        return bytes
+    }
+
+    static func applyModifiers(
+        to bytes: [UInt8],
+        using modifiers: ModifierState,
+        consumeShift: Bool = true
+    ) -> [UInt8] {
+        var finalBytes = bytes
+
+        if modifiers.consumeCtrl() {
+            finalBytes = applyCtrl(to: finalBytes)
+        }
+        if consumeShift && modifiers.consumeShift() {
+            finalBytes = applyShift(to: finalBytes)
+        }
+        if modifiers.consumeAlt() {
+            finalBytes = [0x1B] + finalBytes
+        }
+
+        return finalBytes
+    }
+}
+
 /// Two-row toolbar of extra keys for terminal use on mobile.
 /// Mirrors the Android key surface closely so muscle memory carries over.
 struct MobileToolbar: View {
+    @ObservedObject var modifiers: ModifierState
     let onKey: (Data) -> Void
-
-    @State private var ctrlActive = false
-    @State private var altActive = false
-    @State private var shiftActive = false
 
     private let row1: [ToolbarKey] = [
         .init(label: "ESC", tapData: .esc, longPressData: .ctrlC),
@@ -56,11 +122,11 @@ struct MobileToolbar: View {
     private func isModifierActive(_ key: ToolbarKey) -> Bool {
         switch key.label {
         case "CTRL":
-            return ctrlActive
+            return modifiers.ctrl
         case "ALT":
-            return altActive
+            return modifiers.alt
         case "SHIFT":
-            return shiftActive
+            return modifiers.shift
         default:
             return false
         }
@@ -69,11 +135,11 @@ struct MobileToolbar: View {
     private func handleTap(for key: ToolbarKey) {
         switch key.label {
         case "CTRL":
-            ctrlActive.toggle()
+            modifiers.ctrl.toggle()
         case "ALT":
-            altActive.toggle()
+            modifiers.alt.toggle()
         case "SHIFT":
-            shiftActive.toggle()
+            modifiers.shift.toggle()
         default:
             guard let data = key.tapData else { return }
             send(data.bytes)
@@ -89,45 +155,12 @@ struct MobileToolbar: View {
     }
 
     private func send(_ bytes: [UInt8], consumeShift: Bool = true) {
-        var finalBytes = bytes
-
-        if ctrlActive {
-            finalBytes = applyCtrl(to: finalBytes)
-            ctrlActive = false
-        }
-        if consumeShift && shiftActive {
-            finalBytes = applyShift(to: finalBytes)
-            shiftActive = false
-        }
-        if altActive {
-            finalBytes = [0x1B] + finalBytes
-            altActive = false
-        }
-
+        let finalBytes = TerminalModifierCodec.applyModifiers(
+            to: bytes,
+            using: modifiers,
+            consumeShift: consumeShift
+        )
         onKey(Data(finalBytes))
-    }
-
-    private func applyCtrl(to bytes: [UInt8]) -> [UInt8] {
-        if bytes.count == 1, bytes[0] >= 0x40, bytes[0] <= 0x7F {
-            return [bytes[0] & 0x1F]
-        }
-        return bytes
-    }
-
-    private func applyShift(to bytes: [UInt8]) -> [UInt8] {
-        if bytes == KeyData.tab.bytes {
-            return [0x1B, 0x5B, 0x5A]
-        }
-        if bytes == KeyData.enter.bytes {
-            return [0x0A]
-        }
-        if bytes.count == 3, bytes[0] == 0x1B, bytes[1] == 0x5B {
-            let arrow = bytes[2]
-            if [0x41, 0x42, 0x43, 0x44].contains(arrow) {
-                return [0x1B, 0x5B, 0x31, 0x3B, 0x32, arrow]
-            }
-        }
-        return bytes
     }
 }
 

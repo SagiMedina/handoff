@@ -22,6 +22,7 @@ struct TerminalView: View {
     @State private var wasBackgrounded = false
     @State private var awaitingTransportRecovery = false
     @StateObject private var connectState = ConnectState()
+    @StateObject private var modifiers = ModifierState()
 
     private var key: TerminalSessionStore.Key {
         .init(sessionName: sessionName, windowIndex: windowIndex)
@@ -59,11 +60,15 @@ struct TerminalView: View {
                         readOnlyBanner
                     }
 
-                    SwiftTermView(terminal: terminal, isInputEnabled: !readOnly)
+                    SwiftTermView(
+                        terminal: terminal,
+                        modifierState: modifiers,
+                        isInputEnabled: !readOnly
+                    )
                         .ignoresSafeArea(.keyboard)
 
                     if !readOnly {
-                        MobileToolbar { keyData in
+                        MobileToolbar(modifiers: modifiers) { keyData in
                             terminal.handler.send(keyData)
                         }
                     }
@@ -322,6 +327,7 @@ struct TerminalView: View {
 /// across SwiftUI view re-creations.
 struct SwiftTermView: UIViewRepresentable {
     let terminal: TerminalSessionStore.ActiveTerminal
+    @ObservedObject var modifierState: ModifierState
     let isInputEnabled: Bool
 
     func makeUIView(context: Context) -> SwiftTerm.TerminalView {
@@ -332,26 +338,37 @@ struct SwiftTermView: UIViewRepresentable {
 
     func updateUIView(_ uiView: SwiftTerm.TerminalView, context: Context) {
         context.coordinator.handler = terminal.handler
+        context.coordinator.modifierState = modifierState
         context.coordinator.isInputEnabled = isInputEnabled
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(handler: terminal.handler, isInputEnabled: isInputEnabled)
+        Coordinator(
+            handler: terminal.handler,
+            modifierState: modifierState,
+            isInputEnabled: isInputEnabled
+        )
     }
 
     class Coordinator: NSObject, SwiftTerm.TerminalViewDelegate {
         var handler: TerminalChannelHandler
+        var modifierState: ModifierState
         var isInputEnabled: Bool
         private var resizeWorkItem: DispatchWorkItem?
 
-        init(handler: TerminalChannelHandler, isInputEnabled: Bool) {
+        init(handler: TerminalChannelHandler, modifierState: ModifierState, isInputEnabled: Bool) {
             self.handler = handler
+            self.modifierState = modifierState
             self.isInputEnabled = isInputEnabled
         }
 
         func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
             guard isInputEnabled else { return }
-            handler.send(Data(data))
+            let bytes = TerminalModifierCodec.applyModifiers(
+                to: Array(data),
+                using: modifierState
+            )
+            handler.send(Data(bytes))
         }
 
         func sizeChanged(source: SwiftTerm.TerminalView, newCols: Int, newRows: Int) {
