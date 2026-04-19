@@ -8,7 +8,7 @@ import UIKit
 struct TerminalView: View {
     let sessionName: String
     let windowIndex: Int
-    var tailscale: TailscaleManager
+    @ObservedObject var tailscale: TailscaleManager
 
     @EnvironmentObject var configStore: ConfigStore
     @Environment(\.scenePhase) private var scenePhase
@@ -17,6 +17,7 @@ struct TerminalView: View {
     @State private var errorMessage: String?
     @State private var activeTerminal: TerminalSessionStore.ActiveTerminal?
     @State private var wasBackgrounded = false
+    @State private var awaitingTransportRecovery = false
     @StateObject private var connectState = ConnectState()
 
     private var key: TerminalSessionStore.Key {
@@ -84,17 +85,22 @@ struct TerminalView: View {
             case .active:
                 if wasBackgrounded {
                     wasBackgrounded = false
-                    // iOS can leave us with a zombie SSH channel after
-                    // backgrounding: `isConnected` may still read true even
-                    // though the SOCKS5 proxy underneath was torn down.
-                    // Terminal continuity comes from tmux, not the old socket,
-                    // so always drop the stored terminal and reconnect fresh.
-                    if activeTerminal != nil {
-                        TerminalSessionStore.shared.close(key)
-                        activeTerminal = nil
-                        connectAndAttach()
-                    }
+                    beginForegroundRecovery()
                 }
+            default:
+                break
+            }
+        }
+        .onChange(of: tailscale.state) { newState in
+            guard awaitingTransportRecovery else { return }
+            switch newState {
+            case .connected:
+                awaitingTransportRecovery = false
+                connectAndAttach()
+            case .error(let message):
+                awaitingTransportRecovery = false
+                isConnecting = false
+                errorMessage = message
             default:
                 break
             }
@@ -207,6 +213,22 @@ struct TerminalView: View {
         }
 
         connectState.inFlight = task
+    }
+
+    private func beginForegroundRecovery() {
+        connectState.cancelInFlight()
+        if activeTerminal != nil {
+            TerminalSessionStore.shared.close(key)
+            activeTerminal = nil
+        }
+        errorMessage = nil
+        isConnecting = true
+        // Terminal reconnect failures after background are often lower than SSH:
+        // the embedded Tailscale loopback is stale, so opening a fresh SSH
+        // session just burns 10s and surfaces "The request timed out". Restart
+        // transport first, then reconnect tmux once the proxy is really back.
+        awaitingTransportRecovery = true
+        tailscale.restart()
     }
 
     private func configureTerminalView(_ termView: SwiftTerm.TerminalView) {
