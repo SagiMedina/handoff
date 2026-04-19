@@ -444,7 +444,8 @@ struct SessionsView: View {
                             onSelectWindow: { window in
                                 path.append(ContentView.Route.terminal(
                                     session: session.name,
-                                    window: window.index
+                                    window: window.index,
+                                    readOnly: readOnly
                                 ))
                             },
                             onNewWindow: {
@@ -683,7 +684,8 @@ struct SessionsView: View {
                         let window = session.windows[0]
                         path.append(ContentView.Route.terminal(
                             session: session.name,
-                            window: window.index
+                            window: window.index,
+                            readOnly: readOnly
                         ))
                     }
                 }
@@ -851,7 +853,8 @@ struct SessionsView: View {
                 await MainActor.run {
                     path.append(ContentView.Route.terminal(
                         session: session.name,
-                        window: windowIndex
+                        window: windowIndex,
+                        readOnly: readOnly
                     ))
                 }
             } catch {

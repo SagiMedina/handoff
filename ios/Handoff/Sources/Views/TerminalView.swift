@@ -8,6 +8,7 @@ import UIKit
 struct TerminalView: View {
     let sessionName: String
     let windowIndex: Int
+    let readOnly: Bool
     @ObservedObject var tailscale: TailscaleManager
 
     @EnvironmentObject var configStore: ConfigStore
@@ -54,11 +55,17 @@ struct TerminalView: View {
                 errorStateView(error)
             } else if let terminal = activeTerminal {
                 VStack(spacing: 0) {
-                    SwiftTermView(terminal: terminal)
+                    if readOnly {
+                        readOnlyBanner
+                    }
+
+                    SwiftTermView(terminal: terminal, isInputEnabled: !readOnly)
                         .ignoresSafeArea(.keyboard)
 
-                    MobileToolbar { keyData in
-                        terminal.handler.send(keyData)
+                    if !readOnly {
+                        MobileToolbar { keyData in
+                            terminal.handler.send(keyData)
+                        }
                     }
                 }
             }
@@ -130,6 +137,24 @@ struct TerminalView: View {
         .onChange(of: configStore.terminalFontSize) { _ in
             applyConfiguredFontToActiveTerminal()
         }
+    }
+
+    private var readOnlyBanner: some View {
+        HStack(spacing: 0) {
+            Text("READ-ONLY")
+                .foregroundColor(Theme.primary)
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .tracking(1)
+
+            Text("  ·  viewing only, input disabled")
+                .foregroundColor(Theme.primary.opacity(0.6))
+                .font(.system(size: 11))
+
+            Spacer()
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 4)
+        .background(Theme.primary.opacity(0.12))
     }
 
     private func errorStateView(_ error: String) -> some View {
@@ -297,6 +322,7 @@ struct TerminalView: View {
 /// across SwiftUI view re-creations.
 struct SwiftTermView: UIViewRepresentable {
     let terminal: TerminalSessionStore.ActiveTerminal
+    let isInputEnabled: Bool
 
     func makeUIView(context: Context) -> SwiftTerm.TerminalView {
         let termView = terminal.terminalView
@@ -306,21 +332,25 @@ struct SwiftTermView: UIViewRepresentable {
 
     func updateUIView(_ uiView: SwiftTerm.TerminalView, context: Context) {
         context.coordinator.handler = terminal.handler
+        context.coordinator.isInputEnabled = isInputEnabled
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(handler: terminal.handler)
+        Coordinator(handler: terminal.handler, isInputEnabled: isInputEnabled)
     }
 
     class Coordinator: NSObject, SwiftTerm.TerminalViewDelegate {
         var handler: TerminalChannelHandler
+        var isInputEnabled: Bool
         private var resizeWorkItem: DispatchWorkItem?
 
-        init(handler: TerminalChannelHandler) {
+        init(handler: TerminalChannelHandler, isInputEnabled: Bool) {
             self.handler = handler
+            self.isInputEnabled = isInputEnabled
         }
 
         func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
+            guard isInputEnabled else { return }
             handler.send(Data(data))
         }
 
