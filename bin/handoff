@@ -3,7 +3,13 @@ set -euo pipefail
 
 # Resolve the lib directory relative to this script
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-LIB_DIR="$(cd "$SCRIPT_DIR/../lib" 2>/dev/null && pwd || echo "/usr/local/lib/handoff")"
+if [[ -d "$SCRIPT_DIR/../lib/handoff" ]]; then
+    LIB_DIR="$(cd "$SCRIPT_DIR/../lib/handoff" && pwd)"
+elif [[ -d "$SCRIPT_DIR/../lib" ]]; then
+    LIB_DIR="$(cd "$SCRIPT_DIR/../lib" && pwd)"
+else
+    LIB_DIR="/usr/local/lib/handoff"
+fi
 
 # shellcheck source=../lib/handoff-common.sh
 source "$LIB_DIR/handoff-common.sh"
