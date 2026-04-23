@@ -136,6 +136,30 @@ cmd_setup() {
         fi
     fi
 
+    # 8. tmux mouse mode — finger-scroll on the phone only works as
+    # expected when tmux captures mouse events, otherwise alt-screen
+    # apps (claude, vim, less) receive arrow keys instead.
+    echo ""
+    local tmux_conf="$HOME/.tmux.conf"
+    if [[ -f "$tmux_conf" ]] && grep -qE '^[[:space:]]*set(-option)?[[:space:]]+(-g[[:space:]]+)?mouse[[:space:]]+(on|off)' "$tmux_conf"; then
+        success "  ✓ tmux mouse mode already configured in ~/.tmux.conf"
+    else
+        info "  Phone scrolling works best with tmux mouse mode on."
+        echo "  Without it, scrolling in claude/vim/less sends arrow keys"
+        echo "  instead of scrolling the pane history."
+        echo ""
+        read -rp "  Enable tmux mouse mode? [Y/n] " yn
+        if [[ ! "$yn" =~ ^[Nn] ]]; then
+            {
+                echo ''
+                echo '# Handoff: enable mouse so phone finger-scroll acts as scrollback'
+                echo 'set -g mouse on'
+            } >> "$tmux_conf"
+            success "  ✓ Added 'set -g mouse on' to ~/.tmux.conf"
+            tmux set -g mouse on 2>/dev/null || true
+        fi
+    fi
+
     echo ""
     success "  Setup complete!"
     printf "  Next step: run ${BOLD}handoff pair${RESET} to connect your phone.\n"
@@ -347,8 +371,8 @@ print(json.dumps(patterns))
             printf "  ${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
             echo ""
             local confirm
-            read -rp "  Does the phone show the same code? [y/N]: " confirm
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            read -rp "  Does the phone show the same code? [Y/n]: " confirm
+            if [[ ! "$confirm" =~ ^[Nn] ]]; then
                 devices_json_update_device "$fingerprint" "status" "active"
                 echo ""
                 success "  ✓ \"$device_name\" paired successfully!"
