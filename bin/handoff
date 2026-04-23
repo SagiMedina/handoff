@@ -285,20 +285,15 @@ print(json.dumps(patterns))
     json_payload=$(printf '{"v":2,"i":"%s","u":"%s","k":"%s","t":"%s","n":"%s"}' \
         "$ip" "$user" "$key_inner" "$tmux_path" "$nonce")
 
-    # 10. Display QR code
+    # 10. Display QR code in the terminal.
+    #
+    # Keep everything in one surface. Opening the QR in Preview steals focus
+    # away from this terminal, and the user misses the verification prompt
+    # below when the phone connects.
     echo ""
     info "  Scan this QR code with the Handoff app:"
     echo ""
-
-    # Generate QR as PNG and open in Preview for reliable scanning
-    local qr_png="$HANDOFF_DIR/pair_qr.png"
-    if qrencode -t PNG -o "$qr_png" -s 8 -m 2 "$json_payload" 2>/dev/null; then
-        open "$qr_png" 2>/dev/null &
-        info "  QR code opened in Preview."
-    else
-        # Fallback to terminal
-        qrencode -t ANSIUTF8 -m 1 "$json_payload"
-    fi
+    qrencode -t ANSIUTF8 -m 2 "$json_payload"
     echo ""
 
     # Show summary
@@ -346,7 +341,10 @@ print(json.dumps(patterns))
             local code
             code=$(derive_verification_code "$fingerprint" "$nonce")
             echo ""
-            printf "  ${BOLD}Verification code:  %s %s${RESET}\n" "${code:0:3}" "${code:3:3}"
+            printf "  ${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
+            printf "  ${BOLD}  Phone connected: ${GREEN}%s${RESET}\n" "$device_name"
+            printf "  ${BOLD}  Verification code:  ${YELLOW}%s %s${RESET}\n" "${code:0:3}" "${code:3:3}"
+            printf "  ${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
             echo ""
             local confirm
             read -rp "  Does the phone show the same code? [y/N]: " confirm

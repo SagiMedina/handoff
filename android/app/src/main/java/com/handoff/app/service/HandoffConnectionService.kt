@@ -59,13 +59,14 @@ class HandoffConnectionService : Service() {
     private fun enterForeground() {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // dataSync: appropriate for streaming SSH output over a persistent tsnet tunnel.
-            // connectedDevice would need a companion permission (Bluetooth/WiFi/NFC/USB) we
-            // don't actually use.
+            // specialUse: the app's core flow is "stay connected to your Mac while you
+            // switch apps", which has no daily cap — dataSync gets killed after a
+            // cumulative 6h/day on Android 14+. connectedDevice would fit semantically
+            // but requires a companion Bluetooth/WiFi/NFC/USB permission we don't use.
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
