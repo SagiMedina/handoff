@@ -682,11 +682,30 @@ cmd_gate() {
 
             gate_log "ok"
 
-            # exec replaces the gate process — SSH PTY connects directly to tmux
-            if [[ "$read_only" == "true" ]]; then
-                exec env LANG=en_US.UTF-8 "$tmux_path" attach -t "$target" -r
+            # Build the tmux command. If SSH didn't allocate a PTY (stdin is
+            # not a tty — can happen when authorized_keys lacks the 'pty'
+            # permission or sshd_config has PermitTTY no), wrap tmux in
+            # script(1) so it still gets a controlling terminal.
+            # Normalize TERM: when SSH doesn't allocate a PTY, sshd sets
+            # TERM=dumb, which tmux rejects ("terminal does not support clear").
+            # Use the client's TERM only if it's a real terminal.
+            local term_env="${TERM:-}"
+            if [[ -z "$term_env" || "$term_env" == "dumb" ]]; then
+                term_env="xterm-256color"
+            fi
+            local tmux_args=(env "LANG=en_US.UTF-8" "TERM=$term_env" "$tmux_path" attach -t "$target")
+            [[ "$read_only" == "true" ]] && tmux_args+=(-r)
+
+            if tty -s <&0; then
+                exec "${tmux_args[@]}"
+            elif [[ "$(uname -s)" == "Darwin" ]]; then
+                # BSD/macOS: script [file [command ...]]
+                exec script -q /dev/null "${tmux_args[@]}"
             else
-                exec env LANG=en_US.UTF-8 "$tmux_path" attach -t "$target"
+                # util-linux: script -q -c "<cmd>" <file>
+                local tmux_cmd
+                printf -v tmux_cmd '%q ' "${tmux_args[@]}"
+                exec script -qc "$tmux_cmd" /dev/null
             fi
             ;;
 
