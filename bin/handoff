@@ -680,6 +680,24 @@ cmd_gate() {
             local target="$session"
             [[ -n "$window" ]] && target="${session}:${window}"
 
+            # Detect a tmux server/client version mismatch before attaching.
+            # If an old server is still running (e.g. started by iTerm2 before
+            # `brew upgrade tmux`), a newer client talks a protocol the server
+            # can't handle and tmux bails with "open terminal failed: not a
+            # terminal" — identical to a PTY-allocation failure, so worth
+            # calling out explicitly.
+            local server_ver client_ver
+            server_ver=$("$tmux_path" display-message -p '#{version}' 2>/dev/null || true)
+            client_ver=$("$tmux_path" -V 2>/dev/null | awk '{print $2}')
+            if [[ -n "$server_ver" && -n "$client_ver" && "$server_ver" != "$client_ver" ]]; then
+                gate_log "denied:tmux_version_mismatch"
+                printf 'Handoff: tmux version mismatch (server=%s, client=%s).\r\n' \
+                    "$server_ver" "$client_ver"
+                printf 'The running tmux server is older than the tmux binary.\r\n'
+                printf 'On the Mac: quit iTerm2, run `tmux kill-server`, reopen iTerm2.\r\n'
+                exit 1
+            fi
+
             gate_log "ok"
 
             # Build the tmux command. If SSH didn't allocate a PTY (stdin is

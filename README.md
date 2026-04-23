@@ -126,6 +126,29 @@ All permissions are enforced server-side via `handoff gate` — the phone can ne
 
 **Phone side**: Native Android app (Jetpack Compose) with embedded Tailscale networking (tsnet via gomobile). Connects over SSH through a local tsnet proxy. Terminal emulation via embedded Termux libraries.
 
+## Troubleshooting
+
+**Phone shows "open terminal failed: not a terminal"**
+
+Almost always a stale tmux server. iTerm2 starts tmux at login, so if you `brew upgrade tmux` later, your running server is still the old binary while your new attach clients are the upgraded one. The protocol mismatch surfaces as that error.
+
+Fix (kills all in-flight tmux state — save work first):
+
+```
+# quit iTerm2 first (⌘Q)
+tmux kill-server     # in Terminal.app, or skip if no server remains
+# reopen iTerm2
+```
+
+Confirm versions match after:
+
+```
+tmux -V                                   # client binary
+tmux display-message -p '#{version}'      # running server
+```
+
+The gate also prints this error explicitly when it detects the mismatch, so you shouldn't hit the cryptic tmux message from the phone side anymore.
+
 ## Contributing
 
 PRs welcome. The project is split into:
