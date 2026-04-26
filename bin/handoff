@@ -25,6 +25,7 @@ ${BOLD}Usage:${RESET}
   handoff devices edit <n>  Change device permissions
   handoff devices renew <n> Approve access renewal  (alias: handoff renew <n>)
   handoff devices log [n]   Show access log  (alias: handoff logs [n])
+  handoff notify         Push a notification to paired phones (see: handoff notify --help)
   handoff version        Show version
   handoff help           Show this help
 
@@ -157,6 +158,25 @@ cmd_setup() {
             } >> "$tmux_conf"
             success "  ✓ Added 'set -g mouse on' to ~/.tmux.conf"
             tmux set -g mouse on 2>/dev/null || true
+        fi
+    fi
+
+    # 9. Optional Claude Code plugin hint. We never auto-run a slash command
+    # — Claude Code is interactive; we just point the user at it.
+    if [[ -d "$HOME/.claude" ]]; then
+        echo ""
+        info "  Claude Code detected."
+        echo "  The 'handoff-notify' plugin pushes Claude's"
+        echo "  Notification and Stop hooks to your phone."
+        echo ""
+        local yn
+        read -rp "  Show install commands? [Y/n] " yn
+        if [[ ! "$yn" =~ ^[Nn] ]]; then
+            echo ""
+            printf "    ${BOLD}/plugin marketplace add SagiMedina/handoff${RESET}\n"
+            printf "    ${BOLD}/plugin install handoff-notify@handoff${RESET}\n"
+            echo ""
+            printf "  ${DIM}Run those inside Claude Code. Hooks fire from then on.${RESET}\n"
         fi
     fi
 
@@ -854,6 +874,47 @@ cmd_gate() {
             echo "requested"
             ;;
 
+        subscribe)
+            # Long-lived NDJSON stream of notification events.
+            # Usage: subscribe [since=<id>] [types=<csv>]
+            # Soft-expiry / pending / revoked gating already applied above.
+            local since=0 type_filter=""
+            local kv
+            for kv in $args; do
+                case "$kv" in
+                    since=*) since="${kv#since=}" ;;
+                    types=*) type_filter="${kv#types=}" ;;
+                esac
+            done
+            # Sanitize since: digits only, default 0.
+            [[ "$since" =~ ^[0-9]+$ ]] || since=0
+
+            # One log line per connection — the stream itself is high-volume
+            # and would drown out everything else in access.log.
+            gate_log "ok:subscribe:since=$since"
+
+            # Locate the stream helper next to handoff-common.sh.
+            local stream_script="$LIB_DIR/handoff-events-stream.py"
+            if [[ ! -f "$stream_script" ]]; then
+                error "  stream helper missing: $stream_script"
+                echo "error:internal"
+                exit 1
+            fi
+
+            # device_sessions is a bash array; join with ';' for the helper.
+            local sessions_joined=""
+            local first=1
+            local p
+            for p in "${device_sessions[@]}"; do
+                if (( first )); then sessions_joined="$p"; first=0
+                else sessions_joined="${sessions_joined};${p}"; fi
+            done
+
+            # `python3 -u` for unbuffered stdout — we're streaming.
+            exec python3 -u "$stream_script" \
+                "$fingerprint" "$since" "$type_filter" "$sessions_joined"
+            ;;
+
         *)
             gate_log "denied:unknown_command"
             echo "error:unknown_command"
@@ -1171,6 +1232,128 @@ for e in entries[-50:]:
     echo ""
 }
 
+# ─── handoff notify ─────────────────────────────────────────────────
+
+cmd_notify() {
+    # Append a generic notification event to the bridge log. Subscribers
+    # (paired phones) receive it over the gate channel within ~250ms.
+    #
+    # The CLI is intentionally generic — Claude Code is one source via the
+    # handoff-notify plugin, but anything that wants to ping the phone (e.g.
+    # `handoff watch-exit make build`) can call this.
+    local type="" message="" title="" cwd="" claude_id="" source=""
+    local tmux_session="" tmux_window=""
+    local has_tmux_session=0 has_tmux_window=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --type)              type="$2"; shift 2 ;;
+            --message)           message="$2"; shift 2 ;;
+            --title)             title="$2"; shift 2 ;;
+            --tmux-session)      tmux_session="$2"; has_tmux_session=1; shift 2 ;;
+            --tmux-window)       tmux_window="$2"; has_tmux_window=1; shift 2 ;;
+            --cwd)               cwd="$2"; shift 2 ;;
+            --claude-session-id) claude_id="$2"; shift 2 ;;
+            --source)            source="$2"; shift 2 ;;
+            -h|--help|help)
+                cat <<EOF
+
+  handoff notify — push a notification to paired devices
+
+  Usage:
+    handoff notify --type <notify|stop|custom> --message <text>
+                   [--title <text>]
+                   [--tmux-session <name>] [--tmux-window <int>]
+                   [--cwd <path>]
+                   [--claude-session-id <uuid>]
+                   [--source <string>]
+
+  Tab inference:
+    If --tmux-session/--tmux-window are omitted and \$TMUX_PANE is set,
+    the values are inferred via: tmux display -p -t "\$TMUX_PANE" '#S|#I'
+
+  Behavior:
+    Writes one NDJSON line to ~/.handoff/events.jsonl and returns immediately.
+    No network, no blocking on phone delivery.
+
+EOF
+                return 0
+                ;;
+            *)
+                error "  Unknown flag: $1"
+                echo "  Try: handoff notify --help"
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ -z "$type" ]]; then
+        error "  --type is required (notify|stop|custom)"
+        return 1
+    fi
+    if [[ -z "$message" ]]; then
+        error "  --message is required"
+        return 1
+    fi
+
+    # Infer tab from $TMUX_PANE if the caller didn't provide one. Best-effort
+    # only — if tmux isn't installed or the pane disappeared, just emit
+    # without tab context (subscribers treat it as a "global" event).
+    if [[ $has_tmux_session -eq 0 || $has_tmux_window -eq 0 ]] \
+       && [[ -n "${TMUX_PANE:-}" ]] \
+       && command -v tmux >/dev/null 2>&1; then
+        local inferred
+        inferred=$(tmux display -p -t "${TMUX_PANE}" '#S|#I' 2>/dev/null || true)
+        if [[ -n "$inferred" ]]; then
+            [[ $has_tmux_session -eq 0 ]] && tmux_session="${inferred%%|*}"
+            if [[ $has_tmux_window -eq 0 ]]; then
+                tmux_window="${inferred#*|}"
+                # Strip anything after the index in case the format ever grows.
+                tmux_window="${tmux_window%%|*}"
+            fi
+        fi
+    fi
+
+    local id ts
+    id=$(events_log_next_id)
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Build the JSON record in Python so message/title escaping is bulletproof
+    # — these strings come straight from Claude's hook payload.
+    local json
+    json=$(
+        ID="$id" TS="$ts" TYPE="$type" TITLE="$title" MESSAGE="$message" \
+        TS_S="$tmux_session" TW="$tmux_window" CWD="$cwd" \
+        CLAUDE_ID="$claude_id" SRC="$source" \
+        python3 -c "
+import json, os
+rec = {
+    'id': int(os.environ['ID']),
+    'ts': os.environ['TS'],
+    'type': os.environ['TYPE'],
+    'message': os.environ['MESSAGE'],
+}
+def opt(k, env):
+    v = os.environ.get(env, '')
+    if v != '':
+        rec[k] = int(v) if k == 'tmux_window' else v
+opt('title', 'TITLE')
+opt('tmux_session', 'TS_S')
+if os.environ.get('TW', ''):
+    try:
+        rec['tmux_window'] = int(os.environ['TW'])
+    except ValueError:
+        pass
+opt('cwd', 'CWD')
+opt('claude_session_id', 'CLAUDE_ID')
+opt('source', 'SRC')
+print(json.dumps(rec, separators=(',', ':')))
+"
+    )
+
+    events_log_append "$json"
+}
+
 # ─── Main ───────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -1183,6 +1366,7 @@ case "${1:-}" in
     revoke)  shift; cmd_devices_rm "$@" ;;
     renew)   shift; cmd_devices_renew "$@" ;;
     logs)    shift; cmd_devices_log "$@" ;;
+    notify)  shift; cmd_notify "$@" ;;
     version) echo "handoff $VERSION" ;;
     help|-h|--help) usage ;;
     "")      cmd_default ;;

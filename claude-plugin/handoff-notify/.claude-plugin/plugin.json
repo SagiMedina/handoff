@@ -1,0 +1,13 @@
+{
+  "name": "handoff-notify",
+  "version": "1.0.0",
+  "description": "Forward Claude Code Notification and Stop hook events to a paired phone via Handoff.",
+  "author": {
+    "name": "Handoff",
+    "url": "https://github.com/SagiMedina/handoff"
+  },
+  "homepage": "https://github.com/SagiMedina/handoff",
+  "repository": "https://github.com/SagiMedina/handoff",
+  "license": "MIT",
+  "keywords": ["handoff", "notification", "mobile", "tmux"]
+}
