@@ -129,13 +129,6 @@ fun SessionsScreen(
                     session.copy(windows = windows)
                 }
                 sessions = sessionsWithWindows
-
-                // Auto-connect: single session with single window
-                if (sessionsWithWindows.size == 1 && sessionsWithWindows[0].windows.size == 1) {
-                    val s = sessionsWithWindows[0]
-                    onWindowSelected(s.name, s.windows[0])
-                    return@launch
-                }
             } catch (e: GateException) {
                 error = friendlyGateError(e.gateError)
                 sshManager.disconnect()

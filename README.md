@@ -27,11 +27,16 @@ No cloud relay. No port forwarding. Your Mac and phone talk directly over an enc
 ### Mac
 
 ```bash
-brew install handoff
+brew install handoff   # see "Install" note below
 handoff setup
 ```
 
 This installs Tailscale, enables SSH, configures iTerm2 to use tmux transparently (your terminal looks and feels exactly the same), and generates an SSH key.
+
+> **Install note (pre-release):** the Homebrew formula in `Formula/handoff.rb`
+> isn't published to a tap yet — `brew install handoff` will fail until the
+> tap goes live. Until then, install from a checkout: `git clone …handoff
+> && cd handoff && ./install.sh`.
 
 ### Android
 
@@ -91,6 +96,64 @@ During pairing, you choose:
 
 All permissions are enforced server-side via `handoff gate` — the phone can never bypass them, even with the raw SSH key.
 
+## Phone notifications
+
+Get a push notification on your phone whenever something on your Mac wants
+your attention — Claude waiting for input, a long build finishing, a CI
+script bailing out. Tap it to deep-link straight into the right tmux tab.
+If you're already viewing that tab on your phone, the notification is
+suppressed — no spam. One notification per tab; newer events for the same
+tab replace the older one in place.
+
+The pipeline is intentionally generic. `handoff` itself is tool-agnostic;
+each *source* of notifications is its own opt-in plugin.
+
+```
+your tool ──► handoff notify ──► ~/.handoff/events.jsonl
+                                          │
+                       handoff gate subscribe (NDJSON over SSH/Tailscale)
+                                          ▼
+                              Handoff Android app ──► system notification
+```
+
+No new ports, no FCM, no third-party push service. The phone reuses the
+same per-device SSH key it already uses for terminal access; the gate
+filters events by the device's session patterns server-side.
+
+### For shell scripts and any CLI
+
+`handoff notify` is the public API:
+
+```bash
+make build && handoff notify --type custom --message "build done"
+pytest    || handoff notify --type custom --message "tests failing"
+```
+
+Inside tmux, the current session and window are inferred automatically from
+`$TMUX_PANE`. Outside tmux, the event still delivers as a "no tab"
+notification.
+
+### For Claude Code
+
+The [`handoff-notify` plugin](claude-plugin/handoff-notify/) wires Claude's
+`Notification` and `Stop` hooks to `handoff notify`. Once
+[`SagiMedina/handoff`](https://github.com/SagiMedina/handoff) is public,
+install with two slash commands inside Claude Code:
+
+```
+/plugin marketplace add SagiMedina/handoff
+/plugin install handoff-notify@handoff
+```
+
+A manual fallback that doesn't need the marketplace is documented in the
+[plugin's README](claude-plugin/handoff-notify/README.md#manual-install).
+
+### Architecture deep dive
+
+See [`docs/notifications.md`](docs/notifications.md) for the event JSON
+schema, gate protocol, dedupe/suppression rules, and how to add new
+sources.
+
 ## Why
 
 - Walk away from your desk without killing a long-running Claude Code task
@@ -125,6 +188,29 @@ All permissions are enforced server-side via `handoff gate` — the phone can ne
 **Mac side**: tmux runs transparently under iTerm2 via `tmux -CC`. Each iTerm2 tab is a tmux window. `handoff` is a CLI that lists sessions, manages pairing, and enforces permissions via `handoff gate`.
 
 **Phone side**: Native Android app (Jetpack Compose) with embedded Tailscale networking (tsnet via gomobile). Connects over SSH through a local tsnet proxy. Terminal emulation via embedded Termux libraries.
+
+## Troubleshooting
+
+**Phone shows "open terminal failed: not a terminal"**
+
+Almost always a stale tmux server. iTerm2 starts tmux at login, so if you `brew upgrade tmux` later, your running server is still the old binary while your new attach clients are the upgraded one. The protocol mismatch surfaces as that error.
+
+Fix (kills all in-flight tmux state — save work first):
+
+```
+# quit iTerm2 first (⌘Q)
+tmux kill-server     # in Terminal.app, or skip if no server remains
+# reopen iTerm2
+```
+
+Confirm versions match after:
+
+```
+tmux -V                                   # client binary
+tmux display-message -p '#{version}'      # running server
+```
+
+The gate also prints this error explicitly when it detects the mismatch, so you shouldn't hit the cryptic tmux message from the phone side anymore.
 
 ## Contributing
 

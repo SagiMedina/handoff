@@ -26,8 +26,10 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
+import com.handoff.app.data.ForegroundState
 import com.handoff.app.data.HostKeyMismatchException
 import com.handoff.app.data.HostKeyUnknownException
+import com.handoff.app.data.NotificationPoster
 import com.handoff.app.data.PendingTrustRequest
 import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.SshManager
@@ -159,6 +161,21 @@ fun TerminalScreen(
                 error = "SSH key verification was cancelled."
             }
         )
+    }
+
+    // Track the tab the user is actively viewing, and clear any leftover
+    // notification for it the moment they open it. The notification poster
+    // reads ForegroundState.activeTerminalTab to suppress further pushes for
+    // this tab while the screen is composed.
+    DisposableEffect(sessionName, windowIndex) {
+        val tab = sessionName to windowIndex
+        ForegroundState.activeTerminalTab.value = tab
+        NotificationPoster(context).cancelForTab(sessionName, windowIndex)
+        onDispose {
+            if (ForegroundState.activeTerminalTab.value == tab) {
+                ForegroundState.activeTerminalTab.value = null
+            }
+        }
     }
 
     LaunchedEffect(sessionName, windowIndex, retryToken) {

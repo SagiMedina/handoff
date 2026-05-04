@@ -1,6 +1,7 @@
 package com.handoff.app
 
 import android.Manifest
+import android.content.Intent
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
@@ -8,6 +9,7 @@ import android.util.Log
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import androidx.fragment.app.FragmentActivity
 import androidx.compose.foundation.layout.Box
@@ -17,6 +19,7 @@ import androidx.compose.material3.SnackbarHost
 import androidx.compose.material3.SnackbarHostState
 import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
+import androidx.navigation.NavController
 import androidx.navigation.compose.NavHost
 import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
@@ -24,9 +27,13 @@ import com.handoff.app.data.TmuxSession
 import com.handoff.app.data.BiometricKeyStore
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
+import com.handoff.app.data.ForegroundState
+import com.handoff.app.data.NotificationPoster
 import com.handoff.app.service.HandoffConnectionService
 import com.handoff.app.ui.screens.*
 import com.handoff.app.ui.theme.HandoffTheme
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 
 class MainActivity : FragmentActivity() {
@@ -45,9 +52,39 @@ class MainActivity : FragmentActivity() {
         ActivityResultContracts.RequestPermission(),
     ) { /* best-effort: if denied, service still runs but notification won't be visible */ }
 
+    /**
+     * Pending deep-link from a notification tap. Set by [readDeepLink] from
+     * either the cold-start Intent in [onCreate] or a warm-start delivery in
+     * [onNewIntent]; consumed by a Compose effect that knows when the
+     * NavController is ready to navigate.
+     */
+    private val pendingDeepLink = MutableStateFlow<Pair<String, Int>?>(null)
+
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        readDeepLink(intent)
+    }
+
+    private fun readDeepLink(intent: Intent?) {
+        if (intent?.action != ACTION_OPEN_TAB) return
+        val session = intent.getStringExtra(EXTRA_DEEPLINK_SESSION) ?: return
+        val window = intent.getIntExtra(EXTRA_DEEPLINK_WINDOW, -1)
+        if (window < 0) return
+        // Cancel the notification that fired this — `setAutoCancel(true)` on
+        // the builder already covers tap, but we may also be re-entered from
+        // the recents list while the notification is still posted.
+        runCatching {
+            NotificationManagerCompat.from(this)
+                .cancel(NotificationPoster.tabIdFor(session, window))
+        }
+        pendingDeepLink.value = session to window
+    }
+
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
+        readDeepLink(intent)
 
         // Android 13+ requires an explicit runtime grant for the foreground-service notification.
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
@@ -90,6 +127,38 @@ class MainActivity : FragmentActivity() {
                     biometricKeyStore.isBiometricEnabled && biometricKeyStore.hasStoredKey -> "biometric_gate"
                     else -> "tailscale_auth"
                 }
+
+                // Mirror the live route into ForegroundState. The notification
+                // poster reads this to decide whether the user is on a
+                // terminal screen at all (vs. SessionsScreen / Settings) and
+                // therefore whether to suppress a push.
+                DisposableEffect(navController) {
+                    val listener = NavController.OnDestinationChangedListener { _, dest, _ ->
+                        ForegroundState.currentRoute.value = dest.route
+                    }
+                    navController.addOnDestinationChangedListener(listener)
+                    onDispose {
+                        navController.removeOnDestinationChangedListener(listener)
+                    }
+                }
+
+                // Consume notification-tap deep-links. Waits for config to
+                // exist (so the user has actually paired) before navigating;
+                // a tap during onboarding does nothing — the user lands at
+                // their normal start destination.
+                LaunchedEffect(navController, config) {
+                    if (config == null) return@LaunchedEffect
+                    pendingDeepLink.collectLatest { target ->
+                        if (target == null) return@collectLatest
+                        val (session, window) = target
+                        navController.navigate("terminal/$session/$window") {
+                            launchSingleTop = true
+                            popUpTo(startDest)
+                        }
+                        pendingDeepLink.value = null
+                    }
+                }
+
                 NavHost(
                     navController = navController,
                     startDestination = startDest,
@@ -297,4 +366,10 @@ class MainActivity : FragmentActivity() {
     // No teardown in onDestroy: the Activity may be recreated while the user still
     // wants the connection up. Disconnect happens via HandoffConnectionService — either
     // the notification's Disconnect action, a swipe dismissal, or Unpair.
+
+    companion object {
+        const val ACTION_OPEN_TAB = "com.handoff.app.action.OPEN_TAB"
+        const val EXTRA_DEEPLINK_SESSION = "handoff.deeplink.session"
+        const val EXTRA_DEEPLINK_WINDOW = "handoff.deeplink.window"
+    }
 }

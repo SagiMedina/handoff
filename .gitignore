@@ -3,3 +3,16 @@
 
 # AMQ agent messaging state
 .agent-mail/
+
+# Claude Code local settings
+.claude/
+
+# Kotlin build cache
+android/.kotlin/
+
+# gomobile sources jar (companion to the tracked gobridge.aar)
+android/app/libs/gobridge-sources.jar
+
+# Python bytecode (lib/handoff-events-stream.py runs from source)
+__pycache__/
+*.pyc

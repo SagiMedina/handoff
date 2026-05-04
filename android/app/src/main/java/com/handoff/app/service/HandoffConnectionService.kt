@@ -17,6 +17,9 @@ import com.handoff.app.BuildConfig
 import com.handoff.app.HandoffApp
 import com.handoff.app.MainActivity
 import com.handoff.app.R
+import com.handoff.app.data.ConfigStore
+import com.handoff.app.data.NotificationPoster
+import com.handoff.app.data.NotificationSubscriber
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -36,6 +39,7 @@ import kotlinx.coroutines.launch
 class HandoffConnectionService : Service() {
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
+    private var subscriber: NotificationSubscriber? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -59,17 +63,38 @@ class HandoffConnectionService : Service() {
     private fun enterForeground() {
         val notification = buildNotification()
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-            // dataSync: appropriate for streaming SSH output over a persistent tsnet tunnel.
-            // connectedDevice would need a companion permission (Bluetooth/WiFi/NFC/USB) we
-            // don't actually use.
+            // specialUse: the app's core flow is "stay connected to your Mac while you
+            // switch apps", which has no daily cap — dataSync gets killed after a
+            // cumulative 6h/day on Android 14+. connectedDevice would fit semantically
+            // but requires a companion Bluetooth/WiFi/NFC/USB permission we don't use.
             startForeground(
                 NOTIFICATION_ID,
                 notification,
-                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
             )
         } else {
             startForeground(NOTIFICATION_ID, notification)
         }
+        startSubscriberIfPaired()
+    }
+
+    /**
+     * Idempotent — start the long-lived notification subscriber once a paired
+     * config exists. The subscriber waits for tsnet to be CONNECTED before
+     * making its own SSH connection, so it's safe to start before the user
+     * has finished the Tailscale auth flow.
+     */
+    private fun startSubscriberIfPaired() {
+        if (subscriber != null) return
+        val app = applicationContext as HandoffApp
+        val configStore = ConfigStore(applicationContext)
+        val sub = NotificationSubscriber(
+            appContext = applicationContext,
+            tailscaleManager = app.tailscaleManager,
+            configStore = configStore,
+        )
+        sub.start()
+        subscriber = sub
     }
 
     private fun buildNotification(): Notification {
@@ -108,20 +133,39 @@ class HandoffConnectionService : Service() {
     private fun ensureNotificationChannel() {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
         val nm = getSystemService(NotificationManager::class.java) ?: return
-        if (nm.getNotificationChannel(CHANNEL_ID) != null) return
-        val channel = NotificationChannel(
-            CHANNEL_ID,
-            "Handoff connection",
-            NotificationManager.IMPORTANCE_LOW,
-        ).apply {
-            description = "Shown while Handoff is connected to your Mac"
-            setShowBadge(false)
+        if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Handoff connection",
+                NotificationManager.IMPORTANCE_LOW,
+            ).apply {
+                description = "Shown while Handoff is connected to your Mac"
+                setShowBadge(false)
+            }
+            nm.createNotificationChannel(channel)
         }
-        nm.createNotificationChannel(channel)
+        if (nm.getNotificationChannel(NotificationPoster.CHANNEL_ID_EVENTS) == null) {
+            // Separate channel from the persistent connection notification:
+            // the user may want sound + heads-up for "Claude is waiting" but
+            // a silent service notification — Android lets them tune those
+            // independently.
+            val channel = NotificationChannel(
+                NotificationPoster.CHANNEL_ID_EVENTS,
+                "Claude activity",
+                NotificationManager.IMPORTANCE_HIGH,
+            ).apply {
+                description = "Pushes when Claude on your Mac is waiting for input or finishes."
+                enableLights(true)
+                enableVibration(true)
+            }
+            nm.createNotificationChannel(channel)
+        }
     }
 
     private fun teardownAndStop() {
         val app = applicationContext as HandoffApp
+        runCatching { subscriber?.stop() }
+        subscriber = null
         scope.launch {
             runCatching { app.terminalHolder.disconnect() }
             runCatching { app.sshManager.disconnect() }

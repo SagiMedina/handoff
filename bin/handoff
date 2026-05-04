@@ -25,6 +25,7 @@ ${BOLD}Usage:${RESET}
   handoff devices edit <n>  Change device permissions
   handoff devices renew <n> Approve access renewal  (alias: handoff renew <n>)
   handoff devices log [n]   Show access log  (alias: handoff logs [n])
+  handoff notify         Push a notification to paired phones (see: handoff notify --help)
   handoff version        Show version
   handoff help           Show this help
 
@@ -133,6 +134,49 @@ cmd_setup() {
             echo '# Handoff: auto-attach to tmux session' >> "$HOME/.zshrc"
             echo '[[ -z "$TMUX" ]] && exec tmux new -A -s main' >> "$HOME/.zshrc"
             success "  ✓ Added tmux auto-attach to ~/.zshrc"
+        fi
+    fi
+
+    # 8. tmux mouse mode — finger-scroll on the phone only works as
+    # expected when tmux captures mouse events, otherwise alt-screen
+    # apps (claude, vim, less) receive arrow keys instead.
+    echo ""
+    local tmux_conf="$HOME/.tmux.conf"
+    if [[ -f "$tmux_conf" ]] && grep -qE '^[[:space:]]*set(-option)?[[:space:]]+(-g[[:space:]]+)?mouse[[:space:]]+(on|off)' "$tmux_conf"; then
+        success "  ✓ tmux mouse mode already configured in ~/.tmux.conf"
+    else
+        info "  Phone scrolling works best with tmux mouse mode on."
+        echo "  Without it, scrolling in claude/vim/less sends arrow keys"
+        echo "  instead of scrolling the pane history."
+        echo ""
+        read -rp "  Enable tmux mouse mode? [Y/n] " yn
+        if [[ ! "$yn" =~ ^[Nn] ]]; then
+            {
+                echo ''
+                echo '# Handoff: enable mouse so phone finger-scroll acts as scrollback'
+                echo 'set -g mouse on'
+            } >> "$tmux_conf"
+            success "  ✓ Added 'set -g mouse on' to ~/.tmux.conf"
+            tmux set -g mouse on 2>/dev/null || true
+        fi
+    fi
+
+    # 9. Optional Claude Code plugin hint. We never auto-run a slash command
+    # — Claude Code is interactive; we just point the user at it.
+    if [[ -d "$HOME/.claude" ]]; then
+        echo ""
+        info "  Claude Code detected."
+        echo "  The 'handoff-notify' plugin pushes Claude's"
+        echo "  Notification and Stop hooks to your phone."
+        echo ""
+        local yn
+        read -rp "  Show install commands? [Y/n] " yn
+        if [[ ! "$yn" =~ ^[Nn] ]]; then
+            echo ""
+            printf "    ${BOLD}/plugin marketplace add SagiMedina/handoff${RESET}\n"
+            printf "    ${BOLD}/plugin install handoff-notify@handoff${RESET}\n"
+            echo ""
+            printf "  ${DIM}Run those inside Claude Code. Hooks fire from then on.${RESET}\n"
         fi
     fi
 
@@ -285,20 +329,15 @@ print(json.dumps(patterns))
     json_payload=$(printf '{"v":2,"i":"%s","u":"%s","k":"%s","t":"%s","n":"%s"}' \
         "$ip" "$user" "$key_inner" "$tmux_path" "$nonce")
 
-    # 10. Display QR code
+    # 10. Display QR code in the terminal.
+    #
+    # Keep everything in one surface. Opening the QR in Preview steals focus
+    # away from this terminal, and the user misses the verification prompt
+    # below when the phone connects.
     echo ""
     info "  Scan this QR code with the Handoff app:"
     echo ""
-
-    # Generate QR as PNG and open in Preview for reliable scanning
-    local qr_png="$HANDOFF_DIR/pair_qr.png"
-    if qrencode -t PNG -o "$qr_png" -s 8 -m 2 "$json_payload" 2>/dev/null; then
-        open "$qr_png" 2>/dev/null &
-        info "  QR code opened in Preview."
-    else
-        # Fallback to terminal
-        qrencode -t ANSIUTF8 -m 1 "$json_payload"
-    fi
+    qrencode -t ANSIUTF8 -m 2 "$json_payload"
     echo ""
 
     # Show summary
@@ -346,11 +385,14 @@ print(json.dumps(patterns))
             local code
             code=$(derive_verification_code "$fingerprint" "$nonce")
             echo ""
-            printf "  ${BOLD}Verification code:  %s %s${RESET}\n" "${code:0:3}" "${code:3:3}"
+            printf "  ${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
+            printf "  ${BOLD}  Phone connected: ${GREEN}%s${RESET}\n" "$device_name"
+            printf "  ${BOLD}  Verification code:  ${YELLOW}%s %s${RESET}\n" "${code:0:3}" "${code:3:3}"
+            printf "  ${BOLD}${YELLOW}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${RESET}\n"
             echo ""
             local confirm
-            read -rp "  Does the phone show the same code? [y/N]: " confirm
-            if [[ "$confirm" =~ ^[Yy]$ ]]; then
+            read -rp "  Does the phone show the same code? [Y/n]: " confirm
+            if [[ ! "$confirm" =~ ^[Nn] ]]; then
                 devices_json_update_device "$fingerprint" "status" "active"
                 echo ""
                 success "  ✓ \"$device_name\" paired successfully!"
@@ -682,13 +724,50 @@ cmd_gate() {
             local target="$session"
             [[ -n "$window" ]] && target="${session}:${window}"
 
+            # Detect a tmux server/client version mismatch before attaching.
+            # If an old server is still running (e.g. started by iTerm2 before
+            # `brew upgrade tmux`), a newer client talks a protocol the server
+            # can't handle and tmux bails with "open terminal failed: not a
+            # terminal" — identical to a PTY-allocation failure, so worth
+            # calling out explicitly.
+            local server_ver client_ver
+            server_ver=$("$tmux_path" display-message -p '#{version}' 2>/dev/null || true)
+            client_ver=$("$tmux_path" -V 2>/dev/null | awk '{print $2}')
+            if [[ -n "$server_ver" && -n "$client_ver" && "$server_ver" != "$client_ver" ]]; then
+                gate_log "denied:tmux_version_mismatch"
+                printf 'Handoff: tmux version mismatch (server=%s, client=%s).\r\n' \
+                    "$server_ver" "$client_ver"
+                printf 'The running tmux server is older than the tmux binary.\r\n'
+                printf 'On the Mac: quit iTerm2, run `tmux kill-server`, reopen iTerm2.\r\n'
+                exit 1
+            fi
+
             gate_log "ok"
 
-            # exec replaces the gate process — SSH PTY connects directly to tmux
-            if [[ "$read_only" == "true" ]]; then
-                exec env LANG=en_US.UTF-8 "$tmux_path" attach -t "$target" -r
+            # Build the tmux command. If SSH didn't allocate a PTY (stdin is
+            # not a tty — can happen when authorized_keys lacks the 'pty'
+            # permission or sshd_config has PermitTTY no), wrap tmux in
+            # script(1) so it still gets a controlling terminal.
+            # Normalize TERM: when SSH doesn't allocate a PTY, sshd sets
+            # TERM=dumb, which tmux rejects ("terminal does not support clear").
+            # Use the client's TERM only if it's a real terminal.
+            local term_env="${TERM:-}"
+            if [[ -z "$term_env" || "$term_env" == "dumb" ]]; then
+                term_env="xterm-256color"
+            fi
+            local tmux_args=(env "LANG=en_US.UTF-8" "TERM=$term_env" "$tmux_path" attach -t "$target")
+            [[ "$read_only" == "true" ]] && tmux_args+=(-r)
+
+            if tty -s <&0; then
+                exec "${tmux_args[@]}"
+            elif [[ "$(uname -s)" == "Darwin" ]]; then
+                # BSD/macOS: script [file [command ...]]
+                exec script -q /dev/null "${tmux_args[@]}"
             else
-                exec env LANG=en_US.UTF-8 "$tmux_path" attach -t "$target"
+                # util-linux: script -q -c "<cmd>" <file>
+                local tmux_cmd
+                printf -v tmux_cmd '%q ' "${tmux_args[@]}"
+                exec script -qc "$tmux_cmd" /dev/null
             fi
             ;;
 
@@ -793,6 +872,47 @@ cmd_gate() {
             devices_json_update_device "$fingerprint" "renewal_requested" "true"
             gate_log "ok"
             echo "requested"
+            ;;
+
+        subscribe)
+            # Long-lived NDJSON stream of notification events.
+            # Usage: subscribe [since=<id>] [types=<csv>]
+            # Soft-expiry / pending / revoked gating already applied above.
+            local since=0 type_filter=""
+            local kv
+            for kv in $args; do
+                case "$kv" in
+                    since=*) since="${kv#since=}" ;;
+                    types=*) type_filter="${kv#types=}" ;;
+                esac
+            done
+            # Sanitize since: digits only, default 0.
+            [[ "$since" =~ ^[0-9]+$ ]] || since=0
+
+            # One log line per connection — the stream itself is high-volume
+            # and would drown out everything else in access.log.
+            gate_log "ok:subscribe:since=$since"
+
+            # Locate the stream helper next to handoff-common.sh.
+            local stream_script="$LIB_DIR/handoff-events-stream.py"
+            if [[ ! -f "$stream_script" ]]; then
+                error "  stream helper missing: $stream_script"
+                echo "error:internal"
+                exit 1
+            fi
+
+            # device_sessions is a bash array; join with ';' for the helper.
+            local sessions_joined=""
+            local first=1
+            local p
+            for p in "${device_sessions[@]}"; do
+                if (( first )); then sessions_joined="$p"; first=0
+                else sessions_joined="${sessions_joined};${p}"; fi
+            done
+
+            # `python3 -u` for unbuffered stdout — we're streaming.
+            exec python3 -u "$stream_script" \
+                "$fingerprint" "$since" "$type_filter" "$sessions_joined"
             ;;
 
         *)
@@ -1112,6 +1232,128 @@ for e in entries[-50:]:
     echo ""
 }
 
+# ─── handoff notify ─────────────────────────────────────────────────
+
+cmd_notify() {
+    # Append a generic notification event to the bridge log. Subscribers
+    # (paired phones) receive it over the gate channel within ~250ms.
+    #
+    # The CLI is intentionally generic — Claude Code is one source via the
+    # handoff-notify plugin, but anything that wants to ping the phone (e.g.
+    # `handoff watch-exit make build`) can call this.
+    local type="" message="" title="" cwd="" claude_id="" source=""
+    local tmux_session="" tmux_window=""
+    local has_tmux_session=0 has_tmux_window=0
+
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --type)              type="$2"; shift 2 ;;
+            --message)           message="$2"; shift 2 ;;
+            --title)             title="$2"; shift 2 ;;
+            --tmux-session)      tmux_session="$2"; has_tmux_session=1; shift 2 ;;
+            --tmux-window)       tmux_window="$2"; has_tmux_window=1; shift 2 ;;
+            --cwd)               cwd="$2"; shift 2 ;;
+            --claude-session-id) claude_id="$2"; shift 2 ;;
+            --source)            source="$2"; shift 2 ;;
+            -h|--help|help)
+                cat <<EOF
+
+  handoff notify — push a notification to paired devices
+
+  Usage:
+    handoff notify --type <notify|stop|custom> --message <text>
+                   [--title <text>]
+                   [--tmux-session <name>] [--tmux-window <int>]
+                   [--cwd <path>]
+                   [--claude-session-id <uuid>]
+                   [--source <string>]
+
+  Tab inference:
+    If --tmux-session/--tmux-window are omitted and \$TMUX_PANE is set,
+    the values are inferred via: tmux display -p -t "\$TMUX_PANE" '#S|#I'
+
+  Behavior:
+    Writes one NDJSON line to ~/.handoff/events.jsonl and returns immediately.
+    No network, no blocking on phone delivery.
+
+EOF
+                return 0
+                ;;
+            *)
+                error "  Unknown flag: $1"
+                echo "  Try: handoff notify --help"
+                return 1
+                ;;
+        esac
+    done
+
+    if [[ -z "$type" ]]; then
+        error "  --type is required (notify|stop|custom)"
+        return 1
+    fi
+    if [[ -z "$message" ]]; then
+        error "  --message is required"
+        return 1
+    fi
+
+    # Infer tab from $TMUX_PANE if the caller didn't provide one. Best-effort
+    # only — if tmux isn't installed or the pane disappeared, just emit
+    # without tab context (subscribers treat it as a "global" event).
+    if [[ $has_tmux_session -eq 0 || $has_tmux_window -eq 0 ]] \
+       && [[ -n "${TMUX_PANE:-}" ]] \
+       && command -v tmux >/dev/null 2>&1; then
+        local inferred
+        inferred=$(tmux display -p -t "${TMUX_PANE}" '#S|#I' 2>/dev/null || true)
+        if [[ -n "$inferred" ]]; then
+            [[ $has_tmux_session -eq 0 ]] && tmux_session="${inferred%%|*}"
+            if [[ $has_tmux_window -eq 0 ]]; then
+                tmux_window="${inferred#*|}"
+                # Strip anything after the index in case the format ever grows.
+                tmux_window="${tmux_window%%|*}"
+            fi
+        fi
+    fi
+
+    local id ts
+    id=$(events_log_next_id)
+    ts=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+    # Build the JSON record in Python so message/title escaping is bulletproof
+    # — these strings come straight from Claude's hook payload.
+    local json
+    json=$(
+        ID="$id" TS="$ts" TYPE="$type" TITLE="$title" MESSAGE="$message" \
+        TS_S="$tmux_session" TW="$tmux_window" CWD="$cwd" \
+        CLAUDE_ID="$claude_id" SRC="$source" \
+        python3 -c "
+import json, os
+rec = {
+    'id': int(os.environ['ID']),
+    'ts': os.environ['TS'],
+    'type': os.environ['TYPE'],
+    'message': os.environ['MESSAGE'],
+}
+def opt(k, env):
+    v = os.environ.get(env, '')
+    if v != '':
+        rec[k] = int(v) if k == 'tmux_window' else v
+opt('title', 'TITLE')
+opt('tmux_session', 'TS_S')
+if os.environ.get('TW', ''):
+    try:
+        rec['tmux_window'] = int(os.environ['TW'])
+    except ValueError:
+        pass
+opt('cwd', 'CWD')
+opt('claude_session_id', 'CLAUDE_ID')
+opt('source', 'SRC')
+print(json.dumps(rec, separators=(',', ':')))
+"
+    )
+
+    events_log_append "$json"
+}
+
 # ─── Main ───────────────────────────────────────────────────────────
 
 case "${1:-}" in
@@ -1124,6 +1366,7 @@ case "${1:-}" in
     revoke)  shift; cmd_devices_rm "$@" ;;
     renew)   shift; cmd_devices_renew "$@" ;;
     logs)    shift; cmd_devices_log "$@" ;;
+    notify)  shift; cmd_notify "$@" ;;
     version) echo "handoff $VERSION" ;;
     help|-h|--help) usage ;;
     "")      cmd_default ;;
