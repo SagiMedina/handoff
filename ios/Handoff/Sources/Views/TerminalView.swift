@@ -296,6 +296,14 @@ struct TerminalView: View {
         applyConfiguredFont(to: termView)
         termView.nativeBackgroundColor = UIColor(Theme.background)
         termView.nativeForegroundColor = UIColor(Theme.text)
+        // Hand scrolling over to our own one-finger pan (see SwiftTermView).
+        // SwiftTerm otherwise turns a one-finger pan into a mouse *drag* whenever
+        // the remote app has mouse tracking on (tmux `mouse on`), which tmux reads
+        // as a text selection rather than scrollback. Disabling its mouse reporting
+        // frees the pan for us and leaves tap-to-focus + long/double/triple-tap
+        // selection intact. Cost: taps no longer report as mouse clicks to the
+        // remote app — acceptable for a keyboard-driven terminal.
+        termView.allowMouseReporting = false
         // Idle timer is managed centrally by TerminalSessionStore
     }
 
@@ -333,6 +341,7 @@ struct SwiftTermView: UIViewRepresentable {
     func makeUIView(context: Context) -> SwiftTerm.TerminalView {
         let termView = terminal.terminalView
         termView.terminalDelegate = context.coordinator
+        context.coordinator.installScrollGesture(on: termView)
         return termView
     }
 
@@ -350,16 +359,100 @@ struct SwiftTermView: UIViewRepresentable {
         )
     }
 
-    class Coordinator: NSObject, SwiftTerm.TerminalViewDelegate {
+    class Coordinator: NSObject, SwiftTerm.TerminalViewDelegate, UIGestureRecognizerDelegate {
         var handler: TerminalChannelHandler
         var modifierState: ModifierState
         var isInputEnabled: Bool
         private var resizeWorkItem: DispatchWorkItem?
 
+        // One-finger scroll → tmux scrollback. Mirrors Android's Termux `doScroll`:
+        // accumulate pixel drag, convert to whole rows by cell height (keeping the
+        // sub-row remainder so slow drags aren't rounded away), and emit one
+        // scroll-wheel event per row.
+        private static let gestureName = "handoffScrollPan"
+        private var scrollRemainder: CGFloat = 0
+        private var lastTranslationY: CGFloat = 0
+
         init(handler: TerminalChannelHandler, modifierState: ModifierState, isInputEnabled: Bool) {
             self.handler = handler
             self.modifierState = modifierState
             self.isInputEnabled = isInputEnabled
+        }
+
+        /// Attach (or re-attach, after a view re-creation) the one-finger scroll pan.
+        func installScrollGesture(on view: SwiftTerm.TerminalView) {
+            // Drop a recognizer left by a previous coordinator so the live one owns scrolling.
+            for gesture in view.gestureRecognizers ?? [] where gesture.name == Coordinator.gestureName {
+                view.removeGestureRecognizer(gesture)
+            }
+            let pan = UIPanGestureRecognizer(target: self, action: #selector(handleScrollPan(_:)))
+            pan.name = Coordinator.gestureName
+            pan.maximumNumberOfTouches = 1
+            pan.delegate = self
+            view.addGestureRecognizer(pan)
+        }
+
+        @objc private func handleScrollPan(_ gesture: UIPanGestureRecognizer) {
+            guard let view = gesture.view as? SwiftTerm.TerminalView else { return }
+            switch gesture.state {
+            case .began:
+                scrollRemainder = 0
+                lastTranslationY = 0
+            case .changed:
+                let terminal = view.getTerminal()
+                let cellHeight = view.bounds.height / CGFloat(max(terminal.rows, 1))
+                guard cellHeight > 0 else { return }
+                let translationY = gesture.translation(in: view).y
+                let incremental = translationY - lastTranslationY
+                lastTranslationY = translationY
+                let accumulated = scrollRemainder + incremental
+                let deltaRows = Int((accumulated / cellHeight).rounded(.towardZero))
+                scrollRemainder = accumulated - CGFloat(deltaRows) * cellHeight
+                if deltaRows != 0 {
+                    doScroll(view: view, terminal: terminal, deltaRows: deltaRows,
+                             at: gesture.location(in: view), cellHeight: cellHeight)
+                }
+            default:
+                break
+            }
+        }
+
+        /// Emit one scroll step per row. Finger moving *down* (positive translation)
+        /// reveals older output → wheel up. Branches like Termux's `doScroll`:
+        /// tmux/app mouse tracking on → SGR wheel events; bare alternate screen
+        /// (e.g. less without mouse) → arrow keys. Normal-buffer scrollback is left
+        /// to SwiftTerm's own scroll view.
+        private func doScroll(view: SwiftTerm.TerminalView, terminal: Terminal,
+                              deltaRows: Int, at point: CGPoint, cellHeight: CGFloat) {
+            let up = deltaRows > 0
+            let count = min(abs(deltaRows), 40)   // guard against a runaway flick
+            let mouseActive = terminal.mouseMode != .off
+            let alternate = terminal.isCurrentBufferAlternate
+            guard mouseActive || alternate else { return }
+
+            let cellWidth = view.bounds.width / CGFloat(max(terminal.cols, 1))
+            let col = cellWidth > 0 ? min(max(Int(point.x / cellWidth) + 1, 1), terminal.cols) : 1
+            let row = min(max(Int(point.y / cellHeight) + 1, 1), terminal.rows)
+
+            var bytes: [UInt8] = []
+            for _ in 0..<count {
+                if mouseActive {
+                    // SGR 1006 mouse wheel: button 64 = up, 65 = down.
+                    let button = up ? 64 : 65
+                    bytes.append(contentsOf: Array("\u{1b}[<\(button);\(col);\(row)M".utf8))
+                } else {
+                    bytes.append(contentsOf: Array((up ? "\u{1b}[A" : "\u{1b}[B").utf8))
+                }
+            }
+            if !bytes.isEmpty {
+                handler.send(Data(bytes))
+            }
+        }
+
+        // Scroll pan coexists with SwiftTerm's own scroll view / selection gestures.
+        func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer,
+                               shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer) -> Bool {
+            true
         }
 
         func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
