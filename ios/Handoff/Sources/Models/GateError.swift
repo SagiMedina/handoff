@@ -35,7 +35,12 @@ struct GateError: Error, LocalizedError, Equatable {
         case denied         = "error:denied"
         case unknownCommand = "error:unknown_command"
         case failed         = "error:failed"
-        case unknown        = "error:unknown"
+        // Fallback for any wire code we don't recognize. Its raw value is
+        // deliberately NOT an `error:` string: every gate response starts with
+        // `error:` (see `from(line:)`), so a real server code can never decode
+        // straight to `.unknown` — it's only ever reached via the `?? .unknown`
+        // fallback in `code`, which preserves the original `rawCode` for display.
+        case unknown        = "handoff:unrecognized"
     }
 
     /// Returns a `GateError` if `line` is a gate error wire format, else nil.
