@@ -5,6 +5,7 @@ HANDOFF_DIR="$HOME/.handoff"
 HANDOFF_KEY="$HANDOFF_DIR/phone_key"           # v1 legacy
 HANDOFF_KEYS_DIR="$HANDOFF_DIR/keys"           # v2 per-device keys
 HANDOFF_DEVICES="$HANDOFF_DIR/devices.json"    # v2 device registry
+HANDOFF_DEVICES_LOCK="$HANDOFF_DIR/devices.lock"  # serializes devices.json read-modify-write
 HANDOFF_ACCESS_LOG="$HANDOFF_DIR/access.log"   # gate access log
 
 # ─── Notification event log ────────────────────────────────────────
@@ -143,6 +144,7 @@ devices_json_init() {
     if [[ ! -f "$HANDOFF_DEVICES" ]]; then
         echo '{"version":1,"devices":[]}' > "$HANDOFF_DEVICES"
     fi
+    [[ -f "$HANDOFF_DEVICES_LOCK" ]] || : > "$HANDOFF_DEVICES_LOCK"
     touch "$HANDOFF_ACCESS_LOG"
     events_log_init
 }
@@ -229,27 +231,38 @@ devices_json_add_device() {
     local ro_py="False"
     [[ "$read_only" == "true" ]] && ro_py="True"
     python3 -c "
-import json, sys
-with open('$HANDOFF_DEVICES', 'r') as f:
-    data = json.load(f)
-device = {
-    'name': '$name',
-    'fingerprint': '$fingerprint',
-    'key_file': '$key_file',
-    'status': 'pending',
-    'sessions': $sessions,
-    'read_only': $ro_py,
-    'nonce': '$nonce',
-    'created_at': '$now',
-    'soft_expiry': '$soft_expiry',
-    'hard_expiry': '$hard_expiry',
-    'renewal_requested': False,
-    'last_seen': None,
-    'last_command': None
-}
-data['devices'].append(device)
-with open('$HANDOFF_DEVICES', 'w') as f:
-    json.dump(data, f, indent=2)
+import json, os, fcntl, tempfile
+devices = '$HANDOFF_DEVICES'
+lock = open('$HANDOFF_DEVICES_LOCK', 'a+')
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+try:
+    with open(devices, 'r') as f:
+        data = json.load(f)
+    data['devices'].append({
+        'name': '$name',
+        'fingerprint': '$fingerprint',
+        'key_file': '$key_file',
+        'status': 'pending',
+        'sessions': $sessions,
+        'read_only': $ro_py,
+        'nonce': '$nonce',
+        'created_at': '$now',
+        'soft_expiry': '$soft_expiry',
+        'hard_expiry': '$hard_expiry',
+        'renewal_requested': False,
+        'last_seen': None,
+        'last_command': None,
+    })
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(devices), prefix='.devices.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, devices)
+    except BaseException:
+        os.unlink(tmp); raise
+finally:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 "
 }
 
@@ -258,19 +271,31 @@ with open('$HANDOFF_DEVICES', 'w') as f:
 devices_json_update_device() {
     local fingerprint="$1" field="$2" value="$3"
     python3 -c "
-import json
-with open('$HANDOFF_DEVICES', 'r') as f:
-    data = json.load(f)
-for d in data['devices']:
-    if d['fingerprint'] == '$fingerprint':
-        val = '$value'
-        if val == 'true': val = True
-        elif val == 'false': val = False
-        elif val == 'null': val = None
-        d['$field'] = val
-        break
-with open('$HANDOFF_DEVICES', 'w') as f:
-    json.dump(data, f, indent=2)
+import json, os, fcntl, tempfile
+devices = '$HANDOFF_DEVICES'
+lock = open('$HANDOFF_DEVICES_LOCK', 'a+')
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+try:
+    with open(devices, 'r') as f:
+        data = json.load(f)
+    for d in data['devices']:
+        if d['fingerprint'] == '$fingerprint':
+            val = '$value'
+            if val == 'true': val = True
+            elif val == 'false': val = False
+            elif val == 'null': val = None
+            d['$field'] = val
+            break
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(devices), prefix='.devices.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, devices)
+    except BaseException:
+        os.unlink(tmp); raise
+finally:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 "
 }
 
@@ -311,12 +336,24 @@ for d in data['devices']:
 devices_json_remove_device() {
     local fingerprint="$1"
     python3 -c "
-import json
-with open('$HANDOFF_DEVICES', 'r') as f:
-    data = json.load(f)
-data['devices'] = [d for d in data['devices'] if d['fingerprint'] != '$fingerprint']
-with open('$HANDOFF_DEVICES', 'w') as f:
-    json.dump(data, f, indent=2)
+import json, os, fcntl, tempfile
+devices = '$HANDOFF_DEVICES'
+lock = open('$HANDOFF_DEVICES_LOCK', 'a+')
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+try:
+    with open(devices, 'r') as f:
+        data = json.load(f)
+    data['devices'] = [d for d in data['devices'] if d['fingerprint'] != '$fingerprint']
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(devices), prefix='.devices.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, devices)
+    except BaseException:
+        os.unlink(tmp); raise
+finally:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 "
 }
 
