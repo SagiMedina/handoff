@@ -10,7 +10,12 @@ struct HostKeyFingerprint: Equatable, Codable {
     let sha256: String
 
     static func compute(from key: NIOSSHPublicKey) -> HostKeyFingerprint {
-        let description = String(describing: key)
+        // NIOSSHPublicKey is NOT CustomStringConvertible, so String(describing:)
+        // would yield Swift's reflection dump — not the OpenSSH wire format — and
+        // the base64 decode below would fail, producing a fingerprint that never
+        // matches `ssh-keygen -lf` on the Mac. String(openSSHPublicKey:) emits
+        // "algorithm base64-wire", the exact bytes OpenSSH SHA256-fingerprints.
+        let description = String(openSSHPublicKey: key)
         let parts = description.split(separator: " ", maxSplits: 2, omittingEmptySubsequences: true)
         let algorithm = parts.first.map(String.init) ?? "ssh-unknown"
         let rawData: Data
