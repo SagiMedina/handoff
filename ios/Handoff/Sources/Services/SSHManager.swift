@@ -486,6 +486,7 @@ final class SSHManager: ObservableObject {
         pendingTrustTimeout = nil
     }
 
+    @MainActor
     private func invalidatePendingTrust(reason: HostKeyValidationError = .cancelled) {
         let pendingID = pendingTrust?.id
         let promise = pendingTrustPromise
@@ -566,7 +567,6 @@ final class SSHManager: ObservableObject {
     // MARK: - Disconnect
 
     func disconnect() {
-        invalidatePendingTrust()
         try? parentChannel?.close().wait()
         parentChannel = nil
         sshHandler = nil
@@ -578,7 +578,16 @@ final class SSHManager: ObservableObject {
         // connection will fail its guard check and be dropped.
         protocolVersion = 1
         connectionID = nil
+        // Trust state (pendingTrust/promise/attemptID/timeout) is MainActor-
+        // isolated, and disconnect() does blocking NIO calls so it can't itself
+        // be @MainActor — hop the teardown onto the main actor, alongside the
+        // permissions reset. This Task is enqueued before connect()'s own
+        // `currentAttemptID` set (connect calls disconnect first), so the
+        // FIFO main-actor executor clears the old attempt before the new one
+        // lands; an in-flight first-trust prompt for the new connection is
+        // therefore not invalidated.
         Task { @MainActor [weak self] in
+            self?.invalidatePendingTrust()
             self?.devicePermissions = nil
         }
     }
