@@ -3,7 +3,7 @@ import SafariServices
 
 /// Handles Tailscale authentication when the embedded tsnet needs a browser sign-in.
 /// Shows a spinner while connecting, a sign-in button when auth is needed,
-/// and error states with retry/reset options.
+/// and an identity-preserving retry for transient errors.
 ///
 /// Auth uses `SFSafariViewController` (in-app system Safari) instead of
 /// `UIApplication.shared.open(url)` because the latter backgrounds the app, and
@@ -19,7 +19,7 @@ struct TailscaleAuthView: View {
             Theme.background.ignoresSafeArea()
 
             switch tailscale.state {
-            case .stopped, .starting:
+            case .stopped, .starting, .stopping:
                 VStack(spacing: 16) {
                     ProgressView()
                         .tint(Theme.primary)
@@ -94,19 +94,10 @@ struct TailscaleAuthView: View {
                         .multilineTextAlignment(.center)
                         .padding(.horizontal, 24)
 
-                    HStack(spacing: 16) {
-                        Button("Retry") {
-                            tailscale.stop()
-                            tailscale.start()
-                        }
-                        .foregroundColor(Theme.primary)
-
-                        Button("Reset") {
-                            tailscale.resetState()
-                            tailscale.start()
-                        }
-                        .foregroundColor(Theme.red)
+                    Button("Retry") {
+                        tailscale.retry()
                     }
+                    .foregroundColor(Theme.primary)
                     .padding(.top, 8)
                 }
             }
@@ -121,6 +112,12 @@ struct TailscaleAuthView: View {
             // Auto-dismiss the Safari sheet once Tailscale has connected.
             if case .connected = newState, safariURL != nil {
                 safariURL = nil
+            }
+            // A stop/sign-out publishes `.stopped` only after the old runtime
+            // has closed (and, for sign-out, identity deletion has finished).
+            // Start from that clean barrier so the sign-in URL is fresh.
+            if newState == .stopped {
+                tailscale.start()
             }
         }
     }

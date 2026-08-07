@@ -4,6 +4,77 @@ import NIOPosix
 import NIOSSH
 import Crypto
 
+/// Tracks whether the current transport has completed SSH authentication.
+/// `Channel.isActive` only describes the TCP socket; it can be true while a
+/// SOCKS/SSH handshake is still pending or after a newer attempt superseded it.
+final class SSHConnectionLifecycle {
+    private let lock = NSLock()
+    private var currentID: UUID?
+    private var authenticatedID: UUID?
+
+    var currentAttemptID: UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentID
+    }
+
+    var authenticatedAttemptID: UUID? {
+        lock.lock()
+        defer { lock.unlock() }
+        return authenticatedID
+    }
+
+    func begin() -> UUID {
+        let id = UUID()
+        lock.lock()
+        currentID = id
+        authenticatedID = nil
+        lock.unlock()
+        return id
+    }
+
+    @discardableResult
+    func markAuthenticated(_ id: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard currentID == id else { return false }
+        authenticatedID = id
+        return true
+    }
+
+    func invalidate() {
+        lock.lock()
+        currentID = nil
+        authenticatedID = nil
+        lock.unlock()
+    }
+
+    func isCurrent(_ id: UUID) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return currentID == id
+    }
+
+    func isUsable(channelIsActive: Bool) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return channelIsActive
+            && currentID != nil
+            && authenticatedID == currentID
+    }
+}
+
+/// Pure command construction for session discovery. Raw tmux uses exit status
+/// 1 when no server is running; that is the valid "no sessions" result Android
+/// already treats as an empty list, so only this v1 command normalizes it.
+enum SSHDiscoveryCommand {
+    static func listSessions(protocolVersion: Int, tmuxPath: String) -> String {
+        protocolVersion >= 2
+            ? "list"
+            : "\(tmuxPath) list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null || true"
+    }
+}
+
 /// Manages SSH connections to the remote Mac for tmux session discovery and terminal attachment.
 ///
 /// Architecture (per codex review):
@@ -17,8 +88,12 @@ final class SSHManager: ObservableObject {
     var parentChannel: Channel?
     var sshHandler: NIOSSHHandler?
 
-    /// The active SSH connection's channel, if connected.
-    var isConnected: Bool { parentChannel?.isActive ?? false }
+    private var connectionLifecycle = SSHConnectionLifecycle()
+
+    /// The active, authenticated SSH connection's channel, if connected.
+    var isConnected: Bool {
+        connectionLifecycle.isUsable(channelIsActive: parentChannel?.isActive ?? false)
+    }
 
     // MARK: - Host-key TOFU state
     //
@@ -45,13 +120,6 @@ final class SSHManager: ObservableObject {
     /// Nil while disconnected or on v1 pairings. Updated on each `list` call.
     @Published var devicePermissions: DevicePermissions?
 
-    /// A fresh UUID per successful `connect()`. Published updates from
-    /// in-flight commands compare their captured ID against this one and drop
-    /// the write if the connection was torn down or rotated in the meantime —
-    /// otherwise a slow `list` response could publish stale permissions over
-    /// a later pairing.
-    private var connectionID: UUID?
-
     // MARK: - Connect
 
     /// SOCKS5 proxy info for routing SSH through (e.g., Tailscale's loopback).
@@ -77,120 +145,161 @@ final class SSHManager: ObservableObject {
         // errors and permission headers.
         self.protocolVersion = config.protocolVersion
 
-        // Stamp this attempt so any in-flight @Published updates that land
-        // after a later disconnect/reconnect are dropped on the floor.
-        self.connectionID = UUID()
+        // Stamp this attempt so stale auth completions and @Published writes
+        // cannot claim a newer connection.
+        let connectionAttemptID = connectionLifecycle.begin()
 
         let group = MultiThreadedEventLoopGroup(numberOfThreads: 1)
         self.group = group
 
-        // Attempt-scoped ID lets us reject any stale trust tap after retry,
-        // disconnect, or route changes have abandoned the original handshake.
-        let attemptID = UUID()
-        await MainActor.run {
-            self.currentAttemptID = attemptID
-        }
+        do {
+            // The trust prompt uses the same attempt ID as the transport so a
+            // tap from an abandoned handshake can never approve its successor.
+            await MainActor.run {
+                self.currentAttemptID = connectionAttemptID
+                // Permissions belong to one authenticated gate connection.
+                // Clear them at the new generation boundary so a v2 → v1
+                // reconnect cannot retain the old device's read-only state.
+                self.devicePermissions = nil
+            }
 
-        let privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
-        let authDelegate = PublicKeyAuthDelegate(
-            username: config.user,
-            privateKey: privateKey
-        )
+            let privateKey = try parseOpenSSHKey(base64Encoded: config.privateKey)
+            let authDelegate = PublicKeyAuthDelegate(
+                username: config.user,
+                privateKey: privateKey
+            )
 
-        // Promise that fires when NIOSSH receives UserAuthSuccessEvent
-        let authSuccessPromise = group.next().makePromise(of: Void.self)
-        let authWaiter = AuthSuccessHandler(promise: authSuccessPromise)
+            // All possible handshake endings resolve through one idempotent
+            // completion. In particular, the SOCKS handler can close before
+            // PostSOCKSUpgrader installs AuthSuccessHandler; listening to the
+            // parent channel's closeFuture below prevents that path from
+            // waiting for the 75-second SSH auth timeout.
+            let authCompletion = SSHAuthenticationCompletion(eventLoop: group.next())
+            let authWaiter = AuthSuccessHandler(completion: authCompletion)
 
-        let hostKeyValidator = TOFUHostKeyValidator(
-            host: config.ip,
-            attemptID: attemptID,
-            store: hostKeyStore,
-            onFirstTrust: { [weak self] request, promise in
-                let eventLoop = promise.futureResult.eventLoop
-                Task { @MainActor [weak self] in
-                    guard let self else {
-                        eventLoop.execute {
-                            promise.fail(HostKeyValidationError.cancelled)
+            let hostKeyValidator = TOFUHostKeyValidator(
+                host: config.ip,
+                attemptID: connectionAttemptID,
+                store: hostKeyStore,
+                onFirstTrust: { [weak self] request, promise in
+                    let eventLoop = promise.futureResult.eventLoop
+                    Task { @MainActor [weak self] in
+                        guard let self else {
+                            eventLoop.execute {
+                                promise.fail(HostKeyValidationError.cancelled)
+                            }
+                            return
                         }
-                        return
+                        self.presentFirstTrust(
+                            request: request,
+                            promise: promise,
+                            eventLoop: eventLoop
+                        )
                     }
-                    self.presentFirstTrust(
-                        request: request,
-                        promise: promise,
-                        eventLoop: eventLoop
-                    )
+                },
+                onMismatch: { error, promise in
+                    promise.fail(error)
                 }
-            },
-            onMismatch: { error, promise in
-                promise.fail(error)
-            }
-        )
+            )
 
-        let nioSSHHandler = NIOSSHHandler(
-            role: .client(
-                .init(
-                    userAuthDelegate: authDelegate,
-                    serverAuthDelegate: hostKeyValidator
+            let nioSSHHandler = NIOSSHHandler(
+                role: .client(
+                    .init(
+                        userAuthDelegate: authDelegate,
+                        serverAuthDelegate: hostKeyValidator
+                    )
+                ),
+                allocator: ByteBufferAllocator(),
+                inboundChildChannelInitializer: nil
+            )
+
+            let bootstrap = ClientBootstrap(group: group)
+                .channelInitializer { channel in
+                    if let proxy {
+                        // SOCKS5 path: handshake first, then PostSOCKSUpgrader installs SSH
+                        let socks = SOCKS5AuthConnectHandler(
+                            username: proxy.username,
+                            password: proxy.password,
+                            targetHost: config.ip,
+                            targetPort: 22
+                        )
+                        let upgrade = PostSOCKSUpgrader(
+                            nioSSHHandler: nioSSHHandler,
+                            authWaiter: authWaiter
+                        )
+                        return channel.pipeline.addHandlers([socks, upgrade])
+                    } else {
+                        // Direct path
+                        return channel.pipeline.addHandlers([nioSSHHandler, authWaiter])
+                    }
+                }
+                .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
+                .connectTimeout(.seconds(15))
+
+            let connectHost = proxy?.host ?? config.ip
+            let connectPort = proxy?.port ?? 22
+            let channel = try await bootstrap.connect(host: connectHost, port: connectPort).get()
+
+            guard connectionLifecycle.isCurrent(connectionAttemptID) else {
+                channel.close(promise: nil)
+                throw CancellationError()
+            }
+            self.parentChannel = channel
+
+            // We already hold a reference to the NIOSSHHandler we constructed.
+            // Don't query the pipeline — in the SOCKS5 path it isn't installed until
+            // PostSOCKSUpgrader runs after the handshake completes. Use our reference
+            // directly; once the handler is added to the pipeline, it's the same object.
+            self.sshHandler = nioSSHHandler
+
+            channel.closeFuture.whenComplete { _ in
+                authCompletion.fail(
+                    SSHError.channelError("Connection closed before authentication")
                 )
-            ),
-            allocator: ByteBufferAllocator(),
-            inboundChildChannelInitializer: nil
-        )
-
-        let bootstrap = ClientBootstrap(group: group)
-            .channelInitializer { channel in
-                if let proxy {
-                    // SOCKS5 path: handshake first, then PostSOCKSUpgrader installs SSH
-                    let socks = SOCKS5AuthConnectHandler(
-                        username: proxy.username,
-                        password: proxy.password,
-                        targetHost: config.ip,
-                        targetPort: 22
-                    )
-                    let upgrade = PostSOCKSUpgrader(
-                        nioSSHHandler: nioSSHHandler,
-                        authWaiter: authWaiter
-                    )
-                    return channel.pipeline.addHandlers([socks, upgrade])
-                } else {
-                    // Direct path
-                    return channel.pipeline.addHandlers([nioSSHHandler, authWaiter])
-                }
             }
-            .channelOption(ChannelOptions.socketOption(.so_reuseaddr), value: 1)
-            .connectTimeout(.seconds(15))
 
-        let connectHost = proxy?.host ?? config.ip
-        let connectPort = proxy?.port ?? 22
-        let channel = try await bootstrap.connect(host: connectHost, port: connectPort).get()
-        self.parentChannel = channel
+            // Cap the SSH handshake + auth wait. After iOS backgrounds the app,
+            // tsnet's SOCKS5 listener stays bound but WireGuard routing goes
+            // silent: TCP connect completes, SOCKS handshake may succeed, yet no
+            // SSH packets cross the tunnel. Without this timeout the caller
+            // would block indefinitely — we want it to surface as an error that
+            // triggers a reconnect. The scheduled task runs on the SSH event
+            // loop, same rationale as executeCommand's timeout.
+            // Keep this longer than the 60-second first-trust prompt. The socket
+            // itself still has the independent 15-second ClientBootstrap timeout
+            // above, so an unreachable host fails quickly while a person reading
+            // and approving the fingerprint gets the full trust window.
+            let authTimeout = channel.eventLoop.scheduleTask(in: .seconds(75)) {
+                authCompletion.fail(SSHError.commandFailed("SSH authentication timed out"))
+                channel.close(promise: nil)
+            }
+            authCompletion.futureResult.whenComplete { _ in
+                authTimeout.cancel()
+            }
 
-        // We already hold a reference to the NIOSSHHandler we constructed.
-        // Don't query the pipeline — in the SOCKS5 path it isn't installed until
-        // PostSOCKSUpgrader runs after the handshake completes. Use our reference
-        // directly; once the handler is added to the pipeline, it's the same object.
-        self.sshHandler = nioSSHHandler
+            // EventLoopFuture.get() does not observe Swift Task cancellation.
+            // Closing the attempt's channel makes cancellation promptly resolve
+            // the auth future instead of allowing it to outlive a Retry.
+            try await withTaskCancellationHandler {
+                try await authCompletion.futureResult.get()
+            } onCancel: {
+                channel.close(promise: nil)
+            }
+            try Task.checkCancellation()
 
-        // Cap the SSH handshake + auth wait. After iOS backgrounds the app,
-        // tsnet's SOCKS5 listener stays bound but WireGuard routing goes
-        // silent: TCP connect completes, SOCKS handshake may succeed, yet no
-        // SSH packets cross the tunnel. Without this timeout the caller
-        // would block indefinitely — we want it to surface as an error that
-        // triggers a reconnect. The scheduled task runs on the SSH event
-        // loop, same rationale as executeCommand's timeout.
-        // Keep this longer than the 60-second first-trust prompt. The socket
-        // itself still has the independent 15-second ClientBootstrap timeout
-        // above, so an unreachable host fails quickly while a person reading
-        // and approving the fingerprint gets the full trust window.
-        let authTimeout = channel.eventLoop.scheduleTask(in: .seconds(75)) {
-            authSuccessPromise.fail(SSHError.commandFailed("SSH authentication timed out"))
+            guard connectionLifecycle.markAuthenticated(connectionAttemptID),
+                  channel.isActive else {
+                throw CancellationError()
+            }
+        } catch {
+            // Only the failing attempt may tear down shared manager state. An
+            // older cancelled Task can resume after a newer Retry has already
+            // called connect(); it must not disconnect that newer connection.
+            if connectionLifecycle.isCurrent(connectionAttemptID) {
+                disconnect()
+            }
+            throw error
         }
-        authSuccessPromise.futureResult.whenComplete { _ in
-            authTimeout.cancel()
-        }
-
-        // Wait for SSH auth complete (or the scheduled timeout).
-        try await authSuccessPromise.futureResult.get()
     }
 
     // MARK: - Discovery (one-shot exec)
@@ -199,9 +308,10 @@ final class SSHManager: ObservableObject {
     /// gate's `list` command (which also emits a `#permissions:` header we
     /// stash on `devicePermissions`). On v1 we still shell raw tmux.
     func listSessions(tmuxPath: String) async throws -> [TmuxSession] {
-        let command = protocolVersion >= 2
-            ? "list"
-            : "\(tmuxPath) list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null"
+        let command = SSHDiscoveryCommand.listSessions(
+            protocolVersion: protocolVersion,
+            tmuxPath: tmuxPath
+        )
         let output = try await executeCommand(command)
 
         var lines = output
@@ -215,9 +325,10 @@ final class SSHManager: ObservableObject {
         // MainActor hop is fine — the calling Task is already async.
         if protocolVersion >= 2, let first = lines.first, first.hasPrefix("#permissions:") {
             let parsed = DevicePermissions.parse(header: first)
-            let capturedID = self.connectionID
+            let capturedID = connectionLifecycle.currentAttemptID
             await MainActor.run { [weak self] in
-                guard let self, self.connectionID == capturedID else { return }
+                guard let self,
+                      self.connectionLifecycle.currentAttemptID == capturedID else { return }
                 self.devicePermissions = parsed
             }
             lines.removeFirst()
@@ -492,16 +603,30 @@ final class SSHManager: ObservableObject {
     }
 
     @MainActor
-    private func invalidatePendingTrust(reason: HostKeyValidationError = .cancelled) {
-        let pendingID = pendingTrust?.id
-        let promise = pendingTrustPromise
-        let eventLoop = pendingTrustEventLoop
+    private func invalidatePendingTrust(
+        ifMatching attemptID: UUID?,
+        reason: HostKeyValidationError = .cancelled
+    ) {
+        // disconnect() schedules this MainActor cleanup. A new connect can set
+        // its trust attempt before that task runs, so only the retiring
+        // generation is allowed to clear prompt state.
+        let ownsCurrentAttempt = currentAttemptID == attemptID
+        let ownsPendingPrompt = pendingTrust?.id == attemptID
+        guard ownsCurrentAttempt || ownsPendingPrompt else { return }
 
-        currentAttemptID = nil
-        pendingTrustPromise = nil
-        pendingTrustEventLoop = nil
-        pendingTrustTimeout?.cancel()
-        pendingTrustTimeout = nil
+        let pendingID = ownsPendingPrompt ? pendingTrust?.id : nil
+        let promise = ownsPendingPrompt ? pendingTrustPromise : nil
+        let eventLoop = ownsPendingPrompt ? pendingTrustEventLoop : nil
+
+        if ownsCurrentAttempt {
+            currentAttemptID = nil
+        }
+        if ownsPendingPrompt {
+            pendingTrustPromise = nil
+            pendingTrustEventLoop = nil
+            pendingTrustTimeout?.cancel()
+            pendingTrustTimeout = nil
+        }
 
         if let promise, let eventLoop {
             eventLoop.execute {
@@ -525,10 +650,12 @@ final class SSHManager: ObservableObject {
     /// on the parent channel's event loop. We use flatSubmit to hop onto the right loop.
     /// NIOSSH internally buffers pending channel creations until SSH auth completes.
     private func executeCommand(_ command: String) async throws -> String {
-        guard let parentChannel = self.parentChannel,
+        guard isConnected,
+              let parentChannel = self.parentChannel,
               let sshHandler = self.sshHandler else {
             throw SSHError.notConnected
         }
+        let usesGateProtocol = protocolVersion >= 2
 
         // iOS tears down the Tailscale SOCKS5 proxy while the app is
         // backgrounded. When the user returns, `parentChannel.isActive` can
@@ -538,62 +665,117 @@ final class SSHManager: ObservableObject {
         // event loop itself (so it fails the promise rather than trying to
         // cancel an `EventLoopFuture.get()` that, by NIO's docs, doesn't
         // honor Task cancellation).
-        return try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<String> in
-            let resultPromise = parentChannel.eventLoop.makePromise(of: String.self)
-            let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
+        return try await withTaskCancellationHandler {
+            try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<String> in
+                let completion = SSHCommandCompletion(eventLoop: parentChannel.eventLoop)
+                let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
+                var childChannel: Channel?
 
-            // Fail the promise if the command hasn't completed in 10s. The
-            // scheduled task runs on the same event loop, so it can touch
-            // `resultPromise` safely.
-            let timeoutTask = parentChannel.eventLoop.scheduleTask(in: .seconds(10)) {
-                resultPromise.fail(SSHError.commandFailed("The request timed out"))
-            }
-            resultPromise.futureResult.whenComplete { _ in
-                timeoutTask.cancel()
-            }
-
-            sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
-                guard channelType == .session else {
-                    return childChannel.eventLoop.makeFailedFuture(SSHError.channelError("Unexpected channel type"))
+                // Fail the promise if the command hasn't completed in 10s.
+                // Close any child and its parent so no timed-out channel can
+                // linger and poison the next load.
+                let timeoutTask = parentChannel.eventLoop.scheduleTask(in: .seconds(10)) {
+                    completion.fail(SSHError.commandFailed("The request timed out"))
+                    childChannel?.close(promise: nil)
+                    parentChannel.close(promise: nil)
                 }
-                return childChannel.pipeline.addHandler(
-                    ExecChannelHandler(command: command, promise: resultPromise)
-                )
-            }
+                completion.futureResult.whenComplete { _ in
+                    timeoutTask.cancel()
+                }
 
-            channelPromise.futureResult.whenFailure { error in
-                resultPromise.fail(error)
-            }
+                sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
+                    guard channelType == .session else {
+                        return childChannel.eventLoop.makeFailedFuture(
+                            SSHError.channelError("Unexpected channel type")
+                        )
+                    }
+                    return childChannel.pipeline.addHandler(
+                        ExecChannelHandler(
+                            command: command,
+                            usesGateProtocol: usesGateProtocol,
+                            completion: completion
+                        )
+                    )
+                }
 
-            return resultPromise.futureResult
-        }.get()
+                channelPromise.futureResult.whenSuccess { channel in
+                    if completion.isCompleted {
+                        channel.close(promise: nil)
+                    } else {
+                        childChannel = channel
+                    }
+                }
+                channelPromise.futureResult.whenFailure { error in
+                    completion.fail(error)
+                }
+
+                return completion.futureResult
+            }.get()
+        } onCancel: {
+            // NIO futures do not inherit Swift Task cancellation. Closing this
+            // connection promptly resolves any pending createChannel/exec
+            // future; the next explicit load establishes a fresh connection.
+            parentChannel.close(promise: nil)
+        }
     }
 
     // MARK: - Disconnect
 
     func disconnect() {
-        try? parentChannel?.close().wait()
+        // Detach shared state synchronously so a subsequent connect cannot
+        // observe or overwrite the retiring generation. Channel close and
+        // event-loop shutdown are asynchronous; blocking with wait() /
+        // syncShutdownGracefully() here stalls the MainActor on every Back or
+        // Retry tap.
+        let retiringChannel = parentChannel
+        let retiringGroup = group
+        let retiringTrustAttemptID = currentAttemptID
         parentChannel = nil
         sshHandler = nil
-        try? group?.syncShutdownGracefully()
         group = nil
         // Reset gate state so a subsequent v1 pairing doesn't inherit stale v2
         // permissions from the prior session. Invalidating the connection ID
         // up-front means any still-in-flight @Published update from the last
         // connection will fail its guard check and be dropped.
         protocolVersion = 1
-        connectionID = nil
+        connectionLifecycle.invalidate()
         // Trust state (pendingTrust/promise/attemptID/timeout) is MainActor-
-        // isolated, and disconnect() does blocking NIO calls so it can't itself
-        // be @MainActor — hop the teardown onto the main actor, alongside the
+        // isolated, so hop the teardown onto the main actor alongside the
         // permissions reset. This Task is enqueued before connect()'s own
         // `currentAttemptID` set (connect calls disconnect first), so the
         // FIFO main-actor executor clears the old attempt before the new one
         // lands; an in-flight first-trust prompt for the new connection is
         // therefore not invalidated.
         Task { @MainActor [weak self] in
-            self?.invalidatePendingTrust()
-            self?.devicePermissions = nil
+            guard let self else { return }
+            self.invalidatePendingTrust(ifMatching: retiringTrustAttemptID)
+            if self.connectionLifecycle.currentAttemptID == nil {
+                self.devicePermissions = nil
+            }
+        }
+
+        guard let retiringGroup else { return }
+        let shutdownQueue = DispatchQueue.global(qos: .utility)
+        if let retiringChannel {
+            retiringChannel.close().whenComplete { _ in
+                retiringGroup.shutdownGracefully(queue: shutdownQueue) { error in
+                    #if DEBUG
+                    if let error {
+                        print("[SSHManager] Event-loop shutdown failed: \(error)")
+                    }
+                    #endif
+                }
+            }
+        } else {
+            // This also cancels an in-progress ClientBootstrap attempt that
+            // has not produced a parent channel yet.
+            retiringGroup.shutdownGracefully(queue: shutdownQueue) { error in
+                #if DEBUG
+                if let error {
+                    print("[SSHManager] Event-loop shutdown failed: \(error)")
+                }
+                #endif
+            }
         }
     }
 
@@ -877,6 +1059,33 @@ private final class AcceptAllHostKeysDelegate: NIOSSHClientServerAuthenticationD
 
 // MARK: - Auth success handler
 
+/// Idempotent resolution for one SSH authentication attempt. SOCKS failure,
+/// channel close, auth success, and timeout can converge on the same event-loop
+/// turn; funnelling them through this object avoids double-completing a promise.
+private final class SSHAuthenticationCompletion {
+    let futureResult: EventLoopFuture<Void>
+
+    private var promise: EventLoopPromise<Void>?
+
+    init(eventLoop: EventLoop) {
+        let promise = eventLoop.makePromise(of: Void.self)
+        self.promise = promise
+        self.futureResult = promise.futureResult
+    }
+
+    func succeed() {
+        guard let promise else { return }
+        self.promise = nil
+        promise.succeed(())
+    }
+
+    func fail(_ error: Error) {
+        guard let promise else { return }
+        self.promise = nil
+        promise.fail(error)
+    }
+}
+
 /// Catches UserAuthSuccessEvent from NIOSSH and fulfills a promise.
 /// Added to the parent channel pipeline so connect() can wait for auth before returning.
 ///
@@ -886,17 +1095,16 @@ private final class AcceptAllHostKeysDelegate: NIOSSHClientServerAuthenticationD
 private final class AuthSuccessHandler: ChannelInboundHandler {
     typealias InboundIn = Any
 
-    private var promise: EventLoopPromise<Void>?
+    private let completion: SSHAuthenticationCompletion
     private var lastError: Error?
 
-    init(promise: EventLoopPromise<Void>) {
-        self.promise = promise
+    init(completion: SSHAuthenticationCompletion) {
+        self.completion = completion
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        if event is UserAuthSuccessEvent, let p = promise {
-            promise = nil
-            p.succeed(())
+        if event is UserAuthSuccessEvent {
+            completion.succeed()
         }
         context.fireUserInboundEventTriggered(event)
     }
@@ -928,29 +1136,127 @@ private final class AuthSuccessHandler: ChannelInboundHandler {
     }
 
     private func failPendingPromise(with error: Error) {
+        completion.fail(error)
+    }
+}
+
+// MARK: - Exec channel handler
+
+/// Idempotent resolution for a one-shot SSH command. The exec timeout and the
+/// channel failure/close callbacks can arrive together when a cancelled load
+/// tears down its parent channel.
+private final class SSHCommandCompletion {
+    let futureResult: EventLoopFuture<String>
+
+    private var promise: EventLoopPromise<String>?
+
+    var isCompleted: Bool { promise == nil }
+
+    init(eventLoop: EventLoop) {
+        let promise = eventLoop.makePromise(of: String.self)
+        self.promise = promise
+        self.futureResult = promise.futureResult
+    }
+
+    func succeed(_ output: String) {
+        guard let promise else { return }
+        self.promise = nil
+        promise.succeed(output)
+    }
+
+    func fail(_ error: Error) {
         guard let promise else { return }
         self.promise = nil
         promise.fail(error)
     }
 }
 
-// MARK: - Exec channel handler
+/// The terminal evidence required before treating an SSH exec as complete.
+///
+/// A child channel becoming inactive is not proof that its command finished:
+/// the parent TCP/SSH transport also closes every child channel when it dies.
+/// OpenSSH sends an `exit-status` request for a normally terminated command,
+/// so accepting output without that request turns a dropped connection into a
+/// valid (often empty or truncated) session list.
+struct SSHExecTerminationPolicy {
+    private(set) var exitStatus: Int?
+    private(set) var exitSignal: SSHExecExitSignal?
+
+    mutating func recordExitStatus(_ status: Int) {
+        exitStatus = status
+    }
+
+    mutating func recordExitSignal(name: String, message: String) {
+        exitSignal = SSHExecExitSignal(name: name, message: message)
+    }
+
+    func resolve(
+        stdout: String,
+        stderr: String,
+        usesGateProtocol: Bool
+    ) -> Result<String, Error> {
+        if let exitSignal {
+            let detail = exitSignal.message.trimmingCharacters(in: .whitespacesAndNewlines)
+            let suffix = detail.isEmpty ? "" : ": \(detail)"
+            return .failure(
+                SSHError.commandFailed("Remote command terminated by signal \(exitSignal.name)\(suffix)")
+            )
+        }
+
+        guard let exitStatus else {
+            return .failure(
+                SSHError.commandFailed("SSH connection closed before the remote command reported its exit status")
+            )
+        }
+
+        guard exitStatus == 0 else {
+            // Gate refusals deliberately use a non-zero process status and a
+            // typed `error:*` stdout line. Preserve that domain error instead
+            // of replacing it with a generic process-status message.
+            if usesGateProtocol, let gateError = GateError.from(line: stdout) {
+                return .failure(gateError)
+            }
+
+            let diagnostic = stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            let stdoutDiagnostic = stdout.trimmingCharacters(in: .whitespacesAndNewlines)
+            let detail = diagnostic.isEmpty ? stdoutDiagnostic : diagnostic
+            let suffix = detail.isEmpty ? "" : ": \(detail)"
+            return .failure(
+                SSHError.commandFailed("Remote command exited with status \(exitStatus)\(suffix)")
+            )
+        }
+
+        return .success(stdout)
+    }
+}
+
+struct SSHExecExitSignal {
+    let name: String
+    let message: String
+}
 
 /// Handles a one-shot SSH exec channel: sends exec request on channelActive,
-/// collects stdout, and resolves the promise on channel close.
+/// collects stdout, and resolves only after a confirmed remote exit status.
 private final class ExecChannelHandler: ChannelDuplexHandler {
     typealias InboundIn = SSHChannelData
     typealias OutboundIn = SSHChannelData
     typealias OutboundOut = SSHChannelData
 
     private let command: String
-    private let promise: EventLoopPromise<String>
+    private let usesGateProtocol: Bool
+    private let completion: SSHCommandCompletion
     private var buffer = Data()
-    private var promiseCompleted = false
+    private var stderrBuffer = Data()
+    private var termination = SSHExecTerminationPolicy()
 
-    init(command: String, promise: EventLoopPromise<String>) {
+    init(
+        command: String,
+        usesGateProtocol: Bool,
+        completion: SSHCommandCompletion
+    ) {
         self.command = command
-        self.promise = promise
+        self.usesGateProtocol = usesGateProtocol
+        self.completion = completion
     }
 
     func channelActive(context: ChannelHandlerContext) {
@@ -962,10 +1268,22 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     }
 
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        if event is ChannelFailureEvent, !promiseCompleted {
-            promiseCompleted = true
-            promise.fail(SSHError.commandFailed("Server rejected exec request for: \(command)"))
+        switch event {
+        case is ChannelFailureEvent:
+            completion.fail(SSHError.commandFailed("Server rejected exec request for: \(command)"))
             context.close(promise: nil)
+
+        case let exitStatus as SSHChannelRequestEvent.ExitStatus:
+            termination.recordExitStatus(exitStatus.exitStatus)
+
+        case let exitSignal as SSHChannelRequestEvent.ExitSignal:
+            termination.recordExitSignal(
+                name: exitSignal.signalName,
+                message: exitSignal.errorMessage
+            )
+
+        default:
+            break
         }
         context.fireUserInboundEventTriggered(event)
     }
@@ -973,28 +1291,37 @@ private final class ExecChannelHandler: ChannelDuplexHandler {
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
         let channelData = unwrapInboundIn(data)
 
-        // Only collect stdout (type .channel), ignore stderr (type .stdErr)
-        guard case .byteBuffer(var buf) = channelData.data,
-              channelData.type == .channel else { return }
+        guard case .byteBuffer(var buf) = channelData.data else { return }
 
         if let bytes = buf.readBytes(length: buf.readableBytes) {
-            buffer.append(contentsOf: bytes)
+            switch channelData.type {
+            case .channel:
+                buffer.append(contentsOf: bytes)
+            case .stdErr:
+                stderrBuffer.append(contentsOf: bytes)
+            default:
+                break
+            }
         }
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        if !promiseCompleted {
-            promiseCompleted = true
-            let output = String(data: buffer, encoding: .utf8) ?? ""
-            promise.succeed(output)
+        let output = String(data: buffer, encoding: .utf8) ?? ""
+        let standardError = String(data: stderrBuffer, encoding: .utf8) ?? ""
+        switch termination.resolve(
+            stdout: output,
+            stderr: standardError,
+            usesGateProtocol: usesGateProtocol
+        ) {
+        case .success(let output):
+            completion.succeed(output)
+        case .failure(let error):
+            completion.fail(error)
         }
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        if !promiseCompleted {
-            promiseCompleted = true
-            promise.fail(error)
-        }
+        completion.fail(error)
         context.close(promise: nil)
     }
 }

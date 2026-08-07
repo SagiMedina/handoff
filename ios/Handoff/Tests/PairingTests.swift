@@ -1,6 +1,35 @@
 import XCTest
 @testable import Handoff
 
+final class TailscaleLifecyclePolicyTests: XCTestCase {
+    func testOnlyExplicitSignOutDeletesPersistedIdentity() {
+        XCTAssertFalse(TailscaleLifecycleOperation.start.deletesPersistedIdentity)
+        XCTAssertFalse(
+            TailscaleLifecycleOperation.retryPreservingIdentity.deletesPersistedIdentity
+        )
+        XCTAssertFalse(TailscaleLifecycleOperation.stop.deletesPersistedIdentity)
+        XCTAssertTrue(
+            TailscaleLifecycleOperation.signOutAndForgetIdentity.deletesPersistedIdentity
+        )
+    }
+
+    func testRetryStartsOnlyAfterCleanupWithoutBecomingDestructive() {
+        let retry = TailscaleLifecycleOperation.retryPreservingIdentity
+
+        XCTAssertTrue(retry.startsNodeAfterCleanup)
+        XCTAssertFalse(retry.deletesPersistedIdentity)
+    }
+
+    func testSupersededLifecycleGenerationCannotPublish() {
+        var epoch = TailscaleLifecycleEpoch()
+        let staleStart = epoch.begin()
+        let currentRetry = epoch.begin()
+
+        XCTAssertFalse(epoch.owns(staleStart))
+        XCTAssertTrue(epoch.owns(currentRetry))
+    }
+}
+
 final class QRCodePayloadTests: XCTestCase {
     func testParsesV1PayloadWithoutChangingFullKey() throws {
         let pem = """
@@ -175,5 +204,230 @@ final class SSHAuthenticationAttemptTests: XCTestCase {
             SSHError.authenticationRejected.errorDescription,
             "This pairing key is no longer accepted by the Mac. Unpair and scan a new QR code from handoff pair."
         )
+    }
+}
+
+final class SSHConnectionLifecycleTests: XCTestCase {
+    func testActiveTCPChannelIsNotUsableUntilCurrentAttemptAuthenticates() {
+        let lifecycle = SSHConnectionLifecycle()
+        let attempt = lifecycle.begin()
+
+        XCTAssertFalse(lifecycle.isUsable(channelIsActive: true))
+        XCTAssertTrue(lifecycle.markAuthenticated(attempt))
+        XCTAssertTrue(lifecycle.isUsable(channelIsActive: true))
+        XCTAssertFalse(lifecycle.isUsable(channelIsActive: false))
+    }
+
+    func testStaleAuthenticationCannotClaimNewerConnection() {
+        let lifecycle = SSHConnectionLifecycle()
+        let oldAttempt = lifecycle.begin()
+        let newAttempt = lifecycle.begin()
+
+        XCTAssertFalse(lifecycle.markAuthenticated(oldAttempt))
+        XCTAssertFalse(lifecycle.isUsable(channelIsActive: true))
+        XCTAssertTrue(lifecycle.markAuthenticated(newAttempt))
+        XCTAssertTrue(lifecycle.isUsable(channelIsActive: true))
+    }
+
+    func testDisconnectInvalidatesAuthenticatedConnection() {
+        let lifecycle = SSHConnectionLifecycle()
+        let attempt = lifecycle.begin()
+        XCTAssertTrue(lifecycle.markAuthenticated(attempt))
+
+        lifecycle.invalidate()
+
+        XCTAssertFalse(lifecycle.isCurrent(attempt))
+        XCTAssertFalse(lifecycle.isUsable(channelIsActive: true))
+    }
+}
+
+final class SSHExecTerminationPolicyTests: XCTestCase {
+    func testCleanZeroExitReturnsCompleteOutput() throws {
+        var policy = SSHExecTerminationPolicy()
+        policy.recordExitStatus(0)
+
+        let output = try policy.resolve(
+            stdout: "main:1\n",
+            stderr: "",
+            usesGateProtocol: false
+        ).get()
+
+        XCTAssertEqual(output, "main:1\n")
+    }
+
+    func testTransportCloseWithoutExitStatusIsFailure() {
+        let policy = SSHExecTerminationPolicy()
+
+        assertCommandFailure(
+            policy.resolve(
+                stdout: "main:",
+                stderr: "",
+                usesGateProtocol: false
+            ),
+            contains: "closed before"
+        )
+    }
+
+    func testNormalizedEmptySessionListIsSuccessfulAfterCleanExit() throws {
+        var policy = SSHExecTerminationPolicy()
+        policy.recordExitStatus(0)
+
+        let output = try policy.resolve(
+            stdout: "",
+            stderr: "",
+            usesGateProtocol: false
+        ).get()
+
+        XCTAssertEqual(output, "")
+    }
+
+    func testNonZeroRawCommandExitIsFailure() {
+        var policy = SSHExecTerminationPolicy()
+        policy.recordExitStatus(1)
+
+        assertCommandFailure(
+            policy.resolve(
+                stdout: "",
+                stderr: "tmux failed",
+                usesGateProtocol: false
+            ),
+            contains: "status 1: tmux failed"
+        )
+    }
+
+    func testGateNonZeroExitPreservesTypedGateError() {
+        var policy = SSHExecTerminationPolicy()
+        policy.recordExitStatus(1)
+
+        switch policy.resolve(
+            stdout: "error:soft_expired\n",
+            stderr: "",
+            usesGateProtocol: true
+        ) {
+        case .success:
+            XCTFail("Expected gate failure")
+        case .failure(let error):
+            XCTAssertEqual(error as? GateError, GateError(rawCode: "error:soft_expired"))
+        }
+    }
+
+    func testExitSignalIsFailureEvenIfAZeroStatusWasObserved() {
+        var policy = SSHExecTerminationPolicy()
+        policy.recordExitStatus(0)
+        policy.recordExitSignal(name: "TERM", message: "stopped")
+
+        assertCommandFailure(
+            policy.resolve(
+                stdout: "main:1\n",
+                stderr: "",
+                usesGateProtocol: false
+            ),
+            contains: "signal TERM: stopped"
+        )
+    }
+
+    private func assertCommandFailure(
+        _ result: Result<String, Error>,
+        contains expected: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        switch result {
+        case .success:
+            XCTFail("Expected command failure", file: file, line: line)
+        case .failure(let error):
+            guard case SSHError.commandFailed(let reason) = error else {
+                return XCTFail("Unexpected error: \(error)", file: file, line: line)
+            }
+            XCTAssertTrue(reason.contains(expected), "\(reason) does not contain \(expected)", file: file, line: line)
+        }
+    }
+}
+
+final class SSHDiscoveryCommandTests: XCTestCase {
+    func testV1ListNormalizesOnlyTmuxNoServerExit() {
+        XCTAssertEqual(
+            SSHDiscoveryCommand.listSessions(
+                protocolVersion: 1,
+                tmuxPath: "/opt/homebrew/bin/tmux"
+            ),
+            "/opt/homebrew/bin/tmux list-sessions -F '#{session_name}:#{session_windows}' 2>/dev/null || true"
+        )
+    }
+
+    func testV2ListRemainsGateCommand() {
+        XCTAssertEqual(
+            SSHDiscoveryCommand.listSessions(
+                protocolVersion: 2,
+                tmuxPath: "/ignored/tmux"
+            ),
+            "list"
+        )
+    }
+}
+
+final class SessionsRequestEpochTests: XCTestCase {
+    func testFullLoadSupersedesSilentRefresh() {
+        var epoch = SessionsRequestEpoch()
+        let refresh = epoch.beginRefresh()
+        let load = epoch.beginLoad()
+
+        XCTAssertFalse(epoch.ownsRefresh(refresh))
+        XCTAssertTrue(epoch.ownsLoad(load))
+    }
+
+    func testCancelledLoadCannotPublishIntoRetry() {
+        var epoch = SessionsRequestEpoch()
+        let cancelledLoad = epoch.beginLoad()
+        epoch.invalidateAll()
+        let retry = epoch.beginLoad()
+
+        XCTAssertFalse(epoch.ownsLoad(cancelledLoad))
+        XCTAssertTrue(epoch.ownsLoad(retry))
+    }
+
+    func testOldRefreshCleanupCannotClearNewRefresh() {
+        var epoch = SessionsRequestEpoch()
+        let oldRefresh = epoch.beginRefresh()
+        let newRefresh = epoch.beginRefresh()
+
+        XCTAssertFalse(epoch.ownsRefresh(oldRefresh))
+        XCTAssertTrue(epoch.ownsRefresh(newRefresh))
+    }
+}
+
+final class SessionsLoadRetryPolicyTests: XCTestCase {
+    func testTransportFailureRetriesSSHExactlyOnceWithoutRestartingTailscale() {
+        let firstRecovery = SessionsLoadRetryPolicy.recovery(
+            for: .transport,
+            attempt: .initial
+        )
+        guard case .retrySSH(let backoffNanoseconds) = firstRecovery else {
+            return XCTFail("Initial transport failure should retry discovery SSH")
+        }
+        XCTAssertGreaterThanOrEqual(backoffNanoseconds, 500_000_000)
+        XCTAssertLessThanOrEqual(backoffNanoseconds, 800_000_000)
+        XCTAssertFalse(firstRecovery.restartsTailscaleTransport)
+
+        let retryRecovery = SessionsLoadRetryPolicy.recovery(
+            for: .transport,
+            attempt: .automaticRetry
+        )
+        XCTAssertEqual(retryRecovery, .surfaceError)
+        XCTAssertFalse(retryRecovery.restartsTailscaleTransport)
+    }
+
+    func testStructuredFailuresNeverEnterTransportRecovery() {
+        for failure in [
+            SessionsLoadRetryPolicy.Failure.gate,
+            .hostKeyMismatch
+        ] {
+            let recovery = SessionsLoadRetryPolicy.recovery(
+                for: failure,
+                attempt: .initial
+            )
+            XCTAssertEqual(recovery, .surfaceError)
+            XCTAssertFalse(recovery.restartsTailscaleTransport)
+        }
     }
 }

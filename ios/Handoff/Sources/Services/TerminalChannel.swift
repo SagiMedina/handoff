@@ -2,6 +2,34 @@ import Foundation
 import NIOCore
 import NIOSSH
 
+/// Idempotent completion for terminal channel creation. Timeout, cancellation,
+/// channel failure, and exec acceptance can converge during reconnect.
+private final class TerminalReadyCompletion {
+    let futureResult: EventLoopFuture<Void>
+
+    private var promise: EventLoopPromise<Void>?
+
+    init(eventLoop: EventLoop) {
+        let promise = eventLoop.makePromise(of: Void.self)
+        self.promise = promise
+        self.futureResult = promise.futureResult
+    }
+
+    var isCompleted: Bool { promise == nil }
+
+    func succeed() {
+        guard let promise else { return }
+        self.promise = nil
+        promise.succeed(())
+    }
+
+    func fail(_ error: Error) {
+        guard let promise else { return }
+        self.promise = nil
+        promise.fail(error)
+    }
+}
+
 /// A long-lived PTY-backed SSH channel for interactive tmux attachment.
 /// Bridges SSH I/O with the terminal emulator.
 ///
@@ -18,28 +46,50 @@ final class TerminalChannelHandler: ChannelDuplexHandler {
     private let command: String
     private let initialCols: Int
     private let initialRows: Int
-    private let readyPromise: EventLoopPromise<Void>
-    private var readyPromiseCompleted = false
+    private let readyCompletion: TerminalReadyCompletion
+
+    private let closeLock = NSLock()
+    private var closeCallback: (() -> Void)?
+    private var hasClosed = false
+    private var didDeliverClose = false
 
     /// Called on the NIO event loop with data received from the remote tmux session.
-    var onDataReceived: ((Data) -> Void)?
+    private var dataCallback: ((Data) -> Void)?
+    private var bufferedData: [Data] = []
 
     /// Called when the remote channel closes (session ended, connection lost).
-    var onClosed: (() -> Void)?
+    var onClosed: (() -> Void)? {
+        get {
+            closeLock.lock()
+            defer { closeLock.unlock() }
+            return closeCallback
+        }
+        set {
+            var callbackToDeliver: (() -> Void)?
+            closeLock.lock()
+            closeCallback = newValue
+            if hasClosed, !didDeliverClose, let newValue {
+                didDeliverClose = true
+                callbackToDeliver = newValue
+            }
+            closeLock.unlock()
+            callbackToDeliver?()
+        }
+    }
 
     /// Reference to the child channel for sending data and resize requests.
     private(set) var channel: Channel?
 
-    init(
+    fileprivate init(
         command: String,
         cols: Int,
         rows: Int,
-        readyPromise: EventLoopPromise<Void>
+        readyCompletion: TerminalReadyCompletion
     ) {
         self.command = command
         self.initialCols = cols
         self.initialRows = rows
-        self.readyPromise = readyPromise
+        self.readyCompletion = readyCompletion
     }
 
     // MARK: - Channel lifecycle
@@ -93,41 +143,77 @@ final class TerminalChannelHandler: ChannelDuplexHandler {
 
         if let bytes = buf.readBytes(length: buf.readableBytes) {
             // If we receive data before ChannelSuccessEvent, the exec was implicitly accepted
-            if !readyPromiseCompleted {
-                readyPromiseCompleted = true
-                readyPromise.succeed(())
+            readyCompletion.succeed()
+            let data = Data(bytes)
+            if let dataCallback {
+                dataCallback(data)
+            } else {
+                // PTY output can arrive immediately after the exec success,
+                // before TerminalView resumes from openTerminal() and installs
+                // its emulator callback. Preserve every byte in wire order.
+                bufferedData.append(data)
             }
-            onDataReceived?(Data(bytes))
         }
     }
 
     func channelInactive(context: ChannelHandlerContext) {
-        if !readyPromiseCompleted {
-            readyPromiseCompleted = true
-            readyPromise.fail(SSHError.channelError("Channel closed before terminal was ready"))
-        }
-        onClosed?()
+        readyCompletion.fail(SSHError.channelError("Channel closed before terminal was ready"))
+        notifyClosed()
+        context.fireChannelInactive()
     }
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
-        if !readyPromiseCompleted {
-            readyPromiseCompleted = true
-            readyPromise.fail(error)
-        }
-        onClosed?()
+        readyCompletion.fail(error)
+        notifyClosed()
         context.close(promise: nil)
     }
 
+    func handlerRemoved(context: ChannelHandlerContext) {
+        readyCompletion.fail(SSHError.channelError("Terminal channel was removed"))
+        notifyClosed()
+    }
+
     func userInboundEventTriggered(context: ChannelHandlerContext, event: Any) {
-        if event is ChannelSuccessEvent, !readyPromiseCompleted {
+        if event is ChannelSuccessEvent {
             // Exec request was accepted — terminal is ready
-            readyPromiseCompleted = true
-            readyPromise.succeed(())
-        } else if event is ChannelFailureEvent, !readyPromiseCompleted {
-            readyPromiseCompleted = true
-            readyPromise.fail(SSHError.commandFailed("Server rejected terminal request"))
+            readyCompletion.succeed()
+        } else if event is ChannelFailureEvent {
+            readyCompletion.fail(SSHError.commandFailed("Server rejected terminal request"))
+            context.close(promise: nil)
         }
         context.fireUserInboundEventTriggered(event)
+    }
+
+    private func notifyClosed() {
+        var callbackToDeliver: (() -> Void)?
+        closeLock.lock()
+        hasClosed = true
+        if !didDeliverClose, let closeCallback {
+            didDeliverClose = true
+            callbackToDeliver = closeCallback
+        }
+        closeLock.unlock()
+        callbackToDeliver?()
+    }
+
+    /// Install the emulator callback on the channel's event loop, then drain
+    /// any output that arrived between exec acceptance and UI wiring. Using
+    /// the same event loop as channelRead preserves strict ordering without a
+    /// cross-thread lock around potentially expensive terminal parsing.
+    func setOnDataReceived(_ callback: @escaping (Data) -> Void) {
+        guard let channel else {
+            dataCallback = callback
+            let pending = bufferedData
+            bufferedData.removeAll(keepingCapacity: true)
+            pending.forEach(callback)
+            return
+        }
+        channel.eventLoop.execute {
+            self.dataCallback = callback
+            let pending = self.bufferedData
+            self.bufferedData.removeAll(keepingCapacity: true)
+            pending.forEach(callback)
+        }
     }
 
     // MARK: - Send data to remote
@@ -176,7 +262,8 @@ extension SSHManager {
         cols: Int,
         rows: Int
     ) async throws -> TerminalChannelHandler {
-        guard let parentChannel = self.parentChannel,
+        guard isConnected,
+              let parentChannel = self.parentChannel,
               let sshHandler = self.sshHandler else {
             throw SSHError.notConnected
         }
@@ -193,33 +280,61 @@ extension SSHManager {
             command = "export LANG=en_US.UTF-8; \(tmuxPath) attach -t '\(escaped):\(window)'"
         }
 
-        let handler = try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<TerminalChannelHandler> in
-            let readyPromise = parentChannel.eventLoop.makePromise(of: Void.self)
-            let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
+        return try await withTaskCancellationHandler {
+            try await parentChannel.eventLoop.flatSubmit { () -> EventLoopFuture<TerminalChannelHandler> in
+                let readyCompletion = TerminalReadyCompletion(eventLoop: parentChannel.eventLoop)
+                let channelPromise = parentChannel.eventLoop.makePromise(of: Channel.self)
+                var childChannel: Channel?
 
-            let handler = TerminalChannelHandler(
-                command: command,
-                cols: cols,
-                rows: rows,
-                readyPromise: readyPromise
-            )
+                let handler = TerminalChannelHandler(
+                    command: command,
+                    cols: cols,
+                    rows: rows,
+                    readyCompletion: readyCompletion
+                )
 
-            sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
-                guard channelType == .session else {
-                    return childChannel.eventLoop.makeFailedFuture(SSHError.channelError("Unexpected channel type"))
+                sshHandler.createChannel(channelPromise, channelType: .session) { childChannel, channelType in
+                    guard channelType == .session else {
+                        return childChannel.eventLoop.makeFailedFuture(
+                            SSHError.channelError("Unexpected channel type")
+                        )
+                    }
+                    return childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).flatMap {
+                        childChannel.pipeline.addHandler(handler)
+                    }
                 }
-                return childChannel.setOption(ChannelOptions.allowRemoteHalfClosure, value: true).flatMap {
-                    childChannel.pipeline.addHandler(handler)
+
+                channelPromise.futureResult.whenSuccess { channel in
+                    if readyCompletion.isCompleted {
+                        channel.close(promise: nil)
+                    } else {
+                        childChannel = channel
+                    }
                 }
-            }
 
-            channelPromise.futureResult.whenFailure { error in
-                readyPromise.fail(error)
-            }
+                channelPromise.futureResult.whenFailure { error in
+                    readyCompletion.fail(error)
+                }
 
-            return readyPromise.futureResult.map { handler }
-        }.get()
+                // A zombie parent can leave createChannel pending forever.
+                // Bound the attach and close both the child (if created) and
+                // parent so Retry starts from a genuinely fresh connection.
+                let timeoutTask = parentChannel.eventLoop.scheduleTask(in: .seconds(10)) {
+                    readyCompletion.fail(SSHError.commandFailed("Terminal attach timed out"))
+                    childChannel?.close(promise: nil)
+                    parentChannel.close(promise: nil)
+                }
+                readyCompletion.futureResult.whenComplete { _ in
+                    timeoutTask.cancel()
+                }
 
-        return handler
+                return readyCompletion.futureResult.map { handler }
+            }.get()
+        } onCancel: {
+            // Closing the parent also closes a child whose creation promise is
+            // still pending, something Swift Task cancellation cannot do to a
+            // NIO future by itself.
+            parentChannel.close(promise: nil)
+        }
     }
 }

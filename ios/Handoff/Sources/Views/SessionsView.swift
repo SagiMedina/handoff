@@ -1,5 +1,67 @@
 import SwiftUI
 
+/// Monotonic request tokens used to keep cancelled session work from
+/// publishing into a newer connection attempt. Cancelling a Swift Task does
+/// not cancel an EventLoopFuture that it is awaiting, so cancellation alone is
+/// not a sufficient ownership check for SSH work.
+struct SessionsRequestEpoch {
+    private(set) var load: UInt64 = 0
+    private(set) var refresh: UInt64 = 0
+
+    mutating func beginLoad() -> UInt64 {
+        load &+= 1
+        // A full load owns the session list and supersedes any silent refresh.
+        refresh &+= 1
+        return load
+    }
+
+    mutating func beginRefresh() -> UInt64 {
+        refresh &+= 1
+        return refresh
+    }
+
+    mutating func invalidateAll() {
+        load &+= 1
+        refresh &+= 1
+    }
+
+    func ownsLoad(_ token: UInt64) -> Bool { load == token }
+    func ownsRefresh(_ token: UInt64) -> Bool { refresh == token }
+}
+
+/// Pure policy for recovering a failed Sessions discovery load. Recovery is
+/// deliberately limited to the discovery SSH connection: routine navigation
+/// must never restart the embedded Tailscale node (which can discard the
+/// working route and send the user through authentication again).
+struct SessionsLoadRetryPolicy {
+    enum Failure: Equatable {
+        case transport
+        case gate
+        case hostKeyMismatch
+    }
+
+    enum Attempt: Equatable {
+        case initial
+        case automaticRetry
+    }
+
+    enum Recovery: Equatable {
+        case retrySSH(backoffNanoseconds: UInt64)
+        case surfaceError
+
+        /// Kept explicit so tests protect the most important invariant of
+        /// routine Sessions recovery.
+        var restartsTailscaleTransport: Bool { false }
+    }
+
+    static func recovery(for failure: Failure, attempt: Attempt) -> Recovery {
+        guard failure == .transport, attempt == .initial else {
+            return .surfaceError
+        }
+        return .retrySSH(backoffNanoseconds: 650_000_000)
+    }
+}
+
 /// Displays tmux sessions and tabs from the remote Mac.
 /// Connects via SSH, discovers sessions, and allows navigation to terminal.
 struct SessionsView: View {
@@ -42,26 +104,8 @@ struct SessionsView: View {
     /// foreground recovery starts and either overwrite the fresh list or
     /// disconnect the newly re-established SSH session from its catch block.
     @State private var refreshTask: Task<Void, Never>?
-
-    /// Explicit state machine for post-background recovery. tsnet needs a
-    /// beat to rebuild routing after iOS unfreezes the app; without both a
-    /// pre-connect warmup AND a one-shot retry, the first gate command
-    /// hangs and the user sees "The request timed out".
-    ///
-    /// - `inactive`: steady state. No warmup, no retry.
-    /// - `foregroundAttempt`: first load after scenePhase `.active`. Warmup
-    ///   applied. A transport failure transitions to `retryingForeground`.
-    /// - `retryingForeground`: the one-shot retry. Warmup still applied
-    ///   (that's the whole point of the fix — previously the retry lost it).
-    ///   Failure from here surfaces to the user; success returns to
-    ///   `inactive`.
-    enum ResumeState {
-        case inactive
-        case foregroundAttempt
-        case retryingForeground
-        case restartingTransport
-    }
-    @State private var resumeState: ResumeState = .inactive
+    @State private var requestEpoch = SessionsRequestEpoch()
+    @State private var hasAppeared = false
 
     // New session dialog
     @State private var showNewSessionDialog = false
@@ -161,20 +205,26 @@ struct SessionsView: View {
             }
         }
         .onAppear {
-            // Full load only when we have no cached data (first entry into
-            // Sessions). Re-entry from Terminal finds sessions already
-            // populated — the 5s refresh timer keeps them fresh without a
-            // spinner + potential stale-channel failure on every return.
-            if sessions.isEmpty {
+            if hasAppeared {
+                // Sessions and Terminal deliberately use separate SSH
+                // managers. The Sessions manager is torn down while Terminal
+                // covers this view, so returning always establishes a fresh
+                // SOCKS + SSH connection instead of issuing `list` on a
+                // channel that iOS may already have retired.
+                forceReload()
+            } else {
+                hasAppeared = true
                 loadSessions()
             }
         }
-        // NOTE: no onDisappear disconnect. SwiftUI fires onDisappear when
-        // this view is pushed-over (user navigates into Terminal) and that
-        // used to tear down the Sessions SSH connection, so returning to
-        // Sessions always hit a stale-channel reconnect. Explicit
-        // teardown happens in the Unpair button and signOutOfTailscale;
-        // TailscaleAuthView handles the true dismissal path via scenePhase.
+        .onDisappear {
+            // Terminal has its own retained SSH connection in
+            // TerminalSessionStore. Keeping this discovery connection alive
+            // as well only leaves an idle channel whose in-flight refresh can
+            // time out after Back and race the new load.
+            cancelInFlightRequests()
+            sshManager.disconnect()
+        }
         .onReceive(refreshTimer) { _ in
             if !isLoading {
                 silentRefresh()
@@ -197,20 +247,13 @@ struct SessionsView: View {
                     // spinner instead of errorView.
                     errorMessage = nil
                     isLoading = true
-                    // Escalate recovery one level higher than SSH. Real-device
-                    // testing still shows cases where the embedded Tailscale
-                    // loopback itself is stale after backgrounding, so
-                    // reconnecting SSH on top of the old proxy just burns 10s
-                    // and surfaces "The request timed out". Restarting the
-                    // transport re-routes through ContentView's Tailscale gate,
-                    // then SessionsView is recreated and loads fresh.
-                    resumeState = .inactive
-                    loadTask?.cancel()
-                    loadTask = nil
-                    refreshTask?.cancel()
-                    refreshTask = nil
+                    // Foreground recovery owns only the discovery SSH
+                    // connection. Restarting Tailscale here is a destructive
+                    // escalation: it can tear down an otherwise healthy node
+                    // and unexpectedly return the user to Tailscale login.
+                    cancelInFlightRequests()
                     sshManager.disconnect()
-                    tailscale.restart()
+                    loadSessions(forceReconnect: true, warmUpBeforeConnect: true)
                 }
             default:
                 break
@@ -327,23 +370,21 @@ struct SessionsView: View {
 
     private func signOutOfTailscale() {
         // Close any open terminals before tearing down the network
-        resumeState = .inactive
         loadTask?.cancel()
         loadTask = nil
         refreshTask?.cancel()
         refreshTask = nil
         TerminalSessionStore.shared.closeAll()
         sshManager.disconnect()
-        // resetState() closes the Tailscale node and deletes the persisted state dir,
-        // so the next start() requires fresh browser sign-in.
-        tailscale.resetState()
+        // This explicit, confirmed sign-out is the only Sessions flow allowed
+        // to forget the persisted Tailscale identity.
+        tailscale.signOutAndForgetIdentity()
         // Pop back to root — ContentView will now show TailscaleAuthView since
         // tailscale.state == .stopped (Sessions screen is only reachable when .connected).
         path.removeLast(path.count)
     }
 
     private func unpairDevice() {
-        resumeState = .inactive
         loadTask?.cancel()
         loadTask = nil
         refreshTask?.cancel()
@@ -596,23 +637,28 @@ struct SessionsView: View {
     /// in reality be torn down by iOS after backgrounding, in which case the
     /// next gate command hangs until the exec-level timeout.
     ///
-    /// When invoked by the toolbar Retry button or an errorView Retry (i.e.
-    /// `resetResumeState = true`), this also drops any foreground-recovery
-    /// state — manual reloads shouldn't inherit post-background retry/
-    /// warmup semantics.
-    private func forceReload(resetResumeState: Bool = true) {
-        if resetResumeState {
-            resumeState = .inactive
-        }
-        loadTask?.cancel()
-        loadTask = nil
-        refreshTask?.cancel()
-        refreshTask = nil
+    /// The cached list is intentionally retained while this runs, so Back can
+    /// return immediately to useful content while a fresh discovery SSH
+    /// connection catches up in the background.
+    private func forceReload() {
+        cancelInFlightRequests()
         sshManager.disconnect()
         loadSessions()
     }
 
-    private func loadSessions(forceReconnect: Bool = false) {
+    private func cancelInFlightRequests() {
+        requestEpoch.invalidateAll()
+        loadTask?.cancel()
+        loadTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+    }
+
+    private func loadSessions(
+        forceReconnect: Bool = false,
+        attempt: SessionsLoadRetryPolicy.Attempt = .initial,
+        warmUpBeforeConnect: Bool = false
+    ) {
         guard let config = configStore.config else { return }
 
         // Defensively cancel any previous in-flight load so its catch block
@@ -621,6 +667,7 @@ struct SessionsView: View {
         loadTask?.cancel()
         refreshTask?.cancel()
         refreshTask = nil
+        let requestToken = requestEpoch.beginLoad()
 
         if forceReconnect {
             sshManager.disconnect()
@@ -630,18 +677,21 @@ struct SessionsView: View {
         errorMessage = nil
 
         loadTask = Task {
+            defer {
+                Task { @MainActor in
+                    guard requestEpoch.ownsLoad(requestToken) else { return }
+                    loadTask = nil
+                }
+            }
             do {
                 // Pre-connect breathing room when we're in foreground
                 // recovery (either the first attempt or the one retry).
                 // tsnet's routing takes a beat to wake, and connecting too
                 // early produces either a hang (exec timeout) or a socket
                 // teardown ("network connection was lost") depending on
-                // how long we were backgrounded. Reading the enum (not
-                // consuming it) lets BOTH attempts warm up — the previous
-                // bool got consumed by the retry path and left attempt 2
-                // without warmup.
-                let inRecovery = await MainActor.run { resumeState != .inactive }
-                if inRecovery {
+                // how long we were backgrounded. The retry preserves this
+                // flag so both foreground attempts receive the warmup.
+                if warmUpBeforeConnect {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     try Task.checkCancellation()
                 }
@@ -675,14 +725,10 @@ struct SessionsView: View {
                 try Task.checkCancellation()
 
                 await MainActor.run {
-                    if Task.isCancelled { return }
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsLoad(requestToken) else { return }
                     sessions = discoveredSessions
                     isLoading = false
-                    // We succeeded — exit foreground recovery. Any later
-                    // failure (e.g., mid-session) isn't part of the resume
-                    // race and shouldn't inherit its warmup/retry.
-                    resumeState = .inactive
-
                     if !hasAutoConnected,
                        discoveredSessions.count == 1,
                        discoveredSessions[0].windows.count == 1 {
@@ -702,8 +748,8 @@ struct SessionsView: View {
                 return
             } catch let mismatch as HostKeyMismatchError {
                 await MainActor.run {
-                    if Task.isCancelled { return }
-                    resumeState = .inactive
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsLoad(requestToken) else { return }
                     hostKeyMismatch = mismatch
                     errorMessage = nil
                     isLoading = false
@@ -716,8 +762,8 @@ struct SessionsView: View {
                 await MainActor.run {
                     // Cancelled tasks mustn't mutate state — they've been
                     // superseded by a newer reload whose writes we'd clobber.
-                    if Task.isCancelled { return }
-                    resumeState = .inactive
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsLoad(requestToken) else { return }
                     isLoading = false
                     switch gate.code {
                     case .softExpired:
@@ -732,54 +778,41 @@ struct SessionsView: View {
                     }
                 }
             } catch {
-                if Task.isCancelled { return }
+                guard !Task.isCancelled else { return }
                 #if DEBUG
                 print("[SessionsView] loadSessions threw: \(type(of: error)) — \(error.localizedDescription)")
                 #endif
-                // Post-resume retry: transition foregroundAttempt →
-                // retryingForeground and try again. Reading the enum lets
-                // the inner Task apply warmup on this attempt too — which
-                // the old single-bool couldn't do because the retry
-                // consumed the flag before the inner read.
-                let stateAfterFailure = await MainActor.run { () -> ResumeState in
-                    resumeState
-                }
-                let shouldRetry = await MainActor.run { () -> Bool in
-                    if resumeState == .foregroundAttempt {
-                        resumeState = .retryingForeground
+                switch SessionsLoadRetryPolicy.recovery(for: .transport, attempt: attempt) {
+                case .retrySSH(let backoffNanoseconds):
+                    // Ownership check and disconnect are one MainActor turn:
+                    // stale failures cannot tear down a newer discovery SSH
+                    // connection after Back/Retry starts another full load.
+                    let ownsFailedAttempt = await MainActor.run { () -> Bool in
+                        guard !Task.isCancelled,
+                              requestEpoch.ownsLoad(requestToken) else { return false }
+                        sshManager.disconnect()
                         return true
                     }
-                    return false
-                }
-                if shouldRetry {
-                    sshManager.disconnect()
-                    // 800ms backoff + 500ms warmup in the inner Task gives
-                    // tsnet ~1.3s to settle before the retry connect.
-                    try? await Task.sleep(nanoseconds: 800_000_000)
-                    if Task.isCancelled { return }
-                    await MainActor.run { loadSessions(forceReconnect: true) }
-                    return
-                }
-                // If even the foreground retry failed, the problem is likely
-                // lower than SSH: the embedded Tailscale loopback / routing
-                // stack may still be stale after resume. Escalate from "retry
-                // SSH" to "restart transport" automatically instead of
-                // surfacing a timeout banner that manual Retry then fixes a few
-                // seconds later.
-                if stateAfterFailure == .retryingForeground {
+                    guard ownsFailedAttempt else { return }
+
+                    try? await Task.sleep(nanoseconds: backoffNanoseconds)
+                    guard !Task.isCancelled else { return }
                     await MainActor.run {
-                        if Task.isCancelled { return }
-                        resumeState = .restartingTransport
-                        sshManager.disconnect()
-                        tailscale.restart()
+                        guard requestEpoch.ownsLoad(requestToken) else { return }
+                        loadSessions(
+                            forceReconnect: true,
+                            attempt: .automaticRetry,
+                            warmUpBeforeConnect: warmUpBeforeConnect
+                        )
                     }
-                    return
-                }
-                await MainActor.run {
-                    if Task.isCancelled { return }
-                    resumeState = .inactive
-                    errorMessage = ErrorMessages.friendlyConnection(error)
-                    isLoading = false
+
+                case .surfaceError:
+                    await MainActor.run {
+                        guard !Task.isCancelled,
+                              requestEpoch.ownsLoad(requestToken) else { return }
+                        errorMessage = ErrorMessages.friendlyConnection(error)
+                        isLoading = false
+                    }
                 }
             }
         }
@@ -790,9 +823,11 @@ struct SessionsView: View {
               let config = configStore.config,
               sshManager.isConnected else { return }
 
+        let requestToken = requestEpoch.beginRefresh()
         refreshTask = Task {
             defer {
                 Task { @MainActor in
+                    guard requestEpoch.ownsRefresh(requestToken) else { return }
                     refreshTask = nil
                 }
             }
@@ -808,7 +843,8 @@ struct SessionsView: View {
                     try Task.checkCancellation()
                 }
                 await MainActor.run {
-                    if Task.isCancelled { return }
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsRefresh(requestToken) else { return }
                     sessions = discoveredSessions
                 }
             } catch is CancellationError {
@@ -820,7 +856,8 @@ struct SessionsView: View {
                 // scenePhase bump reconnects cleanly instead of hitting the
                 // exec timeout again.
                 await MainActor.run {
-                    if Task.isCancelled { return }
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsRefresh(requestToken) else { return }
                     sshManager.disconnect()
                 }
             }

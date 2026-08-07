@@ -2,6 +2,14 @@ import SwiftUI
 import SwiftTerm
 import UIKit
 
+extension Notification.Name {
+    /// Process-local delivery after the store has removed the exact terminal
+    /// generation whose channel died. The UUID is carried as `object`.
+    static let handoffTerminalChannelClosed = Notification.Name(
+        "dev.omriariav.handoff.terminalChannelClosed"
+    )
+}
+
 /// Terminal screen: wraps SwiftTerm for tmux session display with SSH backing.
 /// Uses TerminalSessionStore so navigating back and returning preserves
 /// the SSH connection and SwiftTerm buffer state.
@@ -23,7 +31,7 @@ struct TerminalView: View {
     @State private var activeTerminal: TerminalSessionStore.ActiveTerminal?
     @State private var hostKeyMismatch: HostKeyMismatchError?
     @State private var wasBackgrounded = false
-    @State private var awaitingTransportRecovery = false
+    @State private var screenVisibilityID = UUID()
     @StateObject private var connectState = ConnectState()
     @StateObject private var modifiers = ModifierState()
 
@@ -36,8 +44,40 @@ struct TerminalView: View {
     @MainActor
     private final class ConnectState: ObservableObject {
         var inFlight: Task<Void, Never>?
+        private var epoch = TerminalConnectEpoch()
+
+        var hasInFlightAttempt: Bool {
+            inFlight != nil
+        }
+
+        /// Claims a new presentation generation before any async SSH work is
+        /// started. Swift Task cancellation alone cannot revoke ownership of
+        /// an NIO future that resumes later.
+        func beginAttempt() -> UInt64 {
+            inFlight?.cancel()
+            inFlight = nil
+            return epoch.begin()
+        }
+
+        func owns(_ token: UInt64) -> Bool {
+            epoch.owns(token)
+        }
+
+        func install(_ task: Task<Void, Never>, for token: UInt64) {
+            guard owns(token) else {
+                task.cancel()
+                return
+            }
+            inFlight = task
+        }
+
+        func finish(_ token: UInt64) {
+            guard owns(token) else { return }
+            inFlight = nil
+        }
 
         func cancelInFlight() {
+            epoch.invalidate()
             inFlight?.cancel()
             inFlight = nil
         }
@@ -116,9 +156,11 @@ struct TerminalView: View {
             )
         }
         .onAppear {
+            TerminalSessionStore.shared.terminalScreenDidAppear(screenVisibilityID)
             // Reuse existing terminal only if its SSH is still alive.
             // Stale connections (idle timeout, brief iOS suspend) need fresh reconnect.
             if let existing = TerminalSessionStore.shared.get(key), existing.sshManager.isConnected {
+                bindChannelClosure(for: existing)
                 activeTerminal = existing
                 isConnecting = false
             } else {
@@ -127,8 +169,44 @@ struct TerminalView: View {
                 connectAndAttach()
             }
         }
-        // NOTE: no onDisappear disconnect — the connection persists in the store
-        // so navigating back to Sessions preserves terminal state.
+        .onDisappear {
+            // Keep the transport + SwiftTerm buffer cached, but restore the
+            // normal device idle timer as soon as the terminal is not visible.
+            TerminalSessionStore.shared.terminalScreenDidDisappear(screenVisibilityID)
+
+            let retainedTerminalWasEstablished = activeTerminal.map { presented in
+                TerminalSessionStore.shared.get(key)?.id == presented.id
+            } ?? false
+            if TerminalConnectDisappearPolicy.shouldCancelAttempt(
+                hasInFlightAttempt: connectState.hasInFlightAttempt,
+                hasActiveRetainedTerminal: retainedTerminalWasEstablished
+            ) {
+                // A navigation pop can dismiss the view while the SSH/NIO
+                // future is still running. Revoke its generation and close its
+                // transport so it cannot later register over the terminal the
+                // user opens from the Sessions screen.
+                connectState.cancelInFlight()
+                connectSSHManager.disconnect()
+            }
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .handoffTerminalChannelClosed)
+        ) { notification in
+            guard let closedObject = notification.object as? NSUUID else { return }
+            let closedTerminalID = closedObject as UUID
+            guard TerminalPresentationLifecycle.shouldSurfaceChannelClosure(
+                removedCurrentGeneration: true,
+                screenIsVisible: TerminalSessionStore.shared.isTerminalScreenVisible(
+                    screenVisibilityID
+                ),
+                presentedTerminalID: activeTerminal?.id,
+                closedTerminalID: closedTerminalID
+            ) else { return }
+
+            activeTerminal = nil
+            isConnecting = false
+            errorMessage = TerminalPresentationLifecycle.channelClosedMessage
+        }
         .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {
             case .background:
@@ -138,20 +216,6 @@ struct TerminalView: View {
                     wasBackgrounded = false
                     beginForegroundRecovery()
                 }
-            default:
-                break
-            }
-        }
-        .onChange(of: tailscale.state) { _, newState in
-            guard awaitingTransportRecovery else { return }
-            switch newState {
-            case .connected:
-                awaitingTransportRecovery = false
-                connectAndAttach()
-            case .error(let message):
-                awaitingTransportRecovery = false
-                isConnecting = false
-                errorMessage = message
             default:
                 break
             }
@@ -212,7 +276,7 @@ struct TerminalView: View {
         // Cancel any in-flight connect attempt before starting a new one.
         // Prevents duplicate SSH sessions from rapid Reconnect taps or
         // foreground/reconnect races.
-        connectState.cancelInFlight()
+        let attempt = connectState.beginAttempt()
         connectSSHManager.disconnect()
 
         isConnecting = true
@@ -232,6 +296,7 @@ struct TerminalView: View {
                 )
                 try await connectSSHManager.connect(config: config, proxy: proxy)
                 try Task.checkCancellation()
+                guard connectState.owns(attempt) else { return }
 
                 let handler = try await connectSSHManager.openTerminal(
                     tmuxPath: config.tmuxPath,
@@ -241,6 +306,10 @@ struct TerminalView: View {
                     rows: Self.initialTerminalRows
                 )
                 try Task.checkCancellation()
+                guard connectState.owns(attempt) else {
+                    handler.channel?.close(promise: nil)
+                    return
+                }
 
                 // Create SwiftTerm view once per connection, keep it alive via the store
                 let termView = SwiftTerm.TerminalView(frame: .zero)
@@ -260,43 +329,67 @@ struct TerminalView: View {
                 )
 
                 // Wire SSH data into the terminal
-                handler.onDataReceived = { [weak termView] data in
-                    DispatchQueue.main.async {
-                        guard let termView else { return }
-                        let terminal = termView.getTerminal()
-                        let array = Array(data)
-                        terminal.feed(buffer: array[array.startIndex..<array.endIndex])
-                        termView.setNeedsDisplay()
-                    }
+                handler.setOnDataReceived { [weak termView] data in
+                    guard let termView else { return }
+                    RemoteTerminalOutput.feed(data, into: termView)
                 }
 
-                let closeKey = key
-                handler.onClosed = {
-                    Task { @MainActor in
-                        TerminalSessionStore.shared.close(closeKey)
-                    }
-                }
+                bindChannelClosure(for: terminal)
 
+                guard connectState.owns(attempt) else {
+                    handler.channel?.close(promise: nil)
+                    return
+                }
                 TerminalSessionStore.shared.register(terminal)
+                guard connectState.owns(attempt) else {
+                    TerminalSessionStore.shared.close(key, ifMatching: terminal.id)
+                    return
+                }
                 activeTerminal = terminal
                 isConnecting = false
-                connectState.inFlight = nil
+                connectState.finish(attempt)
             } catch is CancellationError {
                 // Task was cancelled — superseded by another connect attempt
+                connectState.finish(attempt)
                 return
             } catch let mismatch as HostKeyMismatchError {
+                guard connectState.owns(attempt) else { return }
                 hostKeyMismatch = mismatch
                 errorMessage = nil
                 isConnecting = false
-                connectState.inFlight = nil
+                connectState.finish(attempt)
             } catch {
+                guard connectState.owns(attempt) else { return }
                 errorMessage = error.localizedDescription
                 isConnecting = false
-                connectState.inFlight = nil
+                connectState.finish(attempt)
             }
         }
 
-        connectState.inFlight = task
+        connectState.install(task, for: attempt)
+    }
+
+    /// This callback owns no TerminalView state. It always removes the exact
+    /// retained generation, even while no terminal screen exists, then emits a
+    /// process-local event for whichever identity-matching screen is visible.
+    /// Rebinding on cached re-entry also replaces callbacks from older builds
+    /// or presentation lifetimes without creating a handler/view retain cycle.
+    private func bindChannelClosure(for terminal: TerminalSessionStore.ActiveTerminal) {
+        let closeKey = terminal.key
+        let terminalID = terminal.id
+        terminal.handler.onClosed = {
+            Task { @MainActor in
+                guard TerminalSessionStore.shared.close(
+                    closeKey,
+                    ifMatching: terminalID
+                ) else { return }
+
+                NotificationCenter.default.post(
+                    name: .handoffTerminalChannelClosed,
+                    object: terminalID as NSUUID
+                )
+            }
+        }
     }
 
     private func beginForegroundRecovery() {
@@ -307,12 +400,11 @@ struct TerminalView: View {
         }
         errorMessage = nil
         isConnecting = true
-        // Terminal reconnect failures after background are often lower than SSH:
-        // the embedded Tailscale loopback is stale, so opening a fresh SSH
-        // session just burns 10s and surfaces "The request timed out". Restart
-        // transport first, then reconnect tmux once the proxy is really back.
-        awaitingTransportRecovery = true
-        tailscale.restart()
+        // Reuse the existing Tailscale proxy and reconnect only this terminal's
+        // SSH transport. If the proxy is genuinely unavailable, surface that
+        // failure rather than turning foregrounding into an implicit sign-out
+        // or whole-network restart.
+        connectAndAttach()
     }
 
     private func configureTerminalView(_ termView: SwiftTerm.TerminalView) {
@@ -335,7 +427,7 @@ struct TerminalView: View {
         // selection intact. Cost: taps no longer report as mouse clicks to the
         // remote app — acceptable for a keyboard-driven terminal.
         termView.allowMouseReporting = false
-        // Idle timer is managed centrally by TerminalSessionStore
+        // Idle timer follows TerminalView visibility, not this cached UIView.
     }
 
     private func applyConfiguredFontToActiveTerminal() {
@@ -367,7 +459,100 @@ struct TerminalView: View {
     }
 }
 
+/// Pure close-event policy used by the SwiftUI presentation. Both the retained
+/// generation and visible generation must match before a transport death can
+/// replace the terminal with a reconnect state.
+enum TerminalPresentationLifecycle {
+    static let channelClosedMessage =
+        "The terminal connection closed. Tap Reconnect to attach again."
+
+    static func shouldSurfaceChannelClosure(
+        removedCurrentGeneration: Bool,
+        screenIsVisible: Bool,
+        presentedTerminalID: UUID?,
+        closedTerminalID: UUID
+    ) -> Bool {
+        removedCurrentGeneration
+            && screenIsVisible
+            && presentedTerminalID == closedTerminalID
+    }
+}
+
+/// Monotonic ownership for TerminalView attachment attempts. This is separate
+/// from SSHManager's transport generation: it protects presentation and store
+/// state when a cancelled Task resumes with a non-cancellation error.
+struct TerminalConnectEpoch {
+    private(set) var current: UInt64 = 0
+
+    mutating func begin() -> UInt64 {
+        current &+= 1
+        return current
+    }
+
+    mutating func invalidate() {
+        current &+= 1
+    }
+
+    func owns(_ token: UInt64) -> Bool {
+        current == token
+    }
+}
+
+/// A completed terminal is intentionally retained across Back, matching
+/// Android's TerminalSessionHolder. Only a still-pending attach is disposable
+/// with the presentation that started it.
+enum TerminalConnectDisappearPolicy {
+    static func shouldCancelAttempt(
+        hasInFlightAttempt: Bool,
+        hasActiveRetainedTerminal: Bool
+    ) -> Bool {
+        hasInFlightAttempt && !hasActiveRetainedTerminal
+    }
+}
+
 // MARK: - SwiftTerm UIViewRepresentable
+
+/// Routes PTY output through SwiftTerm's view-level feed lifecycle on the main
+/// thread. SwiftTerm's parser can synchronously add/remove its UIKit caret for
+/// cursor-visibility escape sequences, despite documenting `feed` as callable
+/// from a background thread.
+/// Feeding the underlying emulator directly redraws cells but skips
+/// `updateCursorPosition`, leaving SwiftTerm's caret view behind after echoed
+/// text and backspaces.
+enum RemoteTerminalOutput {
+    static func feed(_ data: Data, into terminalView: SwiftTerm.TerminalView) {
+        let bytes = Array(data)
+        let feedView: () -> Void = { [weak terminalView] in
+            guard let terminalView else { return }
+            terminalView.feed(byteArray: bytes[...])
+        }
+
+        if Thread.isMainThread {
+            feedView()
+        } else {
+            // The per-channel NIO callback is serial, and main queue dispatch
+            // preserves that chunk order while keeping all UIKit work safe.
+            DispatchQueue.main.async(execute: feedView)
+        }
+    }
+}
+
+/// Applies Handoff's one Android-compatible keyboard rewrite without taking
+/// ownership of SwiftTerm's broader keyboard/IME encoder. A sticky toolbar
+/// Shift followed by Return means LF (Claude multiline) instead of CR.
+enum RemoteTerminalInput {
+    struct RoutedData: Equatable {
+        let data: Data
+        let consumedShift: Bool
+    }
+
+    static func route(_ data: ArraySlice<UInt8>, stickyShift: Bool) -> RoutedData {
+        if stickyShift, data.count == 1, data.first == 0x0D {
+            return RoutedData(data: Data([0x0A]), consumedShift: true)
+        }
+        return RoutedData(data: Data(data), consumedShift: false)
+    }
+}
 
 /// Wraps a persisted SwiftTerm.TerminalView so the underlying buffer survives
 /// across SwiftUI view re-creations.
@@ -383,16 +568,23 @@ struct SwiftTermView: UIViewRepresentable {
         context.coordinator.installModifierResetObservers(on: termView)
         termView.controlModifier = isInputEnabled && modifierState.ctrl
         termView.metaModifier = isInputEnabled && modifierState.alt
+        if isInputEnabled {
+            // Match Android: a writable terminal is keyboard-ready as soon as
+            // it is attached, including when a persisted view is re-entered.
+            DispatchQueue.main.async { [weak termView] in
+                guard let termView, termView.window != nil else { return }
+                _ = termView.becomeFirstResponder()
+            }
+        }
         return termView
     }
 
     func updateUIView(_ uiView: SwiftTerm.TerminalView, context: Context) {
         context.coordinator.handler = terminal.handler
         context.coordinator.modifierState = modifierState
-        context.coordinator.isInputEnabled = isInputEnabled
         // Ctrl and Alt are native SwiftTerm one-shot modifiers. This lets both
         // software and hardware keyboard input flow through SwiftTerm's own
-        // keyboard/IME/Kitty protocol encoders. Shift remains toolbar-only.
+        // keyboard/IME/Kitty encoders. Sticky Shift is bridged only for Return.
         uiView.controlModifier = isInputEnabled && modifierState.ctrl
         uiView.metaModifier = isInputEnabled && modifierState.alt
     }
@@ -400,15 +592,13 @@ struct SwiftTermView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             handler: terminal.handler,
-            modifierState: modifierState,
-            isInputEnabled: isInputEnabled
+            modifierState: modifierState
         )
     }
 
     class Coordinator: NSObject, SwiftTerm.TerminalViewDelegate, UIGestureRecognizerDelegate {
         var handler: TerminalChannelHandler
         var modifierState: ModifierState
-        var isInputEnabled: Bool
         private var resizeWorkItem: DispatchWorkItem?
         private var controlResetObserver: NSObjectProtocol?
         private var metaResetObserver: NSObjectProtocol?
@@ -421,10 +611,9 @@ struct SwiftTermView: UIViewRepresentable {
         private var scrollRemainder: CGFloat = 0
         private var lastTranslationY: CGFloat = 0
 
-        init(handler: TerminalChannelHandler, modifierState: ModifierState, isInputEnabled: Bool) {
+        init(handler: TerminalChannelHandler, modifierState: ModifierState) {
             self.handler = handler
             self.modifierState = modifierState
-            self.isInputEnabled = isInputEnabled
         }
 
         deinit {
@@ -539,10 +728,20 @@ struct SwiftTermView: UIViewRepresentable {
         }
 
         func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
-            guard isInputEnabled else { return }
-            // SwiftTerm owns native keyboard/IME/paste/protocol-reply encoding.
-            // Only the dedicated mobile toolbar applies Handoff modifiers.
-            handler.send(Data(data))
+            // SwiftTerm uses this delegate for both user input and terminal
+            // protocol replies (DA/DSR/query responses). Read-only authority
+            // lives in the gate's `tmux -r`; dropping this stream client-side
+            // can break remote full-screen applications.
+            //
+            // UIKit keyboard callbacks arrive on the main thread. PTY parsing
+            // can invoke protocol replies from the NIO event loop, so only
+            // consult the observable sticky modifier on the main thread.
+            let stickyShift = Thread.isMainThread && modifierState.shift
+            let routed = RemoteTerminalInput.route(data, stickyShift: stickyShift)
+            if routed.consumedShift {
+                modifierState.shift = false
+            }
+            handler.send(routed.data)
         }
 
         func sizeChanged(source: SwiftTerm.TerminalView, newCols: Int, newRows: Int) {

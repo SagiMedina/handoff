@@ -8,13 +8,16 @@ import TailscaleKit
 /// Apple's sandbox blocks userspace WireGuard from a non-NetworkExtension process.
 /// TailscaleKit handles the correct iOS embedding without requiring NE entitlements.
 ///
-/// States: stopped → starting → needsAuth → connected | error
+/// States: stopped → starting → needsAuth → connected | error.
+/// `stopping` is an internal cleanup barrier: no replacement node is opened
+/// against the state directory until the previous runtime has fully closed.
 @MainActor
 final class TailscaleManager: ObservableObject {
 
     enum State: Equatable {
         case stopped
         case starting
+        case stopping
         case needsAuth(url: String)
         case connected
         case error(String)
@@ -42,9 +45,9 @@ final class TailscaleManager: ObservableObject {
         let node: TailscaleNode
         let localAPI: LocalAPIClient
         let processor: MessageProcessor
-        let id: Int
+        let id: UInt64
 
-        init(node: TailscaleNode, localAPI: LocalAPIClient, processor: MessageProcessor, id: Int) {
+        init(node: TailscaleNode, localAPI: LocalAPIClient, processor: MessageProcessor, id: UInt64) {
             self.node = node
             self.localAPI = localAPI
             self.processor = processor
@@ -63,14 +66,20 @@ final class TailscaleManager: ObservableObject {
 
     private var runtime: TailscaleRuntime?
 
+    /// A node is exposed here as soon as it is created, before its IPN bus is
+    /// ready. A superseding lifecycle operation can therefore close it to
+    /// unblock a cancelled `watchIPNBus` / `up` call before awaiting that task.
+    private var startingNode: TailscaleNode?
+
     /// Convenience accessors keeping existing code happy.
     private var node: TailscaleNode? { runtime?.node }
     private var localAPI: LocalAPIClient? { runtime?.localAPI }
     private var processor: MessageProcessor? { runtime?.processor }
 
-    /// Generation counter — bumped on every start()/stop(). Bus events from a
-    /// previous generation are ignored so stale notifications can't clobber state.
-    private var generation: Int = 0
+    /// Every lifecycle request invalidates all async work from earlier requests.
+    /// This protects runtime, proxy, and public state assignments alike.
+    private var lifecycleEpoch = TailscaleLifecycleEpoch()
+    private var lifecycleTask: Task<Void, Never>?
 
     init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
@@ -92,7 +101,8 @@ final class TailscaleManager: ObservableObject {
 
     // MARK: - Start
 
-    /// Bring the Tailscale node up. Re-entry blocked unless we're stopped or in error.
+    /// Bring the Tailscale node up. Re-entry is blocked unless we're stopped or
+    /// in error; explicit Retry uses `retry()` below.
     func start(hostname: String = "handoff-ios") {
         #if DEBUG
         print("[Tailscale] start() called, current state=\(state)")
@@ -107,9 +117,96 @@ final class TailscaleManager: ObservableObject {
             return
         }
 
-        generation += 1
-        let currentGen = generation
-        state = .starting
+        schedule(.start, hostname: hostname)
+    }
+
+    /// Identity-preserving recovery. This closes the old runtime completely,
+    /// then starts a replacement against the same persisted state directory.
+    func retry(hostname: String = "handoff-ios") {
+        schedule(.retryPreservingIdentity, hostname: hostname)
+    }
+
+    /// Compatibility name for existing transport-recovery call sites. A restart
+    /// never removes the user's persisted Tailscale identity.
+    func restart() {
+        retry()
+    }
+
+    private func schedule(
+        _ operation: TailscaleLifecycleOperation,
+        hostname: String = "handoff-ios"
+    ) {
+        let currentGen = lifecycleEpoch.begin()
+        let previousTask = lifecycleTask
+        previousTask?.cancel()
+
+        // Transfer ownership of every old node to an uncancelled cleanup task.
+        // Closing before awaiting the cancelled start is intentional: close()
+        // unblocks libtailscale calls which do not promptly observe Swift task
+        // cancellation. A replacement start waits for both cleanup and the old
+        // lifecycle task, so two nodes never touch `stateDir` concurrently.
+        let oldRuntime = runtime
+        runtime = nil
+        let oldStartingNode = startingNode
+        startingNode = nil
+        oldRuntime?.processor.cancel()
+
+        proxyConfig = nil
+        state = operation.startsNodeAfterCleanup ? .starting : .stopping
+
+        let cleanupTask = Task { @MainActor in
+            if let oldRuntime {
+                oldRuntime.processor.cancel()
+                try? await oldRuntime.node.close()
+            }
+            if let oldStartingNode,
+               oldRuntime == nil || oldStartingNode !== oldRuntime?.node {
+                try? await oldStartingNode.close()
+            }
+        }
+
+        let task = Task { @MainActor [weak self] in
+            await cleanupTask.value
+            await previousTask?.value
+
+            guard let self,
+                  self.lifecycleEpoch.owns(currentGen),
+                  !Task.isCancelled else { return }
+
+            do {
+                if operation.deletesPersistedIdentity {
+                    if FileManager.default.fileExists(atPath: self.stateDir) {
+                        try FileManager.default.removeItem(atPath: self.stateDir)
+                    }
+                    try FileManager.default.createDirectory(
+                        atPath: self.stateDir,
+                        withIntermediateDirectories: true
+                    )
+                }
+
+                guard self.lifecycleEpoch.owns(currentGen),
+                      !Task.isCancelled else { return }
+
+                if operation.startsNodeAfterCleanup {
+                    await self.startCleanRuntime(hostname: hostname, generation: currentGen)
+                } else {
+                    self.state = .stopped
+                }
+            } catch {
+                guard self.lifecycleEpoch.owns(currentGen),
+                      !Task.isCancelled else { return }
+                self.state = .error(error.localizedDescription)
+            }
+
+            guard self.lifecycleEpoch.owns(currentGen) else { return }
+            self.lifecycleTask = nil
+        }
+        lifecycleTask = task
+    }
+
+    /// Called only after the prior runtime has closed and its lifecycle task has
+    /// completed. Every assignment after an async boundary checks `generation`.
+    private func startCleanRuntime(hostname: String, generation currentGen: UInt64) async {
 
         let config = Configuration(
             hostName: hostname,
@@ -119,49 +216,89 @@ final class TailscaleManager: ObservableObject {
             ephemeral: false
         )
 
-        Task {
-            do {
-                let node = try TailscaleNode(config: config, logger: logger)
-                let localAPI = LocalAPIClient(localNode: node, logger: logger)
-
-                let consumer = HandoffIPNConsumer(
-                    onEvent: { [weak self] notify in
-                        Task { @MainActor in
-                            guard let self, self.generation == currentGen else { return }
-                            self.handleNotify(notify)
-                        }
-                    },
-                    onError: { [weak self] error in
-                        Task { @MainActor in
-                            guard let self, self.generation == currentGen else { return }
-                            self.state = .error(error.localizedDescription)
-                        }
-                    }
-                )
-
-                let processor = try await localAPI.watchIPNBus(
-                    mask: [.initialState, .prefs, .netmap, .noPrivateKeys, .rateLimitNetmaps],
-                    consumer: consumer
-                )
-
-                self.runtime = TailscaleRuntime(
-                    node: node,
-                    localAPI: localAPI,
-                    processor: processor,
-                    id: currentGen
-                )
-
-                try await node.up()
-
-                // If the bus didn't already give us a BrowseToURL or a .Running state,
-                // explicitly trigger interactive login. The bus will deliver BrowseToURL.
-                if case .starting = state {
-                    try? await localAPI.startLoginInteractive()
-                }
-            } catch {
-                guard self.generation == currentGen else { return }
-                self.state = .error(error.localizedDescription)
+        do {
+            let node = try TailscaleNode(config: config, logger: logger)
+            guard lifecycleEpoch.owns(currentGen), !Task.isCancelled else {
+                try? await node.close()
+                return
             }
+            startingNode = node
+            let localAPI = LocalAPIClient(localNode: node, logger: logger)
+
+            let consumer = HandoffIPNConsumer(
+                onEvent: { [weak self] notify in
+                    Task { @MainActor in
+                        guard let self,
+                              self.lifecycleEpoch.owns(currentGen) else { return }
+                        self.handleNotify(notify)
+                    }
+                },
+                onError: { [weak self] error in
+                    Task { @MainActor in
+                        guard let self,
+                              self.lifecycleEpoch.owns(currentGen) else { return }
+                        self.state = .error(error.localizedDescription)
+                    }
+                }
+            )
+
+            let processor = try await localAPI.watchIPNBus(
+                mask: [.initialState, .prefs, .netmap, .noPrivateKeys, .rateLimitNetmaps],
+                consumer: consumer
+            )
+
+            guard lifecycleEpoch.owns(currentGen), !Task.isCancelled else {
+                processor.cancel()
+                // A newer operation took ownership from `startingNode` and is
+                // already closing it. Avoid a second concurrent close here.
+                if startingNode === node {
+                    startingNode = nil
+                    try? await node.close()
+                }
+                return
+            }
+
+            startingNode = nil
+            runtime = TailscaleRuntime(
+                node: node,
+                localAPI: localAPI,
+                processor: processor,
+                id: currentGen
+            )
+
+            try await node.up()
+            guard lifecycleEpoch.owns(currentGen), !Task.isCancelled else { return }
+
+            // If the bus didn't already give us a BrowseToURL or a .Running state,
+            // explicitly trigger interactive login. The bus will deliver BrowseToURL.
+            if case .starting = state {
+                try? await localAPI.startLoginInteractive()
+            }
+        } catch {
+            guard lifecycleEpoch.owns(currentGen), !Task.isCancelled else { return }
+
+            let failedRuntime: TailscaleRuntime?
+            if runtime?.id == currentGen {
+                failedRuntime = runtime
+                runtime = nil
+            } else {
+                failedRuntime = nil
+            }
+            let failedStartingNode = startingNode
+            startingNode = nil
+            proxyConfig = nil
+
+            // Keep error recovery ordered too: Retry cannot begin until this
+            // failed node is fully closed.
+            if let failedRuntime {
+                failedRuntime.processor.cancel()
+                try? await failedRuntime.node.close()
+            } else if let failedStartingNode {
+                try? await failedStartingNode.close()
+            }
+
+            guard lifecycleEpoch.owns(currentGen), !Task.isCancelled else { return }
+            state = .error(error.localizedDescription)
         }
     }
 
@@ -208,7 +345,7 @@ final class TailscaleManager: ObservableObject {
             // Doing it in this order means by the time SessionsView reacts to
             // .connected, proxyConfig is already populated for SOCKS5.
             if let node = self.node {
-                let gen = generation
+                let gen = lifecycleEpoch.current
                 Task { [weak self] in
                     guard let self else { return }
                     do {
@@ -216,13 +353,13 @@ final class TailscaleManager: ObservableObject {
                         let parts = lb.address.split(separator: ":")
                         guard parts.count == 2, let port = Int(parts[1]) else {
                             await MainActor.run {
-                                guard self.generation == gen else { return }
+                                guard self.lifecycleEpoch.owns(gen) else { return }
                                 self.state = .error("Could not parse Tailscale loopback address: \(lb.address)")
                             }
                             return
                         }
                         await MainActor.run {
-                            guard self.generation == gen else { return }
+                            guard self.lifecycleEpoch.owns(gen) else { return }
                             self.proxyConfig = ProxyConfig(
                                 host: String(parts[0]),
                                 port: port,
@@ -236,7 +373,7 @@ final class TailscaleManager: ObservableObject {
                         }
                     } catch {
                         await MainActor.run {
-                            guard self.generation == gen else { return }
+                            guard self.lifecycleEpoch.owns(gen) else { return }
                             self.state = .error("Tailscale loopback failed: \(error.localizedDescription)")
                         }
                     }
@@ -245,38 +382,51 @@ final class TailscaleManager: ObservableObject {
         }
     }
 
-    // MARK: - Stop / reset
+    // MARK: - Stop / explicit sign-out
 
     func stop() {
         #if DEBUG
         print("[Tailscale] stop() called, current state=\(state)")
         #endif
-        generation += 1
-        let oldRuntime = runtime
-        runtime = nil
-        proxyConfig = nil
-        state = .stopped
-
-        Task {
-            oldRuntime?.processor.cancel()
-            try? await oldRuntime?.node.close()
-        }
+        schedule(.stop)
     }
 
-    /// Best-effort transport recovery for cases where the embedded loopback /
-    /// routing stack is stale after backgrounding, but the user should not
-    /// have to re-pair or re-auth. This intentionally preserves the existing
-    /// persisted Tailscale state dir.
-    func restart() {
-        stop()
-        start()
+    /// Destructive identity operation. This is deliberately named as a user
+    /// action, not as generic recovery: it waits for the old node to close,
+    /// then removes the persisted Tailscale identity and requires sign-in.
+    func signOutAndForgetIdentity() {
+        schedule(.signOutAndForgetIdentity)
     }
 
-    /// Hard reset — close node and delete the state dir to force re-auth on next start.
-    func resetState() {
-        stop()
-        try? FileManager.default.removeItem(atPath: stateDir)
-        try? FileManager.default.createDirectory(atPath: stateDir, withIntermediateDirectories: true)
+}
+
+/// Pure policy kept separate from the Tailscale framework so identity-deletion
+/// rules and lifecycle ownership can be unit tested without constructing a node.
+enum TailscaleLifecycleOperation: Equatable {
+    case start
+    case retryPreservingIdentity
+    case stop
+    case signOutAndForgetIdentity
+
+    var startsNodeAfterCleanup: Bool {
+        self == .start || self == .retryPreservingIdentity
+    }
+
+    var deletesPersistedIdentity: Bool {
+        self == .signOutAndForgetIdentity
+    }
+}
+
+struct TailscaleLifecycleEpoch {
+    private(set) var current: UInt64 = 0
+
+    mutating func begin() -> UInt64 {
+        current &+= 1
+        return current
+    }
+
+    func owns(_ token: UInt64) -> Bool {
+        current == token
     }
 }
 

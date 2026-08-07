@@ -351,6 +351,12 @@ private struct ToolbarButton: View {
                     }
                 }
         )
+        .onDisappear {
+            // A held repeating key can outlive its gesture when navigation or
+            // view replacement removes the toolbar. Always stop its Task so
+            // Alt-b / Alt-f cannot continue flooding the terminal off-screen.
+            resetTouchState()
+        }
     }
 
     private func resetTouchState() {
