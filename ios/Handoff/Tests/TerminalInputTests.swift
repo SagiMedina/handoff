@@ -320,6 +320,45 @@ final class TerminalScreenVisibilityTests: XCTestCase {
     }
 }
 
+final class TerminalAuthorizationTests: XCTestCase {
+    func testCachedAttachmentCannotCrossPermissionModes() {
+        XCTAssertTrue(
+            TerminalAccessMode.readWrite.isCompatible(withReadOnly: false)
+        )
+        XCTAssertTrue(
+            TerminalAccessMode.readOnly.isCompatible(withReadOnly: true)
+        )
+        XCTAssertFalse(
+            TerminalAccessMode.readWrite.isCompatible(withReadOnly: true),
+            "A permission downgrade must reattach through the gate with tmux -r"
+        )
+        XCTAssertFalse(
+            TerminalAccessMode.readOnly.isCompatible(withReadOnly: false),
+            "A permission upgrade also requires a fresh server-authorized attachment"
+        )
+    }
+
+    func testReadOnlyPresentationSuppressesUserInput() {
+        XCTAssertTrue(TerminalUserInputPolicy.shouldForward(isInputEnabled: true))
+        XCTAssertFalse(TerminalUserInputPolicy.shouldForward(isInputEnabled: false))
+    }
+
+    @MainActor
+    func testReadOnlyTerminalStillForwardsProtocolReplies() {
+        let terminalView = RemoteSwiftTermView(frame: .zero)
+        var forwarded = Data()
+        terminalView.onProtocolReply = { forwarded = $0 }
+
+        let reply = Array("\u{1B}[?1;2c".utf8)
+        terminalView.send(
+            source: terminalView.getTerminal(),
+            data: reply[...]
+        )
+
+        XCTAssertEqual(forwarded, Data(reply))
+    }
+}
+
 final class TerminalPresentationLifecycleTests: XCTestCase {
     func testCurrentVisibleChannelDeathSurfacesReconnectState() {
         let terminalID = UUID()

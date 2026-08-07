@@ -1,6 +1,68 @@
 import XCTest
 @testable import Handoff
 
+final class AppLockNavigationPolicyTests: XCTestCase {
+    func testBackgroundLockInvalidatesPushedRouteAndUnlockKeepsSafeRoot() {
+        var retainedRoutes: [ContentView.Route] = [
+            .terminal(session: "main", window: 0, readOnly: false)
+        ]
+        let background = AppLockNavigationPolicy.decision(
+            for: .enteredBackground,
+            isPaired: true,
+            appLockEnabled: true,
+            appLockAvailable: true
+        )
+
+        XCTAssertFalse(background.hasUnlockedAppFlow)
+        XCTAssertTrue(background.clearsNavigationPath)
+        if background.clearsNavigationPath {
+            retainedRoutes.removeAll()
+        }
+        XCTAssertTrue(retainedRoutes.isEmpty)
+
+        let unlock = AppLockNavigationPolicy.decision(
+            for: .authenticationSucceeded,
+            isPaired: true,
+            appLockEnabled: true,
+            appLockAvailable: true
+        )
+
+        XCTAssertTrue(unlock.hasUnlockedAppFlow)
+        XCTAssertFalse(unlock.clearsNavigationPath)
+        XCTAssertTrue(retainedRoutes.isEmpty)
+    }
+
+    func testBackgroundDoesNotDiscardNavigationWhenLockCannotBeEnforced() {
+        let unavailable = AppLockNavigationPolicy.decision(
+            for: .enteredBackground,
+            isPaired: true,
+            appLockEnabled: true,
+            appLockAvailable: false
+        )
+        let disabled = AppLockNavigationPolicy.decision(
+            for: .enteredBackground,
+            isPaired: true,
+            appLockEnabled: false,
+            appLockAvailable: true
+        )
+
+        XCTAssertFalse(unavailable.clearsNavigationPath)
+        XCTAssertFalse(disabled.clearsNavigationPath)
+    }
+
+    func testPairingChangeAlwaysInvalidatesPreviousPairingRoute() {
+        let decision = AppLockNavigationPolicy.decision(
+            for: .pairingChanged,
+            isPaired: false,
+            appLockEnabled: true,
+            appLockAvailable: true
+        )
+
+        XCTAssertFalse(decision.hasUnlockedAppFlow)
+        XCTAssertTrue(decision.clearsNavigationPath)
+    }
+}
+
 final class TailscaleLifecyclePolicyTests: XCTestCase {
     func testOnlyExplicitSignOutDeletesPersistedIdentity() {
         XCTAssertFalse(TailscaleLifecycleOperation.start.deletesPersistedIdentity)

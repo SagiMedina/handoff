@@ -24,6 +24,23 @@ struct TerminalScreenVisibility {
     }
 }
 
+/// The server-side access mode under which a retained tmux attachment was
+/// opened. A live socket is not sufficient for reuse: device permissions may
+/// have changed while the user was on the Sessions screen, and only a fresh
+/// gate attach can apply tmux's read-only flag.
+enum TerminalAccessMode: Equatable {
+    case readWrite
+    case readOnly
+
+    init(readOnly: Bool) {
+        self = readOnly ? .readOnly : .readWrite
+    }
+
+    func isCompatible(withReadOnly readOnly: Bool) -> Bool {
+        self == TerminalAccessMode(readOnly: readOnly)
+    }
+}
+
 /// Holds the currently active terminal connection outside of any view's lifecycle.
 /// This ensures navigating back to Sessions and returning to the same terminal
 /// doesn't tear down the SSH connection or lose the SwiftTerm buffer.
@@ -47,6 +64,7 @@ final class TerminalSessionStore: ObservableObject {
         let key: Key
         let sshManager: SSHManager
         let handler: TerminalChannelHandler
+        let accessMode: TerminalAccessMode
         /// SwiftTerm view kept alive across navigations to preserve buffer + scroll state.
         let terminalView: SwiftTerm.TerminalView
 
@@ -54,11 +72,13 @@ final class TerminalSessionStore: ObservableObject {
             key: Key,
             sshManager: SSHManager,
             handler: TerminalChannelHandler,
+            accessMode: TerminalAccessMode,
             terminalView: SwiftTerm.TerminalView
         ) {
             self.key = key
             self.sshManager = sshManager
             self.handler = handler
+            self.accessMode = accessMode
             self.terminalView = terminalView
         }
     }

@@ -4,6 +4,19 @@ private struct LicenseLibrary: Identifiable {
     let name: String
     let license: String
     let url: String
+    let bundledLicenseResource: String?
+
+    init(
+        name: String,
+        license: String,
+        url: String,
+        bundledLicenseResource: String? = nil
+    ) {
+        self.name = name
+        self.license = license
+        self.url = url
+        self.bundledLicenseResource = bundledLicenseResource
+    }
 
     var id: String { name }
 }
@@ -37,7 +50,8 @@ private let iosLibraries: [LicenseLibrary] = [
     .init(
         name: "MesloLGS Nerd Font Mono (Nerd Fonts)",
         license: "Apache 2.0",
-        url: "https://github.com/ryanoasis/nerd-fonts"
+        url: "https://github.com/ryanoasis/nerd-fonts",
+        bundledLicenseResource: "MesloLGSNerdFontMono-LICENSE"
     ),
 ]
 
@@ -67,6 +81,16 @@ struct LicensesView: View {
                                 .foregroundColor(Theme.primary)
                                 .multilineTextAlignment(.leading)
                         }
+
+                        if let resource = library.bundledLicenseResource {
+                            NavigationLink {
+                                BundledLicenseView(resourceName: resource)
+                            } label: {
+                                Text("View bundled license")
+                                    .font(.footnote.weight(.semibold))
+                                    .foregroundColor(Theme.primary)
+                            }
+                        }
                     }
                     .padding(16)
                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -82,6 +106,33 @@ struct LicensesView: View {
         }
         .background(Theme.background.ignoresSafeArea())
         .navigationTitle("Licenses")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+private struct BundledLicenseView: View {
+    let resourceName: String
+
+    private var licenseText: String {
+        guard let url = Bundle.main.url(
+            forResource: resourceName,
+            withExtension: "txt"
+        ), let text = try? String(contentsOf: url, encoding: .utf8) else {
+            return "The bundled license text could not be loaded."
+        }
+        return text
+    }
+
+    var body: some View {
+        ScrollView {
+            Text(licenseText)
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(Theme.textSecondary)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(20)
+        }
+        .background(Theme.background.ignoresSafeArea())
+        .navigationTitle("License")
         .navigationBarTitleDisplayMode(.inline)
     }
 }

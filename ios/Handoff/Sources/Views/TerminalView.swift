@@ -10,6 +10,25 @@ extension Notification.Name {
     )
 }
 
+/// Separates terminal-generated protocol replies from user input. SwiftTerm's
+/// base implementation forwards both through TerminalViewDelegate, which makes
+/// client-side read-only enforcement impossible. Protocol replies must always
+/// reach the PTY so DA/DSR and focus queries keep working; keyboard, paste, and
+/// gesture input remain subject to the presentation's access mode.
+final class RemoteSwiftTermView: SwiftTerm.TerminalView {
+    var onProtocolReply: ((Data) -> Void)?
+
+    override func send(source: Terminal, data: ArraySlice<UInt8>) {
+        onProtocolReply?(Data(data))
+    }
+}
+
+enum TerminalUserInputPolicy {
+    static func shouldForward(isInputEnabled: Bool) -> Bool {
+        isInputEnabled
+    }
+}
+
 /// Terminal screen: wraps SwiftTerm for tmux session display with SSH backing.
 /// Uses TerminalSessionStore so navigating back and returning preserves
 /// the SSH connection and SwiftTerm buffer state.
@@ -159,12 +178,16 @@ struct TerminalView: View {
             TerminalSessionStore.shared.terminalScreenDidAppear(screenVisibilityID)
             // Reuse existing terminal only if its SSH is still alive.
             // Stale connections (idle timeout, brief iOS suspend) need fresh reconnect.
-            if let existing = TerminalSessionStore.shared.get(key), existing.sshManager.isConnected {
+            if let existing = TerminalSessionStore.shared.get(key),
+               existing.sshManager.isConnected,
+               existing.accessMode.isCompatible(withReadOnly: readOnly) {
                 bindChannelClosure(for: existing)
                 activeTerminal = existing
                 isConnecting = false
             } else {
-                // Drop any stale terminal in the store before connecting fresh.
+                // Drop stale transports and attachments opened under a
+                // different permission mode. Reattaching through the gate is
+                // what applies a Mac-side read-only downgrade (tmux -r).
                 TerminalSessionStore.shared.close(key)
                 connectAndAttach()
             }
@@ -312,7 +335,7 @@ struct TerminalView: View {
                 }
 
                 // Create SwiftTerm view once per connection, keep it alive via the store
-                let termView = SwiftTerm.TerminalView(frame: .zero)
+                let termView = RemoteSwiftTermView(frame: .zero)
                 configureTerminalView(termView)
                 // Match the local emulator grid to the PTY before any remote data is fed.
                 // Layout-driven resizes can take over once the view is on screen.
@@ -325,8 +348,16 @@ struct TerminalView: View {
                     key: key,
                     sshManager: connectSSHManager,
                     handler: handler,
+                    accessMode: TerminalAccessMode(readOnly: readOnly),
                     terminalView: termView
                 )
+
+                // Terminal-generated DA/DSR/query replies are safe and
+                // required even for read-only attachments. They bypass the
+                // user-input delegate so that delegate can enforce read-only.
+                termView.onProtocolReply = { [weak handler] data in
+                    handler?.send(data)
+                }
 
                 // Wire SSH data into the terminal
                 handler.setOnDataReceived { [weak termView] data in
@@ -582,6 +613,7 @@ struct SwiftTermView: UIViewRepresentable {
     func updateUIView(_ uiView: SwiftTerm.TerminalView, context: Context) {
         context.coordinator.handler = terminal.handler
         context.coordinator.modifierState = modifierState
+        context.coordinator.isInputEnabled = isInputEnabled
         // Ctrl and Alt are native SwiftTerm one-shot modifiers. This lets both
         // software and hardware keyboard input flow through SwiftTerm's own
         // keyboard/IME/Kitty encoders. Sticky Shift is bridged only for Return.
@@ -592,13 +624,15 @@ struct SwiftTermView: UIViewRepresentable {
     func makeCoordinator() -> Coordinator {
         Coordinator(
             handler: terminal.handler,
-            modifierState: modifierState
+            modifierState: modifierState,
+            isInputEnabled: isInputEnabled
         )
     }
 
     class Coordinator: NSObject, SwiftTerm.TerminalViewDelegate, UIGestureRecognizerDelegate {
         var handler: TerminalChannelHandler
         var modifierState: ModifierState
+        var isInputEnabled: Bool
         private var resizeWorkItem: DispatchWorkItem?
         private var controlResetObserver: NSObjectProtocol?
         private var metaResetObserver: NSObjectProtocol?
@@ -611,9 +645,14 @@ struct SwiftTermView: UIViewRepresentable {
         private var scrollRemainder: CGFloat = 0
         private var lastTranslationY: CGFloat = 0
 
-        init(handler: TerminalChannelHandler, modifierState: ModifierState) {
+        init(
+            handler: TerminalChannelHandler,
+            modifierState: ModifierState,
+            isInputEnabled: Bool
+        ) {
             self.handler = handler
             self.modifierState = modifierState
+            self.isInputEnabled = isInputEnabled
         }
 
         deinit {
@@ -696,6 +735,9 @@ struct SwiftTermView: UIViewRepresentable {
         /// to SwiftTerm's own scroll view.
         private func doScroll(view: SwiftTerm.TerminalView, terminal: Terminal,
                               deltaRows: Int, at point: CGPoint, cellHeight: CGFloat) {
+            guard TerminalUserInputPolicy.shouldForward(isInputEnabled: isInputEnabled) else {
+                return
+            }
             let up = deltaRows > 0
             let count = min(abs(deltaRows), 40)   // guard against a runaway flick
             let mouseActive = terminal.mouseMode != .off
@@ -728,14 +770,13 @@ struct SwiftTermView: UIViewRepresentable {
         }
 
         func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
-            // SwiftTerm uses this delegate for both user input and terminal
-            // protocol replies (DA/DSR/query responses). Read-only authority
-            // lives in the gate's `tmux -r`; dropping this stream client-side
-            // can break remote full-screen applications.
-            //
-            // UIKit keyboard callbacks arrive on the main thread. PTY parsing
-            // can invoke protocol replies from the NIO event loop, so only
-            // consult the observable sticky modifier on the main thread.
+            // RemoteSwiftTermView routes terminal-generated protocol replies
+            // directly to the PTY. This delegate now represents only user
+            // input, so read-only can be enforced without breaking DA/DSR.
+            guard TerminalUserInputPolicy.shouldForward(isInputEnabled: isInputEnabled) else {
+                return
+            }
+
             let stickyShift = Thread.isMainThread && modifierState.shift
             let routed = RemoteTerminalInput.route(data, stickyShift: stickyShift)
             if routed.consumedShift {
