@@ -1,5 +1,67 @@
 import SwiftUI
 
+/// Monotonic request tokens used to keep cancelled session work from
+/// publishing into a newer connection attempt. Cancelling a Swift Task does
+/// not cancel an EventLoopFuture that it is awaiting, so cancellation alone is
+/// not a sufficient ownership check for SSH work.
+struct SessionsRequestEpoch {
+    private(set) var load: UInt64 = 0
+    private(set) var refresh: UInt64 = 0
+
+    mutating func beginLoad() -> UInt64 {
+        load &+= 1
+        // A full load owns the session list and supersedes any silent refresh.
+        refresh &+= 1
+        return load
+    }
+
+    mutating func beginRefresh() -> UInt64 {
+        refresh &+= 1
+        return refresh
+    }
+
+    mutating func invalidateAll() {
+        load &+= 1
+        refresh &+= 1
+    }
+
+    func ownsLoad(_ token: UInt64) -> Bool { load == token }
+    func ownsRefresh(_ token: UInt64) -> Bool { refresh == token }
+}
+
+/// Pure policy for recovering a failed Sessions discovery load. Recovery is
+/// deliberately limited to the discovery SSH connection: routine navigation
+/// must never restart the embedded Tailscale node (which can discard the
+/// working route and send the user through authentication again).
+struct SessionsLoadRetryPolicy {
+    enum Failure: Equatable {
+        case transport
+        case gate
+        case hostKeyMismatch
+    }
+
+    enum Attempt: Equatable {
+        case initial
+        case automaticRetry
+    }
+
+    enum Recovery: Equatable {
+        case retrySSH(backoffNanoseconds: UInt64)
+        case surfaceError
+
+        /// Kept explicit so tests protect the most important invariant of
+        /// routine Sessions recovery.
+        var restartsTailscaleTransport: Bool { false }
+    }
+
+    static func recovery(for failure: Failure, attempt: Attempt) -> Recovery {
+        guard failure == .transport, attempt == .initial else {
+            return .surfaceError
+        }
+        return .retrySSH(backoffNanoseconds: 650_000_000)
+    }
+}
+
 /// Displays tmux sessions and tabs from the remote Mac.
 /// Connects via SSH, discovers sessions, and allows navigation to terminal.
 struct SessionsView: View {
@@ -9,17 +71,86 @@ struct SessionsView: View {
 
     @StateObject private var sshManager = SSHManager()
     @State private var sessions: [TmuxSession] = []
+    @State private var softExpiredPrompt: GateError?
+    @State private var hostKeyMismatch: HostKeyMismatchError?
+
+    /// Read-only from the gate's `#permissions:` header. v1 pairings and any
+    /// pre-first-list state resolve to `false`, which is the safe default
+    /// because the gate server-side is still authoritative.
+    private var readOnly: Bool {
+        sshManager.devicePermissions?.readOnly ?? false
+    }
     @State private var isLoading = true
     @State private var errorMessage: String?
+    /// Separate surface for successful/neutral messages. errorMessage only
+    /// renders when sessions is empty, so it's the wrong place for, e.g., a
+    /// "renewal requested" confirmation that lands after the list has loaded.
+    @State private var noticeMessage: String?
     @State private var hasAutoConnected = false
     @State private var showSignOutConfirmation = false
+    @State private var showSettings = false
+    // Tracks a background→active transition so scenePhase can force a fresh
+    // SSH + SOCKS5 handshake on foreground, matching what TerminalView does.
+    @Environment(\.scenePhase) private var scenePhase
+    @State private var wasBackgrounded = false
+    /// Handle of the in-flight load Task so we can cancel it on
+    /// forceReload / scenePhase transitions. Swift Tasks survive iOS
+    /// backgrounding: without cancellation, a stale Task's catch block runs
+    /// on resume and rewrites `errorMessage` right after the scenePhase
+    /// handler cleared it, leaving the banner stuck.
+    @State private var loadTask: Task<Void, Never>?
+    /// Silent refresh runs outside the explicit reload path, so it needs its
+    /// own handle. Otherwise a stale pre-background refresh can finish after
+    /// foreground recovery starts and either overwrite the fresh list or
+    /// disconnect the newly re-established SSH session from its catch block.
+    @State private var refreshTask: Task<Void, Never>?
+    @State private var requestEpoch = SessionsRequestEpoch()
+    @State private var hasAppeared = false
 
     // New session dialog
     @State private var showNewSessionDialog = false
     @State private var newSessionName = ""
+    @State private var filterText = ""
+    @FocusState private var filterFieldFocused: Bool
 
     // Auto-refresh timer
     let refreshTimer = Timer.publish(every: 5, on: .main, in: .common).autoconnect()
+
+    private var totalWindows: Int {
+        sessions.reduce(0) { $0 + $1.windows.count }
+    }
+
+    private var matchCount: Int {
+        visibleSessions.reduce(0) { $0 + $1.windows.count }
+    }
+
+    private var visibleSessions: [TmuxSession] {
+        sessions.compactMap { session in
+            let filteredWindows = filterText.isEmpty
+                ? session.windows
+                : session.windows.filter { window in
+                    window.displayName.localizedCaseInsensitiveContains(filterText)
+                        || window.cwd.localizedCaseInsensitiveContains(filterText)
+                }
+
+            guard !filteredWindows.isEmpty else { return nil }
+
+            let sortedWindows = filteredWindows.sorted { lhs, rhs in
+                let lhsPinned = configStore.isWindowPinned(session: session.name, title: lhs.title)
+                let rhsPinned = configStore.isWindowPinned(session: session.name, title: rhs.title)
+                if lhsPinned != rhsPinned {
+                    return lhsPinned && !rhsPinned
+                }
+                return lhs.index < rhs.index
+            }
+
+            return TmuxSession(
+                name: session.name,
+                windowCount: session.windowCount,
+                windows: sortedWindows
+            )
+        }
+    }
 
     var body: some View {
         ZStack {
@@ -36,12 +167,8 @@ struct SessionsView: View {
                 errorView(error)
             } else {
                 VStack(spacing: 0) {
-                    connectedHeader
-                    if sessions.isEmpty {
-                        emptyView
-                    } else {
-                        sessionList
-                    }
+                    mainContent
+                    statusBar
                 }
             }
         }
@@ -50,14 +177,18 @@ struct SessionsView: View {
         .toolbar {
             ToolbarItem(placement: .navigationBarLeading) {
                 Button("Unpair") {
-                    sshManager.disconnect()
-                    TerminalSessionStore.shared.closeAll()
-                    configStore.unpair()
-                    path.removeLast(path.count)
+                    unpairDevice()
                 }
                 .foregroundColor(Theme.red)
             }
-            ToolbarItem(placement: .navigationBarTrailing) {
+            ToolbarItemGroup(placement: .navigationBarTrailing) {
+                Button {
+                    showSettings = true
+                } label: {
+                    Image(systemName: "gearshape")
+                }
+                .foregroundColor(Theme.primary)
+
                 if isLoading {
                     // Visible feedback that refresh is in flight
                     ProgressView()
@@ -65,7 +196,7 @@ struct SessionsView: View {
                         .tint(Theme.primary)
                 } else {
                     Button {
-                        loadSessions()
+                        forceReload()
                     } label: {
                         Image(systemName: "arrow.clockwise")
                     }
@@ -74,14 +205,58 @@ struct SessionsView: View {
             }
         }
         .onAppear {
-            loadSessions()
+            if hasAppeared {
+                // Sessions and Terminal deliberately use separate SSH
+                // managers. The Sessions manager is torn down while Terminal
+                // covers this view, so returning always establishes a fresh
+                // SOCKS + SSH connection instead of issuing `list` on a
+                // channel that iOS may already have retired.
+                forceReload()
+            } else {
+                hasAppeared = true
+                loadSessions()
+            }
         }
         .onDisappear {
+            // Terminal has its own retained SSH connection in
+            // TerminalSessionStore. Keeping this discovery connection alive
+            // as well only leaves an idle channel whose in-flight refresh can
+            // time out after Back and race the new load.
+            cancelInFlightRequests()
             sshManager.disconnect()
         }
         .onReceive(refreshTimer) { _ in
             if !isLoading {
                 silentRefresh()
+            }
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            switch newPhase {
+            case .background:
+                wasBackgrounded = true
+            case .active:
+                if wasBackgrounded {
+                    wasBackgrounded = false
+                    // Nil the stale error banner *before* forceReload's async
+                    // clear gets a chance to run. SwiftUI paints the
+                    // pre-background state on the first frame after resume,
+                    // so without this sync clear the user sees the old
+                    // "request timed out" banner flash before the reload
+                    // spinner takes over. Also reset sessions if the prior
+                    // load had failed into an empty state, so we show the
+                    // spinner instead of errorView.
+                    errorMessage = nil
+                    isLoading = true
+                    // Foreground recovery owns only the discovery SSH
+                    // connection. Restarting Tailscale here is a destructive
+                    // escalation: it can tear down an otherwise healthy node
+                    // and unexpectedly return the user to Tailscale login.
+                    cancelInFlightRequests()
+                    sshManager.disconnect()
+                    loadSessions(forceReconnect: true, warmUpBeforeConnect: true)
+                }
+            default:
+                break
             }
         }
         .alert("New Session", isPresented: $showNewSessionDialog) {
@@ -105,102 +280,311 @@ struct SessionsView: View {
         } message: {
             Text("You'll need to sign in again on next launch. Your Mac pairing stays intact.")
         }
+        .sheet(item: $sshManager.pendingTrust) { request in
+            HostKeyTrustPromptView(
+                request: request,
+                onTrust: { sshManager.approveTrust(request) },
+                onReject: { sshManager.rejectTrust(request) }
+            )
+        }
+        .fullScreenCover(item: $hostKeyMismatch) { mismatch in
+            HostKeyMismatchView(
+                error: mismatch,
+                onCancel: {
+                    hostKeyMismatch = nil
+                },
+                onResetTrust: {
+                    sshManager.resetTrust(forHost: mismatch.host)
+                    hostKeyMismatch = nil
+                    forceReload()
+                }
+            )
+        }
+        // Gate reports the device's soft expiry has passed. The only
+        // permitted gate command in this state is `renew`; we let the user
+        // send it and surface the Mac's confirmation.
+        .alert(
+            "Access expired",
+            isPresented: Binding(
+                get: { softExpiredPrompt != nil },
+                set: { if !$0 { softExpiredPrompt = nil } }
+            ),
+            presenting: softExpiredPrompt
+        ) { _ in
+            Button("Request renewal") { requestRenewal() }
+            Button("Cancel", role: .cancel) { softExpiredPrompt = nil }
+        } message: { gate in
+            Text(ErrorMessages.friendlyGate(gate))
+        }
+        // Neutral/success notices (e.g. "Renewal requested") — shown as an
+        // alert so they're visible regardless of whether the session list is
+        // loaded. errorMessage can't serve here because errorView only renders
+        // when sessions is empty.
+        .alert(
+            "Handoff",
+            isPresented: Binding(
+                get: { noticeMessage != nil },
+                set: { if !$0 { noticeMessage = nil } }
+            ),
+            presenting: noticeMessage
+        ) { _ in
+            Button("OK", role: .cancel) { noticeMessage = nil }
+        } message: { text in
+            Text(text)
+        }
+        .sheet(isPresented: $showSettings) {
+            SettingsView(
+                config: configStore.config ?? ConnectionConfig(ip: "", user: "", privateKey: "", tmuxPath: ""),
+                readOnly: readOnly,
+                onDone: { showSettings = false },
+                onSignOutOfTailscale: {
+                    showSettings = false
+                    signOutOfTailscale()
+                },
+                onUnpair: {
+                    showSettings = false
+                    unpairDevice()
+                }
+            )
+            .environmentObject(configStore)
+        }
+    }
+
+    private func requestRenewal() {
+        softExpiredPrompt = nil
+        Task {
+            do {
+                _ = try await sshManager.requestRenewal()
+                await MainActor.run {
+                    // Matches the canonical command the Mac prints — see
+                    // bin/handoff's top-level alias list.
+                    noticeMessage = "Renewal requested. Ask the Mac owner to approve with `handoff renew <name>`."
+                }
+            } catch {
+                await MainActor.run {
+                    errorMessage = ErrorMessages.friendlyAction("request renewal", error)
+                }
+            }
+        }
     }
 
     private func signOutOfTailscale() {
         // Close any open terminals before tearing down the network
+        loadTask?.cancel()
+        loadTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
         TerminalSessionStore.shared.closeAll()
         sshManager.disconnect()
-        // resetState() closes the Tailscale node and deletes the persisted state dir,
-        // so the next start() requires fresh browser sign-in.
-        tailscale.resetState()
+        // This explicit, confirmed sign-out is the only Sessions flow allowed
+        // to forget the persisted Tailscale identity.
+        tailscale.signOutAndForgetIdentity()
         // Pop back to root — ContentView will now show TailscaleAuthView since
         // tailscale.state == .stopped (Sessions screen is only reachable when .connected).
         path.removeLast(path.count)
     }
 
+    private func unpairDevice() {
+        loadTask?.cancel()
+        loadTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+        sshManager.disconnect()
+        TerminalSessionStore.shared.closeAll()
+        configStore.unpair()
+        path.removeLast(path.count)
+    }
+
     // MARK: - Subviews
 
-    /// "● Connected" indicator. Tap opens a Menu with the Tailscale IP and
-    /// Tailscale-scoped actions (Copy IP, Sign out of Tailscale).
-    /// Per designer: Tailscale-scoped actions cluster under the Tailscale status indicator,
-    /// keeping them separate from Unpair (which is SSH/pairing-scoped, top-left).
-    private var connectedHeader: some View {
+    private var mainContent: some View {
+        Group {
+            if sessions.isEmpty {
+                emptyView
+            } else {
+                sessionList
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private var statusBar: some View {
         let macIP = configStore.config?.ip ?? ""
-        return Menu {
-            Section {
+        let statusColor = readOnly ? Theme.primary : Theme.green
+        return HStack(spacing: 0) {
+            Text("●")
+                .foregroundColor(statusColor)
+                .font(.system(size: 9))
+                .padding(.trailing, 8)
+
+            Text(readOnly ? "read-only" : "connected")
+                .foregroundColor(statusColor)
+                .font(.system(size: 12, design: .monospaced))
+
+            separatorDot
+
+            Button {
+                UIPasteboard.general.string = macIP
+                UINotificationFeedbackGenerator().notificationOccurred(.success)
+            } label: {
                 Text(macIP)
-                    .font(.system(.body, design: .monospaced))
-                Button {
-                    UIPasteboard.general.string = macIP
-                    UINotificationFeedbackGenerator().notificationOccurred(.success)
-                } label: {
-                    Label("Copy IP", systemImage: "doc.on.doc")
-                }
+                    .foregroundColor(Theme.textSecondary)
+                    .font(.system(size: 12, design: .monospaced))
             }
-            Section {
-                Button(role: .destructive) {
-                    showSignOutConfirmation = true
-                } label: {
-                    Label("Sign out of Tailscale", systemImage: "person.crop.circle.badge.xmark")
+            .buttonStyle(.plain)
+            .disabled(macIP.isEmpty)
+
+            separatorDot
+
+            Text("\(totalWindows) \(totalWindows == 1 ? "tab" : "tabs")")
+                .foregroundColor(Theme.textSecondary)
+                .font(.system(size: 12, design: .monospaced))
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    guard totalWindows >= 6 else { return }
+                    filterFieldFocused = true
                 }
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Text("●")
-                    .foregroundColor(Theme.green)
-                    .font(.system(size: 10))
-                Text("Connected")
-                    .foregroundColor(Theme.green)
-                    .font(.system(size: 12))
+
+            if isLoading {
+                separatorDot
+                Text("syncing")
+                    .foregroundColor(Theme.textSecondary.opacity(0.75))
+                    .font(.system(size: 12, design: .monospaced))
                 Spacer()
             }
-            .padding(.horizontal, 16)
-            .padding(.vertical, 8)
-            .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
+        .padding(.horizontal, 16)
+        .padding(.vertical, 10)
+        .overlay(alignment: .top) {
+            Rectangle()
+                .fill(Color.white.opacity(0.06))
+                .frame(height: 1)
+        }
+    }
+
+    private var separatorDot: some View {
+        Text(" · ")
+            .foregroundColor(Theme.textSecondary.opacity(0.4))
+            .font(.system(size: 12, design: .monospaced))
     }
 
     private var sessionList: some View {
         ScrollView {
             LazyVStack(spacing: 12) {
-                ForEach(sessions) { session in
-                    SessionCard(
-                        session: session,
-                        onSelectWindow: { window in
-                            path.append(ContentView.Route.terminal(
-                                session: session.name,
-                                window: window.index
-                            ))
-                        },
-                        onNewWindow: {
-                            createNewWindow(in: session)
-                        },
-                        onKillSession: {
-                            killSession(session)
-                        },
-                        onKillWindow: { window in
-                            killWindow(window, in: session)
-                        }
-                    )
+                if totalWindows >= 6 {
+                    filterRow
                 }
 
-                // Subtle "+ new session" link at the bottom of the list
-                Button {
-                    newSessionName = ""
-                    showNewSessionDialog = true
-                } label: {
-                    Text("+ new session")
-                        .font(.system(size: 12))
-                        .foregroundColor(Theme.textSecondary.opacity(0.5))
-                        .frame(maxWidth: .infinity)
-                        .padding(.vertical, 12)
+                if visibleSessions.isEmpty {
+                    emptyFilterState
+                } else {
+                    ForEach(visibleSessions) { session in
+                        SessionCard(
+                            session: session,
+                            readOnly: readOnly,
+                            isWindowPinned: { window in
+                                configStore.isWindowPinned(session: session.name, title: window.title)
+                            },
+                            onToggleWindowPin: { window in
+                                configStore.togglePinnedWindow(session: session.name, title: window.title)
+                            },
+                            onSelectWindow: { window in
+                                path.append(ContentView.Route.terminal(
+                                    session: session.name,
+                                    window: window.index,
+                                    readOnly: readOnly
+                                ))
+                            },
+                            onNewWindow: {
+                                createNewWindow(in: session)
+                            },
+                            onKillSession: {
+                                killSession(session)
+                            },
+                            onKillWindow: { window in
+                                killWindow(window, in: session)
+                            }
+                        )
+                    }
                 }
-                .buttonStyle(.plain)
+
+                // Subtle "+ new session" — suppressed in read-only mode so
+                // the user doesn't see a visible mutation affordance the gate
+                // would reject server-side.
+                if !readOnly {
+                    Button {
+                        newSessionName = ""
+                        showNewSessionDialog = true
+                    } label: {
+                        Text("+ new session")
+                            .font(.system(size: 12))
+                            .foregroundColor(Theme.textSecondary.opacity(0.5))
+                            .frame(maxWidth: .infinity)
+                            .padding(.vertical, 12)
+                    }
+                    .buttonStyle(.plain)
+                }
             }
             .padding()
         }
+    }
+
+    private var filterRow: some View {
+        HStack(spacing: 0) {
+            Text("/")
+                .font(.system(size: 16, design: .monospaced))
+                .foregroundColor(Theme.primary.opacity(0.7))
+                .padding(.trailing, 10)
+
+            TextField("filter tabs by name or path", text: $filterText)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .foregroundColor(Theme.text)
+                .focused($filterFieldFocused)
+
+            if !filterText.isEmpty {
+                Text("\(matchCount)/\(totalWindows)")
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundColor(Theme.textSecondary)
+                    .padding(.horizontal, 10)
+
+                Button {
+                    filterText = ""
+                } label: {
+                    Text("×")
+                        .font(.system(size: 18, design: .monospaced))
+                        .foregroundColor(Theme.textSecondary)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .padding(.top, 8)
+        .padding(.bottom, 10)
+        .padding(.vertical, 6)
+        .overlay(alignment: .bottom) {
+            Rectangle()
+                .fill(Color.white.opacity(0.08))
+                .frame(height: 1)
+        }
+    }
+
+    private var emptyFilterState: some View {
+        VStack(spacing: 10) {
+            Text("No matching tabs")
+                .font(.system(size: 14, weight: .semibold))
+                .foregroundColor(Theme.text)
+            Text("Try a different title or working-directory filter.")
+                .font(.system(size: 12))
+                .foregroundColor(Theme.textSecondary)
+                .multilineTextAlignment(.center)
+            Button("Clear filter") {
+                filterText = ""
+            }
+            .font(.system(size: 12))
+            .foregroundColor(Theme.primary)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 32)
     }
 
     private var emptyView: some View {
@@ -212,15 +596,17 @@ struct SessionsView: View {
             Text("No tmux sessions on your Mac.")
                 .foregroundColor(Theme.textSecondary)
                 .multilineTextAlignment(.center)
-            Button {
-                newSessionName = ""
-                showNewSessionDialog = true
-            } label: {
-                Text("+ new session")
-                    .font(.system(size: 14, design: .monospaced))
-                    .foregroundColor(Theme.primary)
+            if !readOnly {
+                Button {
+                    newSessionName = ""
+                    showNewSessionDialog = true
+                } label: {
+                    Text("+ new session")
+                        .font(.system(size: 14, design: .monospaced))
+                        .foregroundColor(Theme.primary)
+                }
+                .padding(.top, 8)
             }
-            .padding(.top, 8)
             Spacer()
         }
         .padding()
@@ -237,7 +623,7 @@ struct SessionsView: View {
                 .multilineTextAlignment(.center)
                 .padding(.horizontal, 24)
             Button("Retry") {
-                loadSessions()
+                forceReload()
             }
             .foregroundColor(Theme.primary)
             .padding(.top, 8)
@@ -246,14 +632,70 @@ struct SessionsView: View {
 
     // MARK: - Data loading
 
-    private func loadSessions() {
+    /// User-initiated refresh. Always force a fresh SSH connection — the
+    /// existing one may look healthy (`parentChannel.isActive == true`) but
+    /// in reality be torn down by iOS after backgrounding, in which case the
+    /// next gate command hangs until the exec-level timeout.
+    ///
+    /// The cached list is intentionally retained while this runs, so Back can
+    /// return immediately to useful content while a fresh discovery SSH
+    /// connection catches up in the background.
+    private func forceReload() {
+        cancelInFlightRequests()
+        sshManager.disconnect()
+        loadSessions()
+    }
+
+    private func cancelInFlightRequests() {
+        requestEpoch.invalidateAll()
+        loadTask?.cancel()
+        loadTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+    }
+
+    private func loadSessions(
+        forceReconnect: Bool = false,
+        attempt: SessionsLoadRetryPolicy.Attempt = .initial,
+        warmUpBeforeConnect: Bool = false
+    ) {
         guard let config = configStore.config else { return }
+
+        // Defensively cancel any previous in-flight load so its catch block
+        // can't race with this one and rewrite `errorMessage` on a dead
+        // connection.
+        loadTask?.cancel()
+        refreshTask?.cancel()
+        refreshTask = nil
+        let requestToken = requestEpoch.beginLoad()
+
+        if forceReconnect {
+            sshManager.disconnect()
+        }
 
         isLoading = true
         errorMessage = nil
 
-        Task {
+        loadTask = Task {
+            defer {
+                Task { @MainActor in
+                    guard requestEpoch.ownsLoad(requestToken) else { return }
+                    loadTask = nil
+                }
+            }
             do {
+                // Pre-connect breathing room when we're in foreground
+                // recovery (either the first attempt or the one retry).
+                // tsnet's routing takes a beat to wake, and connecting too
+                // early produces either a hang (exec timeout) or a socket
+                // teardown ("network connection was lost") depending on
+                // how long we were backgrounded. The retry preserves this
+                // flag so both foreground attempts receive the warmup.
+                if warmUpBeforeConnect {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    try Task.checkCancellation()
+                }
+
                 if !sshManager.isConnected {
                     // Embedded Tailscale mode: never SSH without a proxy config.
                     // Direct-dialing the Tailscale IP would fail (no system VPN).
@@ -268,8 +710,10 @@ struct SessionsView: View {
                     )
                     try await sshManager.connect(config: config, proxy: proxy)
                 }
+                try Task.checkCancellation()
 
                 var discoveredSessions = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
+                try Task.checkCancellation()
 
                 for i in discoveredSessions.indices {
                     let windows = try await sshManager.listWindows(
@@ -278,11 +722,13 @@ struct SessionsView: View {
                     )
                     discoveredSessions[i].windows = windows
                 }
+                try Task.checkCancellation()
 
                 await MainActor.run {
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsLoad(requestToken) else { return }
                     sessions = discoveredSessions
                     isLoading = false
-
                     if !hasAutoConnected,
                        discoveredSessions.count == 1,
                        discoveredSessions[0].windows.count == 1 {
@@ -291,37 +737,129 @@ struct SessionsView: View {
                         let window = session.windows[0]
                         path.append(ContentView.Route.terminal(
                             session: session.name,
-                            window: window.index
+                            window: window.index,
+                            readOnly: readOnly
                         ))
                     }
                 }
-            } catch {
+            } catch is CancellationError {
+                // Superseded by a newer reload. Don't touch UI state — the
+                // newer Task owns it now.
+                return
+            } catch let mismatch as HostKeyMismatchError {
                 await MainActor.run {
-                    errorMessage = error.localizedDescription
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsLoad(requestToken) else { return }
+                    hostKeyMismatch = mismatch
+                    errorMessage = nil
                     isLoading = false
+                }
+            } catch let gate as GateError {
+                // Lifecycle errors get dedicated recovery surfaces. For
+                // everything else we show the friendly copy inline. Gate
+                // errors are structured protocol responses — not a transport
+                // hiccup — so the resume-retry path doesn't apply here.
+                await MainActor.run {
+                    // Cancelled tasks mustn't mutate state — they've been
+                    // superseded by a newer reload whose writes we'd clobber.
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsLoad(requestToken) else { return }
+                    isLoading = false
+                    switch gate.code {
+                    case .softExpired:
+                        softExpiredPrompt = gate
+                        errorMessage = nil
+                    case .notFound:
+                        // Mac has no record of this device — strongest hint
+                        // is to unpair so the user can re-scan.
+                        errorMessage = ErrorMessages.friendlyGate(gate)
+                    default:
+                        errorMessage = ErrorMessages.friendlyGate(gate)
+                    }
+                }
+            } catch {
+                guard !Task.isCancelled else { return }
+                #if DEBUG
+                print("[SessionsView] loadSessions threw: \(type(of: error)) — \(error.localizedDescription)")
+                #endif
+                switch SessionsLoadRetryPolicy.recovery(for: .transport, attempt: attempt) {
+                case .retrySSH(let backoffNanoseconds):
+                    // Ownership check and disconnect are one MainActor turn:
+                    // stale failures cannot tear down a newer discovery SSH
+                    // connection after Back/Retry starts another full load.
+                    let ownsFailedAttempt = await MainActor.run { () -> Bool in
+                        guard !Task.isCancelled,
+                              requestEpoch.ownsLoad(requestToken) else { return false }
+                        sshManager.disconnect()
+                        return true
+                    }
+                    guard ownsFailedAttempt else { return }
+
+                    try? await Task.sleep(nanoseconds: backoffNanoseconds)
+                    guard !Task.isCancelled else { return }
+                    await MainActor.run {
+                        guard requestEpoch.ownsLoad(requestToken) else { return }
+                        loadSessions(
+                            forceReconnect: true,
+                            attempt: .automaticRetry,
+                            warmUpBeforeConnect: warmUpBeforeConnect
+                        )
+                    }
+
+                case .surfaceError:
+                    await MainActor.run {
+                        guard !Task.isCancelled,
+                              requestEpoch.ownsLoad(requestToken) else { return }
+                        errorMessage = ErrorMessages.friendlyConnection(error)
+                        isLoading = false
+                    }
                 }
             }
         }
     }
 
     private func silentRefresh() {
-        guard let config = configStore.config, sshManager.isConnected else { return }
+        guard refreshTask == nil,
+              let config = configStore.config,
+              sshManager.isConnected else { return }
 
-        Task {
+        let requestToken = requestEpoch.beginRefresh()
+        refreshTask = Task {
+            defer {
+                Task { @MainActor in
+                    guard requestEpoch.ownsRefresh(requestToken) else { return }
+                    refreshTask = nil
+                }
+            }
             do {
                 var discoveredSessions = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
+                try Task.checkCancellation()
                 for i in discoveredSessions.indices {
                     let windows = try await sshManager.listWindows(
                         tmuxPath: config.tmuxPath,
                         session: discoveredSessions[i].name
                     )
                     discoveredSessions[i].windows = windows
+                    try Task.checkCancellation()
                 }
                 await MainActor.run {
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsRefresh(requestToken) else { return }
                     sessions = discoveredSessions
                 }
+            } catch is CancellationError {
+                return
             } catch {
-                // Silently ignore errors during auto-refresh
+                if Task.isCancelled { return }
+                // Silently ignore errors during auto-refresh, but tear down
+                // the zombie channel so the next user-initiated load or
+                // scenePhase bump reconnects cleanly instead of hitting the
+                // exec timeout again.
+                await MainActor.run {
+                    guard !Task.isCancelled,
+                          requestEpoch.ownsRefresh(requestToken) else { return }
+                    sshManager.disconnect()
+                }
             }
         }
     }
@@ -342,7 +880,7 @@ struct SessionsView: View {
                 try await sshManager.createSession(tmuxPath: config.tmuxPath, name: name)
                 loadSessions()
             } catch {
-                errorMessage = error.localizedDescription
+                errorMessage = ErrorMessages.friendlyAction("create session", error)
             }
         }
     }
@@ -359,11 +897,12 @@ struct SessionsView: View {
                 await MainActor.run {
                     path.append(ContentView.Route.terminal(
                         session: session.name,
-                        window: windowIndex
+                        window: windowIndex,
+                        readOnly: readOnly
                     ))
                 }
             } catch {
-                errorMessage = "Failed to create tab: \(error.localizedDescription)"
+                errorMessage = ErrorMessages.friendlyAction("create tab", error)
             }
         }
     }
@@ -381,7 +920,7 @@ struct SessionsView: View {
                 try await sshManager.killSession(tmuxPath: config.tmuxPath, name: session.name)
                 loadSessions()
             } catch {
-                errorMessage = error.localizedDescription
+                errorMessage = ErrorMessages.friendlyAction("kill session", error)
             }
         }
     }
@@ -401,7 +940,7 @@ struct SessionsView: View {
                 )
                 loadSessions()
             } catch {
-                errorMessage = "Failed to kill tab: \(error.localizedDescription)"
+                errorMessage = ErrorMessages.friendlyAction("kill tab", error)
             }
         }
     }
