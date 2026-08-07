@@ -64,16 +64,16 @@ struct ContentView: View {
             }
         }
         .preferredColorScheme(.dark)
-        .onChange(of: configStore.isPaired) { isPaired in
+        .onChange(of: configStore.isPaired) { _, isPaired in
             hasUnlockedAppFlow = false
             if isPaired && tailscale.state == .stopped {
                 tailscale.start()
             }
         }
-        .onChange(of: configStore.appLockEnabled) { _ in
+        .onChange(of: configStore.appLockEnabled) {
             hasUnlockedAppFlow = false
         }
-        .onChange(of: scenePhase) { phase in
+        .onChange(of: scenePhase) { _, phase in
             switch phase {
             case .background:
                 hasUnlockedAppFlow = false

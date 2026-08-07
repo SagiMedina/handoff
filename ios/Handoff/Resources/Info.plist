@@ -20,11 +20,18 @@
     <dict/>
     <key>UIRequiredDeviceCapabilities</key>
     <array>
-        <string>armv7</string>
+        <string>arm64</string>
     </array>
     <key>UISupportedInterfaceOrientations</key>
     <array>
         <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationLandscapeLeft</string>
+        <string>UIInterfaceOrientationLandscapeRight</string>
+    </array>
+    <key>UISupportedInterfaceOrientations~ipad</key>
+    <array>
+        <string>UIInterfaceOrientationPortrait</string>
+        <string>UIInterfaceOrientationPortraitUpsideDown</string>
         <string>UIInterfaceOrientationLandscapeLeft</string>
         <string>UIInterfaceOrientationLandscapeRight</string>
     </array>
@@ -34,7 +41,7 @@
     <string>Handoff uses Face ID to unlock access to your paired sessions.</string>
     <key>UIApplicationSupportsIndirectInputEvents</key>
     <true/>
-    <key>UIFonts provided by application</key>
+    <key>UIAppFonts</key>
     <array>
         <string>JetBrainsMono-Regular.ttf</string>
     </array>

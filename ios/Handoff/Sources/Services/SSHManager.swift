@@ -178,7 +178,11 @@ final class SSHManager: ObservableObject {
         // would block indefinitely — we want it to surface as an error that
         // triggers a reconnect. The scheduled task runs on the SSH event
         // loop, same rationale as executeCommand's timeout.
-        let authTimeout = channel.eventLoop.scheduleTask(in: .seconds(15)) {
+        // Keep this longer than the 60-second first-trust prompt. The socket
+        // itself still has the independent 15-second ClientBootstrap timeout
+        // above, so an unreachable host fails quickly while a person reading
+        // and approving the fingerprint gets the full trust window.
+        let authTimeout = channel.eventLoop.scheduleTask(in: .seconds(75)) {
             authSuccessPromise.fail(SSHError.commandFailed("SSH authentication timed out"))
         }
         authSuccessPromise.futureResult.whenComplete { _ in
@@ -381,7 +385,8 @@ final class SSHManager: ObservableObject {
         guard protocolVersion >= 2 else {
             throw SSHError.commandFailed("pair is only available on v2 pairings")
         }
-        let output = try await executeCommand("pair \(deviceName)")
+        let safeDeviceName = PairingDeviceName.sanitize(deviceName)
+        let output = try await executeCommand("pair \(safeDeviceName)")
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
         try throwIfGateError(trimmed)
         return trimmed
@@ -734,6 +739,50 @@ final class SSHManager: ObservableObject {
 
     deinit {
         disconnect()
+    }
+}
+
+/// Normalizes user-controlled `UIDevice.name` values before they enter the
+/// gate command. Device names are display-only, so a deliberately small ASCII
+/// alphabet avoids command separators, quotes, escapes, and control characters
+/// while preserving ordinary names such as "Omri iPhone-15".
+enum PairingDeviceName {
+    static let maximumLength = 48
+    static let fallback = "iPhone"
+
+    static func sanitize(_ rawValue: String) -> String {
+        let folded = rawValue.folding(
+            options: [.diacriticInsensitive, .widthInsensitive],
+            locale: Locale(identifier: "en_US_POSIX")
+        )
+        let allowedPunctuation: Set<UnicodeScalar> = [" ", "-", "_", "."]
+        var result = ""
+        var pendingSeparator = false
+
+        for scalar in folded.unicodeScalars {
+            let isASCIIAlphaNumeric = scalar.isASCII
+                && ((scalar.value >= 48 && scalar.value <= 57)
+                    || (scalar.value >= 65 && scalar.value <= 90)
+                    || (scalar.value >= 97 && scalar.value <= 122))
+
+            if isASCIIAlphaNumeric || allowedPunctuation.contains(scalar) {
+                if pendingSeparator, !result.isEmpty, result.last != " " {
+                    result.append(" ")
+                }
+                pendingSeparator = false
+                result.unicodeScalars.append(scalar)
+            } else {
+                pendingSeparator = true
+            }
+
+            if result.count >= maximumLength {
+                break
+            }
+        }
+
+        let bounded = String(result.prefix(maximumLength))
+            .trimmingCharacters(in: CharacterSet(charactersIn: " ._-"))
+        return bounded.isEmpty ? fallback : bounded
     }
 }
 

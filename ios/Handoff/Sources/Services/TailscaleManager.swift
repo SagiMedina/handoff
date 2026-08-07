@@ -258,7 +258,7 @@ final class TailscaleManager: ObservableObject {
         state = .stopped
 
         Task {
-            await oldRuntime?.processor.cancel()
+            oldRuntime?.processor.cancel()
             try? await oldRuntime?.node.close()
         }
     }

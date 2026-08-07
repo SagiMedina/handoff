@@ -7,7 +7,7 @@ iOS companion app for [Handoff](../README.md) — continue your Mac terminal ses
 - macOS with **Xcode 16.1+**
 - **Go** (https://go.dev/dl/) — needed to build TailscaleKit (libtailscale's Swift framework)
 - [XcodeGen](https://github.com/yonaskolb/XcodeGen): `brew install xcodegen`
-- iOS 16.0+ deployment target
+- iOS 18.1+ deployment target (required by the pinned TailscaleKit build)
 - An Apple ID (free personal team works for development; paid for App Store distribution)
 
 ## Setup

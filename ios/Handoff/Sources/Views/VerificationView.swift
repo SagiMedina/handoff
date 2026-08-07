@@ -15,7 +15,8 @@ import UIKit
 ///    SSH auth failure the Mac deleted the device (rejected or revoked).
 ///
 /// On success we mark the config as verified and let ContentView route to
-/// Sessions. On failure we unpair so the user can re-scan cleanly.
+/// Sessions. On failure we preserve the pending config so a late Mac approval
+/// or transient network problem can be retried without scanning again.
 struct VerificationView: View {
     @EnvironmentObject var configStore: ConfigStore
     var tailscale: TailscaleManager
@@ -67,7 +68,8 @@ struct VerificationView: View {
                 error: mismatch,
                 onCancel: {
                     hostKeyMismatch = nil
-                    configStore.unpair()
+                    errorMessage = mismatch.localizedDescription
+                    phase = .failed
                 },
                 onResetTrust: {
                     sshManager.resetTrust(forHost: mismatch.host)
@@ -134,11 +136,16 @@ struct VerificationView: View {
             Text(errorMessage ?? "Pairing failed.")
                 .foregroundColor(Theme.textSecondary)
                 .multilineTextAlignment(.center)
-            Button("Unpair and try again") {
-                configStore.unpair()
+            Button("Retry") {
+                runFlow()
             }
             .buttonStyle(.borderedProminent)
             .tint(Theme.primary)
+
+            Button("Unpair and scan again", role: .destructive) {
+                configStore.unpair()
+            }
+            .buttonStyle(.bordered)
         }
     }
 
@@ -185,7 +192,7 @@ struct VerificationView: View {
     }
 
     private func verify(config: ConnectionConfig) async throws {
-        await setStatus("Starting secure connection…")
+        setStatus("Starting secure connection…")
         guard let proxyConfig = tailscale.proxyConfig else {
             throw VerificationError.noProxy
         }
@@ -198,13 +205,13 @@ struct VerificationView: View {
 
         try await sshManager.connect(config: config, proxy: proxy)
 
-        await setStatus("Verifying with Mac…")
+        setStatus("Verifying with Mac…")
 
         // List-first: if the device is already active, skip pairing entirely.
         do {
             _ = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
             try Task.checkCancellation()
-            await finish()
+            finish()
             return
         } catch let err as GateError where err.code == .pending {
             // Fall through to the pair handshake.
@@ -240,7 +247,7 @@ struct VerificationView: View {
                 try Task.checkCancellation()
                 _ = try await sshManager.listSessions(tmuxPath: config.tmuxPath)
                 try Task.checkCancellation()
-                await finish()
+                finish()
                 return
             } catch is CancellationError {
                 return
@@ -295,9 +302,9 @@ private enum VerificationError: LocalizedError {
         case .unexpectedResponse(let raw):
             return "Unexpected response from Mac: \(raw)"
         case .rejectedOnMac:
-            return "Pairing was rejected on the Mac. Run `handoff pair` again."
+            return "Pairing was rejected on the Mac. Retry if approval may have raced; otherwise unpair and scan a new code."
         case .timedOut:
-            return "Pairing timed out. Try again from your Mac."
+            return "Pairing timed out. If the Mac approved it late, tap Retry to check again."
         }
     }
 }

@@ -117,7 +117,7 @@ struct TailscaleAuthView: View {
             SafariView(url: url)
                 .ignoresSafeArea()
         }
-        .onChange(of: tailscale.state) { newState in
+        .onChange(of: tailscale.state) { _, newState in
             // Auto-dismiss the Safari sheet once Tailscale has connected.
             if case .connected = newState, safariURL != nil {
                 safariURL = nil

@@ -6,6 +6,9 @@ import UIKit
 /// Uses TerminalSessionStore so navigating back and returning preserves
 /// the SSH connection and SwiftTerm buffer state.
 struct TerminalView: View {
+    private static let initialTerminalColumns = 80
+    private static let initialTerminalRows = 24
+
     let sessionName: String
     let windowIndex: Int
     let readOnly: Bool
@@ -65,12 +68,26 @@ struct TerminalView: View {
                         modifierState: modifiers,
                         isInputEnabled: !readOnly
                     )
-                        .ignoresSafeArea(.keyboard)
 
                     if !readOnly {
-                        MobileToolbar(modifiers: modifiers) { keyData in
-                            terminal.handler.send(keyData)
-                        }
+                        MobileToolbar(
+                            modifiers: modifiers,
+                            applicationCursorMode: {
+                                terminal.terminalView.getTerminal().applicationCursor
+                            },
+                            onKey: { keyData in
+                                let bytes = Array(keyData)
+                                terminal.terminalView.send(data: bytes[...])
+                            },
+                            onPaste: {
+                                // SwiftTerm wraps this in bracketed-paste markers when
+                                // requested by the remote application.
+                                terminal.terminalView.paste(nil)
+                            },
+                            onDismissKeyboard: {
+                                _ = terminal.terminalView.resignFirstResponder()
+                            }
+                        )
                     }
                 }
             }
@@ -112,7 +129,7 @@ struct TerminalView: View {
         }
         // NOTE: no onDisappear disconnect — the connection persists in the store
         // so navigating back to Sessions preserves terminal state.
-        .onChange(of: scenePhase) { newPhase in
+        .onChange(of: scenePhase) { _, newPhase in
             switch newPhase {
             case .background:
                 wasBackgrounded = true
@@ -125,7 +142,7 @@ struct TerminalView: View {
                 break
             }
         }
-        .onChange(of: tailscale.state) { newState in
+        .onChange(of: tailscale.state) { _, newState in
             guard awaitingTransportRecovery else { return }
             switch newState {
             case .connected:
@@ -139,7 +156,7 @@ struct TerminalView: View {
                 break
             }
         }
-        .onChange(of: configStore.terminalFontSize) { _ in
+        .onChange(of: configStore.terminalFontSize) {
             applyConfiguredFontToActiveTerminal()
         }
     }
@@ -220,14 +237,20 @@ struct TerminalView: View {
                     tmuxPath: config.tmuxPath,
                     session: sessionName,
                     window: windowIndex,
-                    cols: 80,
-                    rows: 24
+                    cols: Self.initialTerminalColumns,
+                    rows: Self.initialTerminalRows
                 )
                 try Task.checkCancellation()
 
                 // Create SwiftTerm view once per connection, keep it alive via the store
                 let termView = SwiftTerm.TerminalView(frame: .zero)
                 configureTerminalView(termView)
+                // Match the local emulator grid to the PTY before any remote data is fed.
+                // Layout-driven resizes can take over once the view is on screen.
+                termView.resize(
+                    cols: Self.initialTerminalColumns,
+                    rows: Self.initialTerminalRows
+                )
 
                 let terminal = TerminalSessionStore.ActiveTerminal(
                     key: key,
@@ -296,6 +319,14 @@ struct TerminalView: View {
         applyConfiguredFont(to: termView)
         termView.nativeBackgroundColor = UIColor(Theme.background)
         termView.nativeForegroundColor = UIColor(Theme.text)
+        termView.caretColor = UIColor(Theme.primary)
+        termView.caretTextColor = UIColor(Theme.background)
+        termView.caretViewTracksFocus = false
+        // Set a deliberate initial style. Remote applications can still replace it
+        // later via the normal terminal cursor-style escape sequences.
+        termView.getTerminal().setCursorStyle(.steadyBlock)
+        // Handoff supplies its own keyboard-safe mobile toolbar below the terminal.
+        termView.inputAccessoryView = nil
         // Hand scrolling over to our own one-finger pan (see SwiftTermView).
         // SwiftTerm otherwise turns a one-finger pan into a mouse *drag* whenever
         // the remote app has mouse tracking on (tmux `mouse on`), which tmux reads
@@ -315,7 +346,14 @@ struct TerminalView: View {
 
     private func applyConfiguredFont(to termView: SwiftTerm.TerminalView) {
         let fontSize = CGFloat(configStore.terminalFontSize)
-        if let font = UIFont(name: "JetBrainsMono-Regular", size: fontSize) {
+        let bundledFont = UIFont(name: "JetBrainsMono-Regular", size: fontSize)
+#if DEBUG
+        assert(bundledFont != nil, "JetBrains Mono failed to load; verify UIAppFonts in Info.plist")
+        if let bundledFont {
+            print("Handoff terminal font loaded: \(bundledFont.fontName)")
+        }
+#endif
+        if let font = bundledFont {
             termView.font = font
         } else {
             termView.font = UIFont.monospacedSystemFont(ofSize: fontSize, weight: .regular)
@@ -342,6 +380,9 @@ struct SwiftTermView: UIViewRepresentable {
         let termView = terminal.terminalView
         termView.terminalDelegate = context.coordinator
         context.coordinator.installScrollGesture(on: termView)
+        context.coordinator.installModifierResetObservers(on: termView)
+        termView.controlModifier = isInputEnabled && modifierState.ctrl
+        termView.metaModifier = isInputEnabled && modifierState.alt
         return termView
     }
 
@@ -349,6 +390,11 @@ struct SwiftTermView: UIViewRepresentable {
         context.coordinator.handler = terminal.handler
         context.coordinator.modifierState = modifierState
         context.coordinator.isInputEnabled = isInputEnabled
+        // Ctrl and Alt are native SwiftTerm one-shot modifiers. This lets both
+        // software and hardware keyboard input flow through SwiftTerm's own
+        // keyboard/IME/Kitty protocol encoders. Shift remains toolbar-only.
+        uiView.controlModifier = isInputEnabled && modifierState.ctrl
+        uiView.metaModifier = isInputEnabled && modifierState.alt
     }
 
     func makeCoordinator() -> Coordinator {
@@ -364,6 +410,8 @@ struct SwiftTermView: UIViewRepresentable {
         var modifierState: ModifierState
         var isInputEnabled: Bool
         private var resizeWorkItem: DispatchWorkItem?
+        private var controlResetObserver: NSObjectProtocol?
+        private var metaResetObserver: NSObjectProtocol?
 
         // One-finger scroll → tmux scrollback. Mirrors Android's Termux `doScroll`:
         // accumulate pixel drag, convert to whole rows by cell height (keeping the
@@ -377,6 +425,41 @@ struct SwiftTermView: UIViewRepresentable {
             self.handler = handler
             self.modifierState = modifierState
             self.isInputEnabled = isInputEnabled
+        }
+
+        deinit {
+            if let controlResetObserver {
+                NotificationCenter.default.removeObserver(controlResetObserver)
+            }
+            if let metaResetObserver {
+                NotificationCenter.default.removeObserver(metaResetObserver)
+            }
+        }
+
+        /// SwiftTerm consumes its native one-shot modifiers internally. Mirror
+        /// those resets back to the toolbar so highlighted keys never get stuck.
+        func installModifierResetObservers(on view: SwiftTerm.TerminalView) {
+            if let controlResetObserver {
+                NotificationCenter.default.removeObserver(controlResetObserver)
+            }
+            if let metaResetObserver {
+                NotificationCenter.default.removeObserver(metaResetObserver)
+            }
+
+            controlResetObserver = NotificationCenter.default.addObserver(
+                forName: .terminalViewControlModifierReset,
+                object: view,
+                queue: .main
+            ) { [weak self] _ in
+                self?.modifierState.ctrl = false
+            }
+            metaResetObserver = NotificationCenter.default.addObserver(
+                forName: .terminalViewMetaModifierReset,
+                object: view,
+                queue: .main
+            ) { [weak self] _ in
+                self?.modifierState.alt = false
+            }
         }
 
         /// Attach (or re-attach, after a view re-creation) the one-finger scroll pan.
@@ -457,11 +540,9 @@ struct SwiftTermView: UIViewRepresentable {
 
         func send(source: SwiftTerm.TerminalView, data: ArraySlice<UInt8>) {
             guard isInputEnabled else { return }
-            let bytes = TerminalModifierCodec.applyModifiers(
-                to: Array(data),
-                using: modifierState
-            )
-            handler.send(Data(bytes))
+            // SwiftTerm owns native keyboard/IME/paste/protocol-reply encoding.
+            // Only the dedicated mobile toolbar applies Handoff modifiers.
+            handler.send(Data(data))
         }
 
         func sizeChanged(source: SwiftTerm.TerminalView, newCols: Int, newRows: Int) {
