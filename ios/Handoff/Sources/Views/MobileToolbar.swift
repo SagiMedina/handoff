@@ -7,7 +7,7 @@ final class ModifierState: ObservableObject {
     /// Shift from the software and hardware keyboards.
     @Published var shift = false
 
-    func consume(includeShift: Bool = true) -> TerminalInputModifiers {
+    func consume() -> TerminalInputModifiers {
         var result: TerminalInputModifiers = []
         if ctrl {
             result.insert(.control)
@@ -17,7 +17,7 @@ final class ModifierState: ObservableObject {
             result.insert(.alt)
             alt = false
         }
-        if includeShift, shift {
+        if shift {
             result.insert(.shift)
             shift = false
         }
@@ -52,6 +52,7 @@ enum TerminalInputKey: Equatable {
     case wordRight
     case slash
     case dash
+    case pipe
 }
 
 /// Pure, deterministic xterm encoder for toolbar actions.
@@ -79,13 +80,12 @@ enum TerminalInputEncoder {
         case .pageDown:
             return tildeKey(number: 6, modifiers: modifiers)
         case .tab:
-            if modifiers == [.shift] {
-                return [0x1B, 0x5B, 0x5A]
-            }
-            if !modifiers.isEmpty {
-                return csi("1;\(xtermModifierParameter(modifiers))I")
-            }
-            return [0x09]
+            // Termux treats Shift+Tab as back-tab, ignores Ctrl for Tab, and
+            // applies Alt as the usual ESC prefix.
+            let bytes: [UInt8] = modifiers.contains(.shift)
+                ? [0x1B, 0x5B, 0x5A]
+                : [0x09]
+            return modifiers.contains(.alt) ? [0x1B] + bytes : bytes
         case .enter:
             let byte: UInt8 = modifiers.contains(.shift) ? 0x0A : 0x0D
             return modifiers.contains(.alt) ? [0x1B, byte] : [byte]
@@ -101,6 +101,8 @@ enum TerminalInputEncoder {
             return character(normal: 0x2F, shifted: 0x3F, modifiers: modifiers)
         case .dash:
             return character(normal: 0x2D, shifted: 0x5F, modifiers: modifiers)
+        case .pipe:
+            return [0x7C]
         }
     }
 
@@ -180,6 +182,20 @@ enum TerminalToolbarActionID: String, CaseIterable {
     case enter
 }
 
+/// The first seven entries in each row are the Android extra-key surface in
+/// the same order. iOS-native utilities are appended so the shared muscle
+/// memory stays intact without hiding paste or keyboard dismissal.
+enum TerminalToolbarLayout {
+    static let androidCoreRow1: [TerminalToolbarActionID] = [
+        .escape, .slash, .dash, .home, .up, .end, .shift,
+    ]
+    static let androidCoreRow2: [TerminalToolbarActionID] = [
+        .tab, .control, .alt, .left, .down, .right, .enter,
+    ]
+    static let row1 = androidCoreRow1 + [.paste]
+    static let row2 = androidCoreRow2 + [.dismissKeyboard]
+}
+
 /// Two-row toolbar of extra keys for terminal use on mobile.
 /// Mirrors the Android key surface closely so muscle memory carries over.
 struct MobileToolbar: View {
@@ -189,33 +205,8 @@ struct MobileToolbar: View {
     let onPaste: () -> Void
     let onDismissKeyboard: () -> Void
 
-    private let row1: [ToolbarKey] = [
-        .init(id: .escape, label: "ESC", key: .escape, longPressKey: .interrupt),
-        .init(id: .slash, label: "/", key: .slash),
-        .init(id: .dash, label: "-", key: .dash),
-        .init(id: .home, label: "HOME", key: .home),
-        .init(id: .up, label: "\u{2191}", key: .up, longPressKey: .pageUp),
-        .init(id: .end, label: "END", key: .end),
-        .init(id: .paste, label: "PASTE", key: nil, accessibilityLabel: "Paste"),
-        .init(
-            id: .dismissKeyboard,
-            label: "KEYBOARD",
-            key: nil,
-            systemImage: "keyboard.chevron.compact.down",
-            accessibilityLabel: "Dismiss keyboard"
-        ),
-    ]
-
-    private let row2: [ToolbarKey] = [
-        .init(id: .tab, label: "TAB", key: .tab),
-        .init(id: .control, label: "CTRL", key: nil),
-        .init(id: .alt, label: "ALT", key: nil),
-        .init(id: .shift, label: "SHIFT", key: nil),
-        .init(id: .left, label: "\u{2190}", key: .left, longPressKey: .wordLeft, repeatsLongPress: true),
-        .init(id: .down, label: "\u{2193}", key: .down, longPressKey: .pageDown),
-        .init(id: .right, label: "\u{2192}", key: .right, longPressKey: .wordRight, repeatsLongPress: true),
-        .init(id: .enter, label: "\u{21B5}", key: .enter),
-    ]
+    private let row1 = TerminalToolbarLayout.row1.map { ToolbarKey(id: $0) }
+    private let row2 = TerminalToolbarLayout.row2.map { ToolbarKey(id: $0) }
 
     var body: some View {
         VStack(spacing: 0) {
@@ -277,11 +268,19 @@ struct MobileToolbar: View {
             handleTap(for: key)
             return
         }
-        send(input, consumeShift: false)
+        // Android's extra-key long presses are intrinsic actions (Ctrl-C,
+        // pipe, page navigation, or word navigation) and do not consume a
+        // sticky modifier. Match that behavior so the next tap still receives
+        // any highlighted Ctrl/Alt/Shift state.
+        let bytes = TerminalInputEncoder.encode(
+            input,
+            applicationCursor: applicationCursorMode()
+        )
+        onKey(Data(bytes))
     }
 
-    private func send(_ input: TerminalInputKey, consumeShift: Bool = true) {
-        let activeModifiers = modifiers.consume(includeShift: consumeShift)
+    private func send(_ input: TerminalInputKey) {
+        let activeModifiers = modifiers.consume()
         let bytes = TerminalInputEncoder.encode(
             input,
             applicationCursor: applicationCursorMode(),
@@ -370,6 +369,61 @@ private struct ToolbarKey: Identifiable {
     let repeatsLongPress: Bool
     let systemImage: String?
     let accessibilityLabel: String
+
+    init(id: TerminalToolbarActionID) {
+        switch id {
+        case .escape:
+            self.init(id: id, label: "ESC", key: .escape, longPressKey: .interrupt)
+        case .slash:
+            self.init(id: id, label: "/", key: .slash)
+        case .dash:
+            self.init(id: id, label: "-", key: .dash, longPressKey: .pipe)
+        case .home:
+            self.init(id: id, label: "HOME", key: .home)
+        case .up:
+            self.init(id: id, label: "\u{2191}", key: .up, longPressKey: .pageUp)
+        case .end:
+            self.init(id: id, label: "END", key: .end)
+        case .paste:
+            self.init(id: id, label: "PASTE", key: nil, accessibilityLabel: "Paste")
+        case .dismissKeyboard:
+            self.init(
+                id: id,
+                label: "KEYBOARD",
+                key: nil,
+                systemImage: "keyboard.chevron.compact.down",
+                accessibilityLabel: "Dismiss keyboard"
+            )
+        case .tab:
+            self.init(id: id, label: "TAB", key: .tab)
+        case .control:
+            self.init(id: id, label: "CTRL", key: nil)
+        case .alt:
+            self.init(id: id, label: "ALT", key: nil)
+        case .shift:
+            self.init(id: id, label: "SHIFT", key: nil)
+        case .left:
+            self.init(
+                id: id,
+                label: "\u{2190}",
+                key: .left,
+                longPressKey: .wordLeft,
+                repeatsLongPress: true
+            )
+        case .down:
+            self.init(id: id, label: "\u{2193}", key: .down, longPressKey: .pageDown)
+        case .right:
+            self.init(
+                id: id,
+                label: "\u{2192}",
+                key: .right,
+                longPressKey: .wordRight,
+                repeatsLongPress: true
+            )
+        case .enter:
+            self.init(id: id, label: "\u{21B5}", key: .enter)
+        }
+    }
 
     init(
         id: TerminalToolbarActionID,
