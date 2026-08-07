@@ -1,4 +1,5 @@
 import XCTest
+import CoreText
 import SwiftTerm
 @testable import Handoff
 
@@ -158,6 +159,40 @@ final class TerminalInputEncoderTests: XCTestCase {
 }
 
 final class RemoteTerminalOutputTests: XCTestCase {
+    func testBundledTerminalFontCoversPowerlevel10kGlyphsAndEmojiFallback() throws {
+        let terminalFont = try XCTUnwrap(
+            UIFont(name: "MesloLGSNFM-Regular", size: 14),
+            "The terminal's Nerd Font must be registered through UIAppFonts"
+        )
+        let prompt = "\u{F179} \u{F015} \u{F252} \u{F017} \u{F126} \u{276F} 😀"
+        let attributedPrompt = NSAttributedString(
+            string: prompt,
+            attributes: [.font: terminalFont]
+        )
+        let line = CTLineCreateWithAttributedString(attributedPrompt)
+        let fontNames = (CTLineGetGlyphRuns(line) as! [CTRun]).compactMap { run -> String? in
+            let attributes = CTRunGetAttributes(run) as NSDictionary
+            guard let runFont = attributes[kCTFontAttributeName] else {
+                return nil
+            }
+            return CTFontCopyPostScriptName(runFont as! CTFont) as String
+        }
+
+        XCTAssertFalse(fontNames.isEmpty)
+        XCTAssertTrue(
+            fontNames.contains("MesloLGSNFM-Regular"),
+            "Powerlevel10k private-use glyphs must render with the bundled Nerd Font; runs: \(fontNames)"
+        )
+        XCTAssertTrue(
+            fontNames.contains { $0.localizedCaseInsensitiveContains("AppleColorEmoji") },
+            "Emoji must keep using the platform color-emoji fallback; runs: \(fontNames)"
+        )
+        XCTAssertFalse(
+            fontNames.contains { $0.localizedCaseInsensitiveContains("LastResort") },
+            "Every prompt glyph must resolve through MesloLGS Nerd Font Mono or emoji fallback; runs: \(fontNames)"
+        )
+    }
+
     @MainActor
     func testPTYEchoKeepsVisualCaretAlignedAfterTextAndBackspace() async throws {
         let terminalView = SwiftTerm.TerminalView(

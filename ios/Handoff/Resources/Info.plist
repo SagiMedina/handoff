@@ -43,7 +43,7 @@
     <true/>
     <key>UIAppFonts</key>
     <array>
-        <string>JetBrainsMono-Regular.ttf</string>
+        <string>MesloLGSNerdFontMono-Regular.ttf</string>
     </array>
 </dict>
 </plist>

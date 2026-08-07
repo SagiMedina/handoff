@@ -34,6 +34,11 @@ private let iosLibraries: [LicenseLibrary] = [
         license: "Apache 2.0",
         url: "https://github.com/apple/swift-crypto"
     ),
+    .init(
+        name: "MesloLGS Nerd Font Mono (Nerd Fonts)",
+        license: "Apache 2.0",
+        url: "https://github.com/ryanoasis/nerd-fonts"
+    ),
 ]
 
 struct LicensesView: View {

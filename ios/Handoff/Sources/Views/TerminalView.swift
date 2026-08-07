@@ -438,9 +438,9 @@ struct TerminalView: View {
 
     private func applyConfiguredFont(to termView: SwiftTerm.TerminalView) {
         let fontSize = CGFloat(configStore.terminalFontSize)
-        let bundledFont = UIFont(name: "JetBrainsMono-Regular", size: fontSize)
+        let bundledFont = UIFont(name: "MesloLGSNFM-Regular", size: fontSize)
 #if DEBUG
-        assert(bundledFont != nil, "JetBrains Mono failed to load; verify UIAppFonts in Info.plist")
+        assert(bundledFont != nil, "MesloLGS Nerd Font Mono failed to load; verify UIAppFonts in Info.plist")
         if let bundledFont {
             print("Handoff terminal font loaded: \(bundledFont.fontName)")
         }
