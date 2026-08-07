@@ -791,6 +791,7 @@ enum PairingDeviceName {
 enum SSHError: LocalizedError {
     case notConnected
     case invalidKey(String)
+    case authenticationRejected
     case commandFailed(String)
     case channelError(String)
 
@@ -800,6 +801,8 @@ enum SSHError: LocalizedError {
             return "Not connected to Mac. Check Tailscale."
         case .invalidKey(let reason):
             return "Invalid SSH key: \(reason)"
+        case .authenticationRejected:
+            return "This pairing key is no longer accepted by the Mac. Unpair and scan a new QR code from handoff pair."
         case .commandFailed(let reason):
             return "Command failed: \(reason)"
         case .channelError(let reason):
@@ -810,10 +813,27 @@ enum SSHError: LocalizedError {
 
 // MARK: - Auth delegates
 
+/// Tracks the single public-key offer allowed for one SSH connection attempt.
+///
+/// When sshd rejects a key it commonly advertises `publickey` again. Offering
+/// the same key repeatedly only burns through MaxAuthTries, after which sshd
+/// closes the socket and the UI sees a misleading generic channel error.
+/// Failing the second challenge preserves the real, actionable cause.
+final class PublicKeyAuthenticationAttempt {
+    private var hasOfferedKey = false
+
+    func claimKeyOffer() -> Bool {
+        guard !hasOfferedKey else { return false }
+        hasOfferedKey = true
+        return true
+    }
+}
+
 /// Public key authentication using Ed25519.
 private final class PublicKeyAuthDelegate: NIOSSHClientUserAuthenticationDelegate {
     let username: String
     let privateKey: Curve25519.Signing.PrivateKey
+    private let attempt = PublicKeyAuthenticationAttempt()
 
     init(username: String, privateKey: Curve25519.Signing.PrivateKey) {
         self.username = username
@@ -824,8 +844,8 @@ private final class PublicKeyAuthDelegate: NIOSSHClientUserAuthenticationDelegat
         availableMethods: NIOSSHAvailableUserAuthenticationMethods,
         nextChallengePromise: EventLoopPromise<NIOSSHUserAuthenticationOffer?>
     ) {
-        guard availableMethods.contains(.publicKey) else {
-            nextChallengePromise.succeed(nil)
+        guard availableMethods.contains(.publicKey), attempt.claimKeyOffer() else {
+            nextChallengePromise.fail(SSHError.authenticationRejected)
             return
         }
 
@@ -883,16 +903,34 @@ private final class AuthSuccessHandler: ChannelInboundHandler {
 
     func errorCaught(context: ChannelHandlerContext, error: Error) {
         lastError = error
+        failPendingPromise(with: error)
         context.fireErrorCaught(error)
+        // NIOSSH reports a failed authentication-delegate future through the
+        // pipeline but does not close the parent channel itself. Close here so
+        // a rejected key cannot leave the socket and event-loop group alive
+        // until sshd's LoginGraceTime expires.
+        context.close(promise: nil)
+    }
+
+    func channelInactive(context: ChannelHandlerContext) {
+        failPendingPromise(
+            with: lastError ?? SSHError.channelError("Connection closed before authentication")
+        )
+        context.fireChannelInactive()
     }
 
     func handlerRemoved(context: ChannelHandlerContext) {
         // Safety net: if the handler is torn down and the promise was never fulfilled,
         // fail it so EventLoopFuture.deinit doesn't trap.
-        if let p = promise {
-            promise = nil
-            p.fail(lastError ?? SSHError.channelError("Connection closed before authentication"))
-        }
+        failPendingPromise(
+            with: lastError ?? SSHError.channelError("Connection closed before authentication")
+        )
+    }
+
+    private func failPendingPromise(with error: Error) {
+        guard let promise else { return }
+        self.promise = nil
+        promise.fail(error)
     }
 }
 

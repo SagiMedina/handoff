@@ -27,6 +27,7 @@ struct VerificationView: View {
     @State private var status: String = "Connecting to Mac…"
     @State private var verificationCode: String?
     @State private var errorMessage: String?
+    @State private var requiresFreshPairing = false
     @State private var flowTask: Task<Void, Never>?
     @State private var hostKeyMismatch: HostKeyMismatchError?
 
@@ -136,16 +137,24 @@ struct VerificationView: View {
             Text(errorMessage ?? "Pairing failed.")
                 .foregroundColor(Theme.textSecondary)
                 .multilineTextAlignment(.center)
-            Button("Retry") {
-                runFlow()
-            }
-            .buttonStyle(.borderedProminent)
-            .tint(Theme.primary)
+            if requiresFreshPairing {
+                Button("Unpair and scan again") {
+                    configStore.unpair()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.primary)
+            } else {
+                Button("Retry") {
+                    runFlow()
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(Theme.primary)
 
-            Button("Unpair and scan again", role: .destructive) {
-                configStore.unpair()
+                Button("Unpair and scan again", role: .destructive) {
+                    configStore.unpair()
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.bordered)
         }
     }
 
@@ -169,6 +178,7 @@ struct VerificationView: View {
         status = "Connecting to Mac…"
         verificationCode = nil
         errorMessage = nil
+        requiresFreshPairing = false
         flowTask = Task {
             do {
                 try await verify(config: config)
@@ -183,6 +193,7 @@ struct VerificationView: View {
             } catch {
                 if Task.isCancelled { return }
                 await MainActor.run {
+                    requiresFreshPairing = error.requiresFreshPairing
                     errorMessage = (error as? LocalizedError)?.errorDescription
                         ?? error.localizedDescription
                     phase = .failed
@@ -251,6 +262,8 @@ struct VerificationView: View {
                 return
             } catch is CancellationError {
                 return
+            } catch SSHError.authenticationRejected {
+                throw VerificationError.credentialsRejected
             } catch let err as GateError {
                 switch err.code {
                 case .pending:
@@ -292,6 +305,7 @@ struct VerificationView: View {
 private enum VerificationError: LocalizedError {
     case noProxy
     case unexpectedResponse(String)
+    case credentialsRejected
     case rejectedOnMac
     case timedOut
 
@@ -301,10 +315,30 @@ private enum VerificationError: LocalizedError {
             return "Tailscale isn't connected. Return and try again."
         case .unexpectedResponse(let raw):
             return "Unexpected response from Mac: \(raw)"
+        case .credentialsRejected:
+            return "This pairing key is no longer accepted by the Mac. Unpair and scan a new QR code from handoff pair."
         case .rejectedOnMac:
             return "Pairing was rejected on the Mac. Retry if approval may have raced; otherwise unpair and scan a new code."
         case .timedOut:
             return "Pairing timed out. If the Mac approved it late, tap Retry to check again."
         }
+    }
+}
+
+private extension Error {
+    var requiresFreshPairing: Bool {
+        if let sshError = self as? SSHError,
+           case .authenticationRejected = sshError {
+            return true
+        }
+        if let verificationError = self as? VerificationError {
+            switch verificationError {
+            case .credentialsRejected, .rejectedOnMac:
+                return true
+            default:
+                break
+            }
+        }
+        return false
     }
 }

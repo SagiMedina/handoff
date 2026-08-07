@@ -160,3 +160,20 @@ final class PairingDeviceNameTests: XCTestCase {
         XCTAssertEqual(PairingDeviceName.sanitize("💥\n\\''"), "iPhone")
     }
 }
+
+final class SSHAuthenticationAttemptTests: XCTestCase {
+    func testPublicKeyIsOfferedOnlyOncePerConnectionAttempt() {
+        let attempt = PublicKeyAuthenticationAttempt()
+
+        XCTAssertTrue(attempt.claimKeyOffer())
+        XCTAssertFalse(attempt.claimKeyOffer())
+        XCTAssertFalse(attempt.claimKeyOffer())
+    }
+
+    func testRejectedAuthenticationHasActionableDescription() {
+        XCTAssertEqual(
+            SSHError.authenticationRejected.errorDescription,
+            "This pairing key is no longer accepted by the Mac. Unpair and scan a new QR code from handoff pair."
+        )
+    }
+}
