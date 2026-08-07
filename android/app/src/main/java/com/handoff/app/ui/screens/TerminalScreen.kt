@@ -26,6 +26,8 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.sp
 import com.handoff.app.data.ConfigStore
 import com.handoff.app.data.ConnectionConfig
+import com.handoff.app.data.ForegroundState
+import com.handoff.app.data.NotificationPoster
 import com.handoff.app.data.friendlyConnectionError
 import com.handoff.app.data.SshManager
 import com.handoff.app.data.TailscaleManager
@@ -119,6 +121,23 @@ fun TerminalScreen(
         onDispose {
             if (terminalHolder.currentView === termView) {
                 terminalHolder.currentView = null
+            }
+        }
+    }
+
+    // Track the tab the user is actively viewing, and clear any leftover
+    // notification for it the moment they open it. The notification poster
+    // reads ForegroundState.activeTerminalTab to suppress further pushes for
+    // this tab while the screen is composed.
+    DisposableEffect(sessionName, windowIndex) {
+        val tab = sessionName to windowIndex
+        ForegroundState.activeTerminalTab.value = tab
+        NotificationPoster(context).cancelForTab(sessionName, windowIndex)
+        onDispose {
+            // Only clear if we still own the slot — a tab-to-tab navigation
+            // composes the new screen before this one disposes.
+            if (ForegroundState.activeTerminalTab.value == tab) {
+                ForegroundState.activeTerminalTab.value = null
             }
         }
     }

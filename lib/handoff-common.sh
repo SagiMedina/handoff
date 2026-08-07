@@ -5,7 +5,18 @@ HANDOFF_DIR="$HOME/.handoff"
 HANDOFF_KEY="$HANDOFF_DIR/phone_key"           # v1 legacy
 HANDOFF_KEYS_DIR="$HANDOFF_DIR/keys"           # v2 per-device keys
 HANDOFF_DEVICES="$HANDOFF_DIR/devices.json"    # v2 device registry
+HANDOFF_DEVICES_LOCK="$HANDOFF_DIR/devices.lock"  # serializes devices.json read-modify-write
 HANDOFF_ACCESS_LOG="$HANDOFF_DIR/access.log"   # gate access log
+
+# ─── Notification event log ────────────────────────────────────────
+# Append-only NDJSON of generic notification events. Phones subscribe over the
+# gate channel; `handoff notify` writes here. One rotation file is kept so a
+# subscriber whose `tail -F` outlives the rotation follows by inode swap.
+HANDOFF_EVENTS_LOG="$HANDOFF_DIR/events.jsonl"
+HANDOFF_EVENTS_LOG_PREV="$HANDOFF_DIR/events.jsonl.1"
+HANDOFF_EVENTS_LOCK="$HANDOFF_DIR/events.lock"
+HANDOFF_EVENTS_ID_FILE="$HANDOFF_DIR/events.id"
+HANDOFF_EVENTS_LOG_MAX_BYTES="${HANDOFF_EVENTS_LOG_MAX_BYTES:-1048576}"  # 1 MB
 
 # Colors
 RED='\033[0;31m'
@@ -133,7 +144,81 @@ devices_json_init() {
     if [[ ! -f "$HANDOFF_DEVICES" ]]; then
         echo '{"version":1,"devices":[]}' > "$HANDOFF_DEVICES"
     fi
+    [[ -f "$HANDOFF_DEVICES_LOCK" ]] || : > "$HANDOFF_DEVICES_LOCK"
     touch "$HANDOFF_ACCESS_LOG"
+    events_log_init
+}
+
+# ─── Event log helpers (notification bridge) ──────────────────────
+
+# Create empty event log + counter on first use.
+events_log_init() {
+    mkdir -p "$HANDOFF_DIR"
+    [[ -f "$HANDOFF_EVENTS_LOG" ]] || : > "$HANDOFF_EVENTS_LOG"
+    [[ -f "$HANDOFF_EVENTS_ID_FILE" ]] || echo 0 > "$HANDOFF_EVENTS_ID_FILE"
+    [[ -f "$HANDOFF_EVENTS_LOCK" ]] || : > "$HANDOFF_EVENTS_LOCK"
+}
+
+# Allocate the next monotonic event id.
+# flock-protected via Python (consistent with the rest of this file's JSON I/O).
+events_log_next_id() {
+    events_log_init
+    HANDOFF_EVENTS_ID_FILE="$HANDOFF_EVENTS_ID_FILE" \
+    HANDOFF_EVENTS_LOCK="$HANDOFF_EVENTS_LOCK" \
+    python3 -c "
+import os, fcntl
+lock = open(os.environ['HANDOFF_EVENTS_LOCK'], 'r+')
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+try:
+    path = os.environ['HANDOFF_EVENTS_ID_FILE']
+    try:
+        with open(path) as f:
+            cur = int((f.read() or '0').strip() or '0')
+    except (FileNotFoundError, ValueError):
+        cur = 0
+    nxt = cur + 1
+    with open(path, 'w') as f:
+        f.write(str(nxt))
+    print(nxt)
+finally:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+"
+}
+
+# Append one NDJSON record to the event log, rotating in place if oversized.
+# Usage: events_log_append '<one JSON object on a single line>'
+events_log_append() {
+    local line="$1"
+    events_log_init
+    HANDOFF_EVENTS_LOG="$HANDOFF_EVENTS_LOG" \
+    HANDOFF_EVENTS_LOG_PREV="$HANDOFF_EVENTS_LOG_PREV" \
+    HANDOFF_EVENTS_LOCK="$HANDOFF_EVENTS_LOCK" \
+    HANDOFF_EVENTS_LOG_MAX_BYTES="$HANDOFF_EVENTS_LOG_MAX_BYTES" \
+    HANDOFF_EVENT_LINE="$line" \
+    python3 -c "
+import os, fcntl
+log  = os.environ['HANDOFF_EVENTS_LOG']
+prev = os.environ['HANDOFF_EVENTS_LOG_PREV']
+lockp = os.environ['HANDOFF_EVENTS_LOCK']
+maxb = int(os.environ['HANDOFF_EVENTS_LOG_MAX_BYTES'])
+line = os.environ['HANDOFF_EVENT_LINE'].rstrip('\n') + '\n'
+
+lock = open(lockp, 'r+')
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+try:
+    try:
+        size = os.path.getsize(log)
+    except FileNotFoundError:
+        size = 0
+    # Rotate by rename so subscribers tailing the inode see EOF and reopen.
+    if size + len(line.encode('utf-8')) > maxb:
+        if os.path.exists(log):
+            os.replace(log, prev)
+    with open(log, 'ab') as f:
+        f.write(line.encode('utf-8'))
+finally:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+"
 }
 
 # Add a device to devices.json
@@ -146,27 +231,38 @@ devices_json_add_device() {
     local ro_py="False"
     [[ "$read_only" == "true" ]] && ro_py="True"
     python3 -c "
-import json, sys
-with open('$HANDOFF_DEVICES', 'r') as f:
-    data = json.load(f)
-device = {
-    'name': '$name',
-    'fingerprint': '$fingerprint',
-    'key_file': '$key_file',
-    'status': 'pending',
-    'sessions': $sessions,
-    'read_only': $ro_py,
-    'nonce': '$nonce',
-    'created_at': '$now',
-    'soft_expiry': '$soft_expiry',
-    'hard_expiry': '$hard_expiry',
-    'renewal_requested': False,
-    'last_seen': None,
-    'last_command': None
-}
-data['devices'].append(device)
-with open('$HANDOFF_DEVICES', 'w') as f:
-    json.dump(data, f, indent=2)
+import json, os, fcntl, tempfile
+devices = '$HANDOFF_DEVICES'
+lock = open('$HANDOFF_DEVICES_LOCK', 'a+')
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+try:
+    with open(devices, 'r') as f:
+        data = json.load(f)
+    data['devices'].append({
+        'name': '$name',
+        'fingerprint': '$fingerprint',
+        'key_file': '$key_file',
+        'status': 'pending',
+        'sessions': $sessions,
+        'read_only': $ro_py,
+        'nonce': '$nonce',
+        'created_at': '$now',
+        'soft_expiry': '$soft_expiry',
+        'hard_expiry': '$hard_expiry',
+        'renewal_requested': False,
+        'last_seen': None,
+        'last_command': None,
+    })
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(devices), prefix='.devices.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, devices)
+    except BaseException:
+        os.unlink(tmp); raise
+finally:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 "
 }
 
@@ -175,19 +271,31 @@ with open('$HANDOFF_DEVICES', 'w') as f:
 devices_json_update_device() {
     local fingerprint="$1" field="$2" value="$3"
     python3 -c "
-import json
-with open('$HANDOFF_DEVICES', 'r') as f:
-    data = json.load(f)
-for d in data['devices']:
-    if d['fingerprint'] == '$fingerprint':
-        val = '$value'
-        if val == 'true': val = True
-        elif val == 'false': val = False
-        elif val == 'null': val = None
-        d['$field'] = val
-        break
-with open('$HANDOFF_DEVICES', 'w') as f:
-    json.dump(data, f, indent=2)
+import json, os, fcntl, tempfile
+devices = '$HANDOFF_DEVICES'
+lock = open('$HANDOFF_DEVICES_LOCK', 'a+')
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+try:
+    with open(devices, 'r') as f:
+        data = json.load(f)
+    for d in data['devices']:
+        if d['fingerprint'] == '$fingerprint':
+            val = '$value'
+            if val == 'true': val = True
+            elif val == 'false': val = False
+            elif val == 'null': val = None
+            d['$field'] = val
+            break
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(devices), prefix='.devices.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, devices)
+    except BaseException:
+        os.unlink(tmp); raise
+finally:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 "
 }
 
@@ -228,12 +336,24 @@ for d in data['devices']:
 devices_json_remove_device() {
     local fingerprint="$1"
     python3 -c "
-import json
-with open('$HANDOFF_DEVICES', 'r') as f:
-    data = json.load(f)
-data['devices'] = [d for d in data['devices'] if d['fingerprint'] != '$fingerprint']
-with open('$HANDOFF_DEVICES', 'w') as f:
-    json.dump(data, f, indent=2)
+import json, os, fcntl, tempfile
+devices = '$HANDOFF_DEVICES'
+lock = open('$HANDOFF_DEVICES_LOCK', 'a+')
+fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+try:
+    with open(devices, 'r') as f:
+        data = json.load(f)
+    data['devices'] = [d for d in data['devices'] if d['fingerprint'] != '$fingerprint']
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(devices), prefix='.devices.', suffix='.tmp')
+    try:
+        with os.fdopen(fd, 'w') as f:
+            json.dump(data, f, indent=2)
+            f.flush(); os.fsync(f.fileno())
+        os.replace(tmp, devices)
+    except BaseException:
+        os.unlink(tmp); raise
+finally:
+    fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
 "
 }
 

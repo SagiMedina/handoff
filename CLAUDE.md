@@ -13,6 +13,7 @@ Two components:
 - `handoff` - show active tmux sessions with window count, ensure Tailscale is up, show connection info
 - `handoff pair` - show QR code for phone setup (contains setup script URL + SSH key + Tailscale IP)
 - `handoff status` - is sharing active?
+- `handoff notify --type ... --message ...` - push a notification to paired phones; tool-agnostic (any source can call it; the Claude Code plugin is one example)
 
 ### 2. Android app (native)
 - Jetpack Compose UI with CameraX QR scanning for pairing
@@ -20,7 +21,6 @@ Two components:
 - One-time Tailscale auth: opens browser for login, state persisted for future launches
 - SSH via JSch through a local TCP proxy that routes through tsnet to the Mac
 - Dynamic session discovery: SSH into Mac, list tmux sessions, pick one, attach
-- If only one session exists, skip picker and connect directly
 - Terminal emulation via embedded Termux terminal libraries
 
 ## Key Technical Decisions
@@ -54,8 +54,17 @@ Two components:
 ### Multi-session support
 - Users may have multiple tmux sessions (different projects)
 - `handoff` lists all active sessions with window counts
-- Phone widget shows session picker
-- Single session = auto-connect (skip picker)
+- Phone widget shows session picker (always — never auto-connects)
+
+### Phone notification bridge
+- Mac → phone push pipeline that reuses the existing per-device SSH/gate channel — no new ports, no FCM, no third-party push service.
+- `handoff notify` (generic CLI) appends an NDJSON event to `~/.handoff/events.jsonl` (atomic, monotonic id via `~/.handoff/events.id`, rotation-bounded at ~1 MB).
+- `handoff gate subscribe [since=<id>] [types=<csv>]` (new gate subcommand) opens a long-lived NDJSON stream over the existing SSH session via `lib/handoff-events-stream.py` — drains events past the cursor, then tails the log forever, with 25 s heartbeats and rotation-aware inode polling. Gate filters by the device's session patterns (same matcher as `list`/`attach`).
+- Android `HandoffConnectionService` owns a long-lived `NotificationSubscriber` (its own JSch session, separate from `SshManager` because that one isn't idempotent). Posts events on a HIGH-importance `handoff_events` channel. A `BootReceiver` (manifest: `BOOT_COMPLETED` + `MY_PACKAGE_REPLACED`) restarts the service automatically after reboot or APK upgrade so the subscriber wakes up without the user reopening the app.
+- Per-tab dedupe: notification id = `("$tmux_session:$tmux_window").hashCode() & 0x3FFFFFFF`. Re-posting with the same id replaces in place — newer events for the same tab supersede older ones rather than stack.
+- Active-tab suppression: `ForegroundState` tracks `isForeground` (ActivityLifecycleCallbacks), `currentRoute` (NavController listener), `activeTerminalTab` (TerminalScreen DisposableEffect). Suppression fires only when all three say "user is currently looking at this exact tab"; the cursor still advances so the event is "delivered" in the UX sense.
+- Deep-link: tap → `MainActivity.onNewIntent` → `navController.navigate("terminal/$s/$w")`.
+- The Claude Code plugin (`claude-plugin/handoff-notify/`) is the canonical *event source*, not the only one. Anything that wants to ping the phone (CI, build scripts, a future `handoff watch-exit <cmd>` wrapper) calls `handoff notify` directly. Distribution: Claude Code plugin ships via `/plugin install`; `handoff` itself ships via Homebrew. Two separate channels — never coupled in `handoff setup`.
 
 ## Dependencies
 
@@ -90,8 +99,9 @@ Two components:
 ### SSH forced command (`handoff gate`)
 - All device SSH keys use `command="handoff gate <fingerprint>"` in authorized_keys
 - Phone can never execute arbitrary commands — only gate protocol commands
-- Protocol: `list`, `windows <session>`, `attach <session> [window]`, `create-session`, `kill-session`, `create-window`, `kill-window`, `pair`, `renew`
+- Protocol: `list`, `windows <session>`, `attach <session> [window]`, `create-session`, `kill-session`, `create-window`, `kill-window`, `pair`, `renew`, `subscribe`
 - Gate enforces all permissions server-side: session filtering, read-only, expiry
+- `subscribe` is read-only and respects soft expiry like other commands; emits NDJSON (one event per line) plus a `{"type":"ping"}` heartbeat every 25 s and a `{"type":"ready","last_id":N}` marker after the initial drain
 
 ### Device lifecycle
 ```
@@ -126,3 +136,7 @@ PENDING → (verification) → ACTIVE → (expiry) → SOFT_EXPIRED → (renew) 
 - Should we also support Linux hosts (not just Mac)?
 - Notification on phone when `handoff` is run? (Termux:API can show notifications)
 - Auto-detect when user leaves Mac (lid close, screen lock) and trigger handoff automatically?
+
+## Known gaps
+- **`brew install handoff` does not work yet.** `Formula/handoff.rb` has `sha256 "PLACEHOLDER"`, no tap is published, the v0.1.0 release tag isn't on GitHub, and neither the formula nor `install.sh` includes the new `lib/handoff-events-stream.py` (the gate `subscribe` helper). To make brew real: fill the SHA, tag a release, publish a `SagiMedina/homebrew-handoff` tap repo, and update both `Formula/handoff.rb` and `install.sh` to install the helper. README's `brew install handoff` line is currently aspirational; today users must `git clone && ./install.sh` (and even that misses the helper — fix install.sh too).
+- **Claude Code plugin is not installable from a non-public repo via the marketplace yet.** `/plugin marketplace add SagiMedina/handoff` requires the repo to be on GitHub. Until then, the manual fallback (`forward.sh` referenced from absolute path inside `~/.claude/settings.json` `hooks` block) is the only working path. `extraKnownMarketplaces` with `source: "local"` is rejected by the user-scope settings validator — do not retry that route.

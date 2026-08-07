@@ -1,0 +1,15 @@
+{
+  "name": "handoff",
+  "owner": {
+    "name": "Handoff",
+    "url": "https://github.com/SagiMedina/handoff"
+  },
+  "description": "Plugins that ship with Handoff.",
+  "plugins": [
+    {
+      "name": "handoff-notify",
+      "source": "./claude-plugin/handoff-notify",
+      "description": "Push Claude Code Notification and Stop events to your phone via Handoff."
+    }
+  ]
+}
