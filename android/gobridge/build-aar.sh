@@ -44,6 +44,9 @@ echo "==> Installing gomobile..."
 go install golang.org/x/mobile/cmd/gomobile@latest
 go install golang.org/x/mobile/cmd/gobind@latest
 
+# Ensure GOPATH/bin is in PATH
+export PATH="$(go env GOPATH)/bin:$PATH"
+
 echo "==> Initializing gomobile..."
 gomobile init
 
